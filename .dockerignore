@@ -1,0 +1,8 @@
+.git
+.github
+node_modules
+static/style.css
+k8s
+docs
+README.md
+*.md

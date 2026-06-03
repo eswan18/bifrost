@@ -1,0 +1,13 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: light --default, synthwave --prefersdark;
+}
+
+@source "../templates";
+
+@layer base {
+    body {
+        @apply min-h-screen bg-base-200 text-base-content;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+}
