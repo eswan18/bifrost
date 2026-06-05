@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-staging-env-config
+  namespace: bifrost-staging
+data:
+  ENV: "staging"
+  BASE_URL: "https://bifrost-staging.tailc06f30.ts.net"
+  OIDC_ISSUER_EXTERNAL: "https://identity-staging.tailc06f30.ts.net"
+  OIDC_ISSUER_INTERNAL: "http://identity.identity-staging.svc.cluster.local"
