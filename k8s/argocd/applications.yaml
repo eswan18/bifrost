@@ -1,0 +1,46 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bifrost-staging
+  namespace: argocd
+  annotations:
+    argocd-image-updater.argoproj.io/image-list: bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost
+    argocd-image-updater.argoproj.io/bifrost.update-strategy: newest-build
+    argocd-image-updater.argoproj.io/bifrost.allow-tags: regexp:^[a-f0-9]{7,}$
+    argocd-image-updater.argoproj.io/write-back-method: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/eswan18/bifrost
+    targetRevision: main
+    path: k8s/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: bifrost-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bifrost-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/eswan18/bifrost
+    targetRevision: main
+    path: k8s/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: bifrost-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

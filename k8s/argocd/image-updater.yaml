@@ -1,0 +1,3 @@
+# Image-updater configuration for this app is set via annotations on the
+# bifrost-staging Application in applications.yaml. This file is reserved
+# for overrides that need to live outside the Application object (none yet).
