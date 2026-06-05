@@ -1,0 +1,45 @@
+{{define "content"}}
+<h1 class="text-2xl font-bold mb-4">Services</h1>
+<div class="space-y-3">
+  {{range .Rows}}
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex justify-between items-start">
+        <div>
+          <h2 class="card-title">{{.Name}}</h2>
+          <div class="text-sm opacity-70 mt-1">
+            <div>staging: <span class="font-mono">{{or .StagingTag "—"}}</span></div>
+            <div>prod: <span class="font-mono">{{or .ProdTag "—"}}</span></div>
+          </div>
+        </div>
+        <div>
+          {{if eq (printf "%s" .State) "in_sync"}}
+            <span class="badge badge-success">in sync</span>
+          {{else if eq (printf "%s" .State) "out_of_sync"}}
+            <span class="badge badge-warning">out of sync</span>
+          {{else if eq (printf "%s" .State) "mid_deploy"}}
+            <span class="badge badge-info">deploying…</span>
+          {{else}}
+            <span class="badge badge-ghost">unknown</span>
+          {{end}}
+        </div>
+      </div>
+
+      {{if eq (printf "%s" .State) "out_of_sync"}}
+      <form method="POST" action="/services/{{.Name}}/promote" class="mt-3">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="expected_sha" value="{{.NewProdTag}}">
+        <button class="btn btn-primary btn-sm w-full"
+                onclick="return confirm('Promote {{.Name}} prod to {{.NewProdTag}}?')">
+          Promote → {{.NewProdTag}}
+        </button>
+      </form>
+      {{end}}
+    </div>
+  </div>
+  {{end}}
+</div>
+<div class="text-center mt-6">
+  <a href="/" class="btn btn-ghost btn-sm">Refresh</a>
+</div>
+{{end}}

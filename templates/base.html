@@ -1,0 +1,35 @@
+{{define "base"}}<!DOCTYPE html>
+<html lang="en" data-theme="synthwave">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bifrost</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="min-h-screen">
+  <div class="navbar bg-base-100 shadow-sm">
+    <div class="flex-1">
+      <a href="/" class="btn btn-ghost text-xl">Bifrost</a>
+    </div>
+    {{if .Session}}
+    <div class="flex-none">
+      <form method="POST" action="/auth/logout">
+        <button class="btn btn-ghost btn-sm">Sign out</button>
+      </form>
+    </div>
+    {{end}}
+  </div>
+
+  {{if .Flash}}
+  <div class="container mx-auto px-4 mt-4">
+    <div class="alert alert-{{if eq (printf "%s" .Flash.Kind) "error"}}error{{else}}success{{end}}">
+      <span>{{.Flash.Msg}}</span>
+    </div>
+  </div>
+  {{end}}
+
+  <main class="container mx-auto px-4 py-6 max-w-3xl">
+    {{template "content" .}}
+  </main>
+</body>
+</html>{{end}}
