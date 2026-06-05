@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bifrost
+spec:
+  template:
+    spec:
+      serviceAccountName: bifrost-prod-ksa
+      containers:
+        - name: bifrost
+          envFrom:
+            - configMapRef:
+                name: bifrost-config
+            - configMapRef:
+                name: bifrost-prod-env-config
+            - secretRef:
+                name: bifrost-prod-secrets
