@@ -4,6 +4,8 @@ TEMPLATES := $(wildcard templates/*.html)
 
 .DEFAULT_GOAL := build
 
+.PHONY: css css-watch run build test lint
+
 css: static/style.css
 
 static/style.css: static/input.css $(TEMPLATES)

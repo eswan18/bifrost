@@ -1,3 +1,3 @@
 module github.com/eswan18/bifrost
 
-go 1.25
+go 1.25.5
