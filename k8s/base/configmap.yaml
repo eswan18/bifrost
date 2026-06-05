@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-config
+data:
+  HTTP_ADDRESS: ":8080"
+  ARGOCD_NAMESPACE: "argocd"
+  TEMPLATES_DIR: "/app/templates"
+  STATIC_DIR: "/app/static"
+  ALLOWED_EMAIL: "ethanpswan@gmail.com"
+  SERVICES: "asset-manager,bifrost,comms,fitness-api,fitness-dashboard,forecasting,identity"
