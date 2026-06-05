@@ -1,0 +1,21 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/ethans-services/containers/bifrost:$SHORT_SHA
+      - -t
+      - us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - us-central1-docker.pkg.dev/ethans-services/containers/bifrost
+
+images:
+  - us-central1-docker.pkg.dev/ethans-services/containers/bifrost:$SHORT_SHA
+  - us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
