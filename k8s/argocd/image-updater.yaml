@@ -14,3 +14,4 @@ spec:
           imageName: us-central1-docker.pkg.dev/ethans-services/containers/bifrost
           commonUpdateSettings:
             updateStrategy: newest-build
+            allowTags: "regexp:^[a-f0-9]{7,}$"
