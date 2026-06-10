@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -176,6 +177,28 @@ func TestStatusRendersPromoteForm(t *testing.T) {
 	}
 }
 
+// TestStatusRendersDeployingSpinner: a mid-deploy service (>1 distinct image
+// in a namespace) renders an animated spinner in its badge. The asserted
+// substring is contiguous only in the rendered badge — base.html's JS copy is
+// split across string concatenation, so it can't false-match.
+func TestStatusRendersDeployingSpinner(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234", "reg/foo:def5678"}, // 2 distinct => mid-deploy
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	want := `badge badge-info gap-1"><span class="loading loading-spinner loading-xs"></span>deploying`
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Error("mid-deploy badge should render an inline spinner")
+	}
+}
+
 func TestStatus404sNonRootPaths(t *testing.T) {
 	k := &fakeKube{imgs: map[string][]string{}}
 	h, _, sess := newTestHandlers(t, k)
@@ -187,6 +210,124 @@ func TestStatus404sNonRootPaths(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+}
+
+// TestStatusJSON covers the per-service polling endpoint the promote spinner
+// uses to detect when prod has rolled out.
+func TestStatusJSON(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:def5678"},
+	}}
+	h, _, _ := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/services/foo/status", nil)
+	req.SetPathValue("name", "foo")
+	rec := httptest.NewRecorder()
+	h.StatusJSON(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["state"] != "out_of_sync" {
+		t.Errorf("state = %v, want out_of_sync", got["state"])
+	}
+	if got["prodTag"] != "def5678" {
+		t.Errorf("prodTag = %v, want def5678", got["prodTag"])
+	}
+	if got["newProdTag"] != "abc1234" {
+		t.Errorf("newProdTag = %v, want abc1234", got["newProdTag"])
+	}
+}
+
+func TestStatusJSONUnknownService(t *testing.T) {
+	h, _, _ := newTestHandlers(t, &fakeKube{imgs: map[string][]string{}})
+	req := httptest.NewRequest("GET", "/services/nope/status", nil)
+	req.SetPathValue("name", "nope")
+	rec := httptest.NewRecorder()
+	h.StatusJSON(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+}
+
+// TestPromoteJSONSuccess covers the AJAX response: with Accept: application/json
+// the handler patches prod and returns {ok:true, newTag:...} (so the client can
+// poll for that tag) instead of redirecting.
+func TestPromoteJSONSuccess(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:def5678"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	form := strings.NewReader("csrf=" + auth.CSRFToken(h.Cfg.SessionSecret, sess.ID) +
+		"&expected_sha=abc1234")
+	req := httptest.NewRequest("POST", "/services/foo/promote", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.SetPathValue("name", "foo")
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+
+	rec := httptest.NewRecorder()
+	h.Promote(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["ok"] != true {
+		t.Errorf("ok = %v, want true", got["ok"])
+	}
+	if got["newTag"] != "abc1234" {
+		t.Errorf("newTag = %v, want abc1234", got["newTag"])
+	}
+	if k.patched["foo"] != "reg/foo:abc1234" {
+		t.Errorf("patched = %q, want reg/foo:abc1234", k.patched["foo"])
+	}
+}
+
+// TestPromoteJSONStaleExpectedSHA: the refusal path also speaks JSON and does
+// not patch.
+func TestPromoteJSONStaleExpectedSHA(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:def5678"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	form := strings.NewReader("csrf=" + auth.CSRFToken(h.Cfg.SessionSecret, sess.ID) +
+		"&expected_sha=fff0000")
+	req := httptest.NewRequest("POST", "/services/foo/promote", form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.SetPathValue("name", "foo")
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+
+	rec := httptest.NewRecorder()
+	h.Promote(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["ok"] != false {
+		t.Errorf("ok = %v, want false", got["ok"])
+	}
+	if _, ok := k.patched["foo"]; ok {
+		t.Error("should not have patched on stale expected_sha")
+	}
+	if msg, _ := got["error"].(string); !strings.Contains(msg, "staging changed") {
+		t.Errorf("error = %q, want staleness message", msg)
 	}
 }
 
