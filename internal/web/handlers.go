@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -37,6 +38,7 @@ func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.Renderer.Render(w, "status", data); err != nil {
+		slog.Error("render failed", "template", "status", "error", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
 }
@@ -53,8 +55,14 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 		go func(i int, svc string) {
 			defer wg.Done()
 			row := statusRow{Name: svc, State: promote.Unknown}
-			staging, _ := h.Kube.ListPodImages(ctx, svc+"-staging")
-			prod, _ := h.Kube.ListPodImages(ctx, svc+"-prod")
+			staging, err := h.Kube.ListPodImages(ctx, svc+"-staging")
+			if err != nil {
+				slog.Warn("list pod images failed", "service", svc, "namespace", svc+"-staging", "error", err)
+			}
+			prod, err := h.Kube.ListPodImages(ctx, svc+"-prod")
+			if err != nil {
+				slog.Warn("list pod images failed", "service", svc, "namespace", svc+"-prod", "error", err)
+			}
 			s := promote.StatusOf(staging, prod)
 			row.State = s.State
 			row.StagingTag = s.StagingTag
@@ -91,27 +99,35 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	// Re-derive the current state to make sure we promote what the user saw.
 	staging, err := h.Kube.ListPodImages(r.Context(), app+"-staging")
 	if err != nil {
+		slog.Error("promote: read staging failed", "user", sess.Email, "service", app, "error", err)
 		SetFlash(w, FlashError, fmt.Sprintf("read staging: %v", err))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	prod, err := h.Kube.ListPodImages(r.Context(), app+"-prod")
 	if err != nil {
+		slog.Error("promote: read prod failed", "user", sess.Email, "service", app, "error", err)
 		SetFlash(w, FlashError, fmt.Sprintf("read prod: %v", err))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	s := promote.StatusOf(staging, prod)
 	if s.State != promote.OutOfSync {
+		slog.Warn("promote refused: nothing to promote", "user", sess.Email, "service", app, "state", string(s.State))
 		SetFlash(w, FlashError, fmt.Sprintf("%s: nothing to promote (state=%s)", app, s.State))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 	if r.FormValue("expected_sha") != "" && r.FormValue("expected_sha") != s.NewProdTag {
+		slog.Warn("promote refused: staging changed since page load",
+			"user", sess.Email, "service", app,
+			"expected", r.FormValue("expected_sha"), "current", s.NewProdTag)
 		SetFlash(w, FlashError, fmt.Sprintf("%s: staging changed since page load — refresh and retry", app))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	slog.Info("promote attempt", "user", sess.Email, "service", app,
+		"from", s.ProdTag, "to", s.NewProdTag)
 
 	// Image base = same registry path as the current staging image.
 	stagingImage := staging[0]
@@ -125,8 +141,12 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	newImage := imageBase + ":" + s.NewProdTag
 
 	if err := h.Kube.PatchProdImage(r.Context(), app, newImage); err != nil {
+		slog.Error("promote failed", "user", sess.Email, "service", app,
+			"from", s.ProdTag, "to", s.NewProdTag, "error", err)
 		SetFlash(w, FlashError, fmt.Sprintf("patch failed: %v", err))
 	} else {
+		slog.Info("promote succeeded", "user", sess.Email, "service", app,
+			"from", s.ProdTag, "to", s.NewProdTag)
 		SetFlash(w, FlashSuccess, fmt.Sprintf("Promoted %s prod → %s", app, s.NewProdTag))
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
