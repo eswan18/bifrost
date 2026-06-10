@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log"
@@ -52,8 +53,23 @@ func main() {
 		log.Fatalf("oidc: %v", err)
 	}
 
+	// renderError renders the themed error page; auth handlers use it to show
+	// sign-in failures (e.g. an error redirect from the IdP) as a real page
+	// instead of a bare 502 that Cloudflare would mask as "Bad Gateway".
+	renderError := func(w http.ResponseWriter, status int, message string) {
+		var buf bytes.Buffer
+		if err := rend.Render(&buf, "error", map[string]any{"Message": message}); err != nil {
+			log.Printf("render error page failed: %v", err)
+			http.Error(w, message, status)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = w.Write(buf.Bytes())
+	}
+
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
-	authH := &auth.Handlers{OIDC: oidcClient, Session: sm}
+	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
 	webH := &web.Handlers{Cfg: cfg, Kube: kc, Renderer: rend}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
