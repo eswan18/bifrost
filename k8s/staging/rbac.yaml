@@ -21,26 +21,27 @@ roleRef:
   name: bifrost-staging-pods-reader
   apiGroup: rbac.authorization.k8s.io
 ---
+# Cluster-scoped (not a Role in the argocd namespace) because the
+# kustomization's global `namespace:` transformer would rewrite a namespaced
+# Role/RoleBinding into bifrost-staging, silently breaking promote RBAC.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: bifrost-staging-argocd-app-patcher
-  namespace: argocd
 rules:
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
     verbs: ["get", "list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: bifrost-staging-argocd-app-patcher
-  namespace: argocd
 subjects:
   - kind: ServiceAccount
     name: bifrost-staging-ksa
     namespace: bifrost-staging
 roleRef:
-  kind: Role
+  kind: ClusterRole
   name: bifrost-staging-argocd-app-patcher
   apiGroup: rbac.authorization.k8s.io
