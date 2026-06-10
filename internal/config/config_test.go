@@ -32,6 +32,27 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadSkipsEmptyServiceEntries(t *testing.T) {
+	env := minimalValidEnv()
+	env["SERVICES"] = " fitness-api, ,identity,"
+	cfg, err := loadFromMap(env)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	want := []string{"fitness-api", "identity"}
+	if !reflect.DeepEqual(cfg.Services, want) {
+		t.Errorf("Services = %v, want %v", cfg.Services, want)
+	}
+}
+
+func TestLoadRejectsServicesWithNoNames(t *testing.T) {
+	env := minimalValidEnv()
+	env["SERVICES"] = " , ,"
+	if _, err := loadFromMap(env); err == nil {
+		t.Fatal("expected error for SERVICES with no service names")
+	}
+}
+
 func TestLoadMissingRequired(t *testing.T) {
 	_, err := loadFromMap(map[string]string{"HTTP_ADDRESS": ":8080"})
 	if err == nil {

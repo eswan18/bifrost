@@ -61,9 +61,16 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		ns = "argocd"
 	}
 
-	svcs := strings.Split(m["SERVICES"], ",")
-	for i := range svcs {
-		svcs[i] = strings.TrimSpace(svcs[i])
+	// Skip empty entries so a trailing comma doesn't yield a service named ""
+	// (which would query namespace "-staging").
+	var svcs []string
+	for _, s := range strings.Split(m["SERVICES"], ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			svcs = append(svcs, s)
+		}
+	}
+	if len(svcs) == 0 {
+		return nil, fmt.Errorf("SERVICES contains no service names")
 	}
 
 	return &Config{
