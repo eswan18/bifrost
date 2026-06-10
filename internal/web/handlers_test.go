@@ -176,6 +176,20 @@ func TestStatusRendersPromoteForm(t *testing.T) {
 	}
 }
 
+func TestStatus404sNonRootPaths(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{}}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/favicon.ico", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+}
+
 func TestPromoteNothingToPromote(t *testing.T) {
 	k := &fakeKube{imgs: map[string][]string{
 		"foo-staging": {"reg/foo:abc"},

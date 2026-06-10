@@ -28,6 +28,12 @@ type statusRow struct {
 }
 
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
+	// "GET /" is a catch-all pattern: without this, every unmatched path
+	// (favicon.ico, scanners) would trigger a full status collection.
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	rows := h.collectStatus(r.Context())
 	sess := auth.SessionFromContext(r.Context())
 	data := map[string]any{
