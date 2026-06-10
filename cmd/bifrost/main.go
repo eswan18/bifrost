@@ -84,6 +84,7 @@ func main() {
 	mux.HandleFunc("POST /auth/logout", authH.Logout)
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
 	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Status)))
+	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 
 	srv := &http.Server{

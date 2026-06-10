@@ -31,5 +31,66 @@
   <main class="container mx-auto px-4 py-6 max-w-3xl">
     {{template "content" .}}
   </main>
+
+  <script>
+    // Progressive enhancement for promote: confirm, show a spinner, POST via
+    // fetch, then poll the service status until prod has rolled out the new
+    // SHA. With JS disabled the plain <form> still POSTs and redirects.
+    (function () {
+      var POLL_MS = 3000;
+      var TIMEOUT_MS = 5 * 60 * 1000;
+
+      function spinner(label) {
+        return '<span class="loading loading-spinner loading-xs"></span> ' + label;
+      }
+
+      function pollUntilRolledOut(svc, newTag, started) {
+        function again() {
+          if (Date.now() - started > TIMEOUT_MS) { location.reload(); return; }
+          setTimeout(function () { pollUntilRolledOut(svc, newTag, started); }, POLL_MS);
+        }
+        fetch('/services/' + encodeURIComponent(svc) + '/status', {
+          headers: { 'Accept': 'application/json' }
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (s) {
+            if (s.prodTag === newTag) { location.reload(); return; }
+            again();
+          })
+          .catch(again);
+      }
+
+      document.querySelectorAll('form.js-promote').forEach(function (form) {
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var svc = form.dataset.service;
+          var tag = form.dataset.newtag;
+          if (!confirm('Promote ' + svc + ' prod to ' + tag + '?')) return;
+
+          var btn = form.querySelector('button[type="submit"]');
+          btn.disabled = true;
+          btn.innerHTML = spinner('Promoting…');
+          var badge = document.querySelector('[data-service="' + svc + '"] .js-badge');
+          if (badge) {
+            badge.innerHTML = '<span class="badge badge-info gap-1">' +
+              '<span class="loading loading-spinner loading-xs"></span>deploying…</span>';
+          }
+
+          fetch(form.action, {
+            method: 'POST',
+            headers: { 'Accept': 'application/json' },
+            body: new URLSearchParams(new FormData(form))
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+              if (!res.ok) { location.reload(); return; } // flash shows the reason
+              btn.innerHTML = spinner('Deploying…');
+              pollUntilRolledOut(svc, res.newTag, Date.now());
+            })
+            .catch(function () { location.reload(); });
+        });
+      });
+    })();
+  </script>
 </body>
 </html>{{end}}
