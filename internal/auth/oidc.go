@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -20,14 +21,16 @@ type OIDC struct {
 	OAuth2   *oauth2.Config
 }
 
-// NewOIDC fetches the discovery doc from issuerExternal, rewrites the
-// token/userinfo/jwks endpoints to point at issuerInternal (in-cluster DNS),
-// then builds an oidc.Provider from the rewritten doc.
+// NewOIDC fetches the discovery doc from issuerInternal (in-cluster DNS —
+// pods can't resolve the external hostname; identity serves the same doc on
+// both, built from its configured JWT_ISSUER), rewrites the
+// token/userinfo/jwks endpoints to point at issuerInternal, then builds an
+// oidc.Provider from the rewritten doc.
 //
 // authorizationEndpoint and end_session_endpoint are left as-is because
 // the browser hits those directly.
 func NewOIDC(ctx context.Context, issuerExternal, issuerInternal, clientID, clientSecret, redirectURL string) (*OIDC, error) {
-	doc, err := fetchDiscoveryDoc(ctx, issuerExternal)
+	doc, err := fetchDiscoveryDoc(ctx, issuerInternal)
 	if err != nil {
 		return nil, fmt.Errorf("fetch discovery doc: %w", err)
 	}
@@ -51,10 +54,16 @@ func NewOIDC(ctx context.Context, issuerExternal, issuerInternal, clientID, clie
 	}, nil
 }
 
+// httpTimeout bounds every outbound call to identity (discovery fetch,
+// token exchange via the provider client, JWKS) so a hung endpoint can't
+// wedge requests forever.
+const httpTimeout = 10 * time.Second
+
 func fetchDiscoveryDoc(ctx context.Context, issuer string) (map[string]any, error) {
 	url := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: httpTimeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +102,10 @@ func buildProviderFromDoc(ctx context.Context, doc map[string]any) (*oidc.Provid
 	issuer, _ := doc["issuer"].(string)
 	// Provide the rewritten doc to go-oidc via a context-bound HTTP client
 	// that returns it when go-oidc fetches /.well-known/openid-configuration.
-	client := &http.Client{Transport: &docTransport{issuer: issuer, body: b}}
+	client := &http.Client{
+		Transport: &docTransport{issuer: issuer, body: b},
+		Timeout:   httpTimeout,
+	}
 	ctx = oidc.ClientContext(ctx, client)
 	return oidc.NewProvider(ctx, issuer)
 }
