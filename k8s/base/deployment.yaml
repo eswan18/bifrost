@@ -56,9 +56,9 @@ spec:
               mountPath: /mnt/secrets
               readOnly: true
       volumes:
+        # secretProviderClass is env-specific; each overlay's
+        # deployment-patch.yaml sets volumeAttributes.
         - name: secrets
           csi:
             driver: secrets-store.csi.k8s.io
             readOnly: true
-            volumeAttributes:
-              secretProviderClass: bifrost-secrets
