@@ -8,10 +8,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
       - run: go mod download
       - run: go vet ./...
       - run: go test ./...
@@ -19,10 +19,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
-      - uses: golangci/golangci-lint-action@v6
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
         with:
           version: latest

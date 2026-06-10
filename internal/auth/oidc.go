@@ -67,7 +67,7 @@ func fetchDiscoveryDoc(ctx context.Context, issuer string) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("discovery returned %d", resp.StatusCode)
 	}
