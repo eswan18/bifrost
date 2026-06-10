@@ -52,6 +52,19 @@ the staging Application. To roll out prod, use the app itself
 (`https://bifrost.ethanswan.com`) — or `ib promote bifrost` if the app is
 the thing that's broken.
 
+### First deployment
+
+`bifrost-prod` initially runs `:latest` — no `kustomize.images` override
+exists on the Application until the first promotion writes one. Bifrost
+refuses to promote a service whose prod tag is unparseable, so the FIRST
+promotion of bifrost itself must be done manually:
+
+    kubectl patch application bifrost-prod -n argocd --type merge \
+      -p '{"spec":{"source":{"kustomize":{"images":["us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:<sha>"]}}}}'
+
+Also add `bifrost` to the `SERVICES` list in `infra/ib.py` so the laptop CLI
+stays a working fallback (that change lives in the infra repo, not here).
+
 ## Out-of-repo setup
 
 This repo doesn't manage:
