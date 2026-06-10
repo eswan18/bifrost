@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -27,6 +28,8 @@ func New(argoNS string) (Client, error) {
 			return nil, err
 		}
 	}
+	// Bound every API call so a hung API server can't hang requests forever.
+	cfg.Timeout = 15 * time.Second
 	typed, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err

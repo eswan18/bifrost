@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/eswan18/bifrost/internal/auth"
@@ -38,13 +41,13 @@ func main() {
 		log.Fatalf("kube: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	oidcClient, err := auth.NewOIDC(ctx,
+	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	oidcClient, err := auth.NewOIDC(oidcCtx,
 		cfg.OIDCIssuerExternal, cfg.OIDCIssuerInternal,
 		cfg.OIDCClientID, cfg.OIDCClientSecret,
 		cfg.BaseURL+"/auth/callback",
 	)
+	oidcCancel()
 	if err != nil {
 		log.Fatalf("oidc: %v", err)
 	}
@@ -67,8 +70,37 @@ func main() {
 	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Status)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 
-	log.Printf("bifrost (%s) listening on %s", cfg.Env, cfg.HTTPAddress)
-	if err := http.ListenAndServe(cfg.HTTPAddress, mux); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddress,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Staging restarts on every auto-deploy and bifrost promotes itself in
+	// prod — drain in-flight requests on SIGTERM instead of dropping them.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("bifrost (%s) listening on %s", cfg.Env, cfg.HTTPAddress)
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("serve: %v", err)
+		}
+	case <-ctx.Done():
+		log.Printf("signal received, shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
 	}
 }
