@@ -1,3 +1,16 @@
-# Image-updater configuration for this app is set via annotations on the
-# bifrost-staging Application in applications.yaml. This file is reserved
-# for overrides that need to live outside the Application object (none yet).
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: bifrost-staging
+  namespace: argocd
+spec:
+  namespace: argocd
+  writeBackConfig:
+    method: argocd
+  applicationRefs:
+    - namePattern: bifrost-staging
+      images:
+        - alias: bifrost
+          imageName: us-central1-docker.pkg.dev/ethans-services/containers/bifrost
+          commonUpdateSettings:
+            updateStrategy: newest-build
