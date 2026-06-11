@@ -68,6 +68,44 @@ func TestLoadSessionSecretTooShort(t *testing.T) {
 	}
 }
 
+func TestRepoOverrides(t *testing.T) {
+	env := minimalValidEnv()
+	env["REPO_OVERRIDES"] = "asset-manager=asset_manager, foo = bar ,"
+	cfg, err := loadFromMap(env)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got := cfg.RepoFor("asset-manager"); got != "asset_manager" {
+		t.Errorf("RepoFor(asset-manager) = %q, want asset_manager", got)
+	}
+	if got := cfg.RepoFor("foo"); got != "bar" {
+		t.Errorf("RepoFor(foo) = %q, want bar", got)
+	}
+	if got := cfg.RepoFor("identity"); got != "identity" {
+		t.Errorf("RepoFor(identity) = %q, want identity (default)", got)
+	}
+}
+
+func TestRepoOverridesMalformed(t *testing.T) {
+	for _, bad := range []string{"asset-manager", "=repo", "svc="} {
+		env := minimalValidEnv()
+		env["REPO_OVERRIDES"] = bad
+		if _, err := loadFromMap(env); err == nil {
+			t.Errorf("REPO_OVERRIDES=%q: expected error", bad)
+		}
+	}
+}
+
+func TestGitHubOrgDefault(t *testing.T) {
+	cfg, err := loadFromMap(minimalValidEnv())
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if cfg.GitHubOrg != "eswan18" {
+		t.Errorf("GitHubOrg = %q, want eswan18", cfg.GitHubOrg)
+	}
+}
+
 func minimalValidEnv() map[string]string {
 	return map[string]string{
 		"BASE_URL":             "https://b",

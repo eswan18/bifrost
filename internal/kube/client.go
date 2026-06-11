@@ -11,7 +11,8 @@ import (
 )
 
 type Client interface {
-	ListPodImages(ctx context.Context, namespace string) ([]string, error)
+	ListPods(ctx context.Context, namespace string) ([]PodInfo, error)
+	ListArgoApps(ctx context.Context) (map[string]AppStatus, error)
 	PatchProdImage(ctx context.Context, app, image string) error
 }
 

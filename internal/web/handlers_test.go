@@ -3,6 +3,8 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,19 +14,41 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/kube"
 )
 
 type fakeKube struct {
 	mu       sync.Mutex
-	imgs     map[string][]string
+	imgs     map[string][]string         // each image becomes one healthy running pod
+	pods     map[string][]kube.PodInfo   // overrides imgs for a namespace when set
+	argoApps map[string]kube.AppStatus
+	argoErr  error
 	patched  map[string]string
 	patchErr error
 }
 
-func (f *fakeKube) ListPodImages(_ context.Context, ns string) ([]string, error) {
+func (f *fakeKube) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.imgs[ns], nil
+	if pods, ok := f.pods[ns]; ok {
+		return pods, nil
+	}
+	var out []kube.PodInfo
+	for i, img := range f.imgs[ns] {
+		out = append(out, kube.PodInfo{
+			Name:       fmt.Sprintf("pod-%d", i),
+			Phase:      "Running",
+			Containers: []kube.ContainerInfo{{Image: img, Ready: true}},
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeKube) ListArgoApps(_ context.Context) (map[string]kube.AppStatus, error) {
+	if f.argoErr != nil {
+		return nil, f.argoErr
+	}
+	return f.argoApps, nil
 }
 
 func (f *fakeKube) PatchProdImage(_ context.Context, app, image string) error {
@@ -46,6 +70,8 @@ func newTestHandlers(t *testing.T, k *fakeKube) (*Handlers, *auth.SessionManager
 		Services:        []string{"foo"},
 		SessionSecret:   []byte("12345678901234567890123456789012"),
 		ArgoCDNamespace: "argocd",
+		GitHubOrg:       "eswan18",
+		RepoOverrides:   map[string]string{"foo": "foo_repo"},
 	}
 	rend, err := LoadTemplates("../../templates")
 	if err != nil {
@@ -328,6 +354,104 @@ func TestPromoteJSONStaleExpectedSHA(t *testing.T) {
 	}
 	if msg, _ := got["error"].(string); !strings.Contains(msg, "staging changed") {
 		t.Errorf("error = %q, want staleness message", msg)
+	}
+}
+
+// TestStatusRendersHealthAndCommitLinks: env lines link tags to GitHub
+// commits (honoring repo overrides) and show a health badge derived from pod
+// readiness.
+func TestStatusRendersHealthAndCommitLinks(t *testing.T) {
+	k := &fakeKube{
+		imgs: map[string][]string{
+			"foo-prod": {"reg/foo:def5678"},
+		},
+		pods: map[string][]kube.PodInfo{
+			"foo-staging": {{
+				Name: "pod-0", Phase: "Running",
+				Containers: []kube.ContainerInfo{
+					{Image: "reg/foo:abc1234", Ready: true},
+					{Image: "reg/foo:abc1234", Ready: false},
+				},
+			}},
+		},
+	}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="https://github.com/eswan18/foo_repo/commit/abc1234"`) {
+		t.Error("staging tag should link to the commit using the override repo name")
+	}
+	if !strings.Contains(body, "1/2 ready") {
+		t.Error("staging health badge should show 1/2 ready")
+	}
+}
+
+// TestStatusRendersArgoBadges: argo badges appear only when interesting —
+// OutOfSync/Progressing render, Synced+Healthy renders nothing.
+func TestStatusRendersArgoBadges(t *testing.T) {
+	k := &fakeKube{
+		imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:abc1234"},
+		},
+		argoApps: map[string]kube.AppStatus{
+			"foo-staging": {SyncStatus: "Synced", HealthStatus: "Healthy"},
+			"foo-prod":    {SyncStatus: "OutOfSync", HealthStatus: "Progressing"},
+		},
+	}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "argo: out of sync") {
+		t.Error("prod OutOfSync argo badge missing")
+	}
+	if !strings.Contains(body, "argo: progressing") {
+		t.Error("prod Progressing argo badge missing")
+	}
+	// Exactly one of each badge: the Synced+Healthy staging env renders none.
+	if strings.Count(body, "argo: out of sync") != 1 || strings.Count(body, "argo: progressing") != 1 {
+		t.Error("Synced+Healthy staging env should render no argo badges")
+	}
+}
+
+// TestStatusSurvivesArgoListFailure: an ArgoCD API failure must not take down
+// the status page — health and promote still work, argo badges are omitted.
+func TestStatusSurvivesArgoListFailure(t *testing.T) {
+	k := &fakeKube{
+		imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:def5678"},
+		},
+		argoErr: errors.New("argocd api down"),
+	}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `action="/services/foo/promote"`) {
+		t.Error("promote form should still render when argo list fails")
+	}
+	if strings.Contains(rec.Body.String(), "argo:") {
+		t.Error("no argo badges should render when argo list fails")
 	}
 }
 
