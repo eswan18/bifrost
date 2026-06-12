@@ -20,15 +20,28 @@
             </div>
           </div>
         </div>
-        <div class="js-badge">
-          {{if eq (printf "%s" .State) "in_sync"}}
-            <span class="badge badge-success">in sync</span>
-          {{else if eq (printf "%s" .State) "out_of_sync"}}
-            <span class="badge badge-warning">out of sync</span>
-          {{else if eq (printf "%s" .State) "mid_deploy"}}
-            <span class="badge badge-info gap-1"><span class="loading loading-spinner loading-xs"></span>deploying…</span>
-          {{else}}
-            <span class="badge badge-ghost">unknown</span>
+        <div class="flex flex-col items-end gap-1">
+          <div class="js-badge">
+            {{if eq (printf "%s" .State) "in_sync"}}
+              <span class="badge badge-success">in sync</span>
+            {{else if eq (printf "%s" .State) "out_of_sync"}}
+              <span class="badge badge-warning">out of sync</span>
+            {{else if eq (printf "%s" .State) "mid_deploy"}}
+              <span class="badge badge-info gap-1"><span class="loading loading-spinner loading-xs"></span>deploying…</span>
+            {{else}}
+              <span class="badge badge-ghost">unknown</span>
+            {{end}}
+          </div>
+          {{if .Build}}
+            {{if eq .Build.State "building"}}
+              <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-info badge-sm gap-1">
+                <span class="loading loading-spinner loading-xs"></span>building {{.Build.SHA}}
+              </a>
+            {{else}}
+              <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-error badge-sm">
+                build failed {{.Build.SHA}}
+              </a>
+            {{end}}
           {{end}}
         </div>
       </div>

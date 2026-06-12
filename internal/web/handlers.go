@@ -11,6 +11,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/promote"
 )
@@ -18,6 +19,7 @@ import (
 type Handlers struct {
 	Cfg      *config.Config
 	Kube     kube.Client
+	Builds   gcb.Client // nil → build badges disabled
 	Renderer *Renderer
 }
 
@@ -29,12 +31,19 @@ type envStatus struct {
 	ArgoHealth string
 }
 
+type buildInfo struct {
+	State  string // "building" | "failed"
+	SHA    string
+	LogURL string
+}
+
 type statusRow struct {
 	Name       string
 	State      promote.State
 	Staging    envStatus
 	Prod       envStatus
 	NewProdTag string
+	Build      *buildInfo // nil → no badge (no recent build, or it succeeded)
 }
 
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
@@ -108,8 +117,8 @@ func (h *Handlers) statusRowFor(ctx context.Context, svc string) statusRow {
 }
 
 func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
-	// ArgoCD state is one bulk List shared by every row; fetch it
-	// concurrently with the per-service pod queries.
+	// ArgoCD state and build history are each one bulk call shared by every
+	// row; fetch both concurrently with the per-service pod queries.
 	argoCh := make(chan map[string]kube.AppStatus, 1)
 	go func() {
 		apps, err := h.Kube.ListArgoApps(ctx)
@@ -117,6 +126,18 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 			slog.Warn("list argocd applications failed", "error", err)
 		}
 		argoCh <- apps // nil on error → argo badges render as unknown
+	}()
+	buildsCh := make(chan map[string]gcb.BuildStatus, 1)
+	go func() {
+		if h.Builds == nil {
+			buildsCh <- nil
+			return
+		}
+		builds, err := h.Builds.LatestBuilds(ctx)
+		if err != nil {
+			slog.Warn("list cloud builds failed", "error", err)
+		}
+		buildsCh <- builds // nil on error → no build badges
 	}()
 
 	type result struct {
@@ -140,6 +161,7 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 	}
 
 	apps := <-argoCh
+	builds := <-buildsCh
 	for i := range rows {
 		if app, ok := apps[rows[i].Name+"-staging"]; ok {
 			rows[i].Staging.ArgoSync = app.SyncStatus
@@ -149,8 +171,21 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 			rows[i].Prod.ArgoSync = app.SyncStatus
 			rows[i].Prod.ArgoHealth = app.HealthStatus
 		}
+		rows[i].Build = buildBadge(builds[h.Cfg.RepoFor(rows[i].Name)])
 	}
 	return rows
+}
+
+// buildBadge maps a build to its badge, or nil when no badge should show
+// (no recent build, success, or cancelled).
+func buildBadge(b gcb.BuildStatus) *buildInfo {
+	switch {
+	case b.InProgress():
+		return &buildInfo{State: "building", SHA: b.SHA, LogURL: b.LogURL}
+	case b.Failed():
+		return &buildInfo{State: "failed", SHA: b.SHA, LogURL: b.LogURL}
+	}
+	return nil
 }
 
 // commitURL links an image tag to the commit it was built from. Returns ""

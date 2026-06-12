@@ -20,6 +20,7 @@ type Config struct {
 	ArgoCDNamespace    string
 	GitHubOrg          string
 	RepoOverrides      map[string]string // service name → repo name, when they differ
+	GCPProject         string            // for Cloud Build status; "" disables it
 }
 
 // RepoFor returns the GitHub repo name for a service. Most repos are named
@@ -39,7 +40,7 @@ func Load() (*Config, error) {
 		"OIDC_ISSUER_EXTERNAL", "OIDC_ISSUER_INTERNAL",
 		"OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
 		"SESSION_SECRET", "ARGOCD_NAMESPACE",
-		"GITHUB_ORG", "REPO_OVERRIDES",
+		"GITHUB_ORG", "REPO_OVERRIDES", "GCP_PROJECT",
 	} {
 		m[k] = os.Getenv(k)
 	}
@@ -117,5 +118,6 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		ArgoCDNamespace:    ns,
 		GitHubOrg:          org,
 		RepoOverrides:      overrides,
+		GCPProject:         m["GCP_PROJECT"],
 	}, nil
 }
