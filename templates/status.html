@@ -57,7 +57,10 @@
      boring default and rendering it would just add noise to every card. */}}
 {{define "envbadges"}}
   {{if eq (printf "%s" .Health.State) "healthy"}}
-    <span class="status status-success" title="{{.Health.Detail}}"></span>
+    {{/* A plain solid dot: daisyUI's status component layers a white
+         "depth" highlight over the fill, which washes the green out to
+         gray at this size on dark themes. */}}
+    <span class="inline-block size-2 rounded-full bg-success" title="{{.Health.Detail}}"></span>
   {{else if eq (printf "%s" .Health.State) "degraded"}}
     <span class="badge badge-warning badge-sm">{{.Health.Detail}}</span>
   {{else if eq (printf "%s" .Health.State) "crashlooping"}}
