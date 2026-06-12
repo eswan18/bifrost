@@ -57,7 +57,7 @@
      boring default and rendering it would just add noise to every card. */}}
 {{define "envbadges"}}
   {{if eq (printf "%s" .Health.State) "healthy"}}
-    <span class="badge badge-success badge-xs" title="{{.Health.Detail}}"></span>
+    <span class="status status-success" title="{{.Health.Detail}}"></span>
   {{else if eq (printf "%s" .Health.State) "degraded"}}
     <span class="badge badge-warning badge-sm">{{.Health.Detail}}</span>
   {{else if eq (printf "%s" .Health.State) "crashlooping"}}
