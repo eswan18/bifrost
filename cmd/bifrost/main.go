@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("templates: %v", err)
 	}
+	rend.SetCSSVersion(web.CSSVersion(staticDir))
 
 	kc, err := kube.New(cfg.ArgoCDNamespace)
 	if err != nil {
