@@ -10,3 +10,4 @@ data:
   ALLOWED_EMAIL: "ethanpswan@gmail.com"
   SERVICES: "asset-manager,bifrost,comms,fitness-api,fitness-dashboard,forecasting,identity"
   REPO_OVERRIDES: "asset-manager=asset_manager"
+  GCP_PROJECT: "ethans-services"

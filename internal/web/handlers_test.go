@@ -14,6 +14,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 )
 
@@ -452,6 +453,94 @@ func TestStatusSurvivesArgoListFailure(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "argo:") {
 		t.Error("no argo badges should render when argo list fails")
+	}
+}
+
+type fakeBuilds struct {
+	builds map[string]gcb.BuildStatus
+	err    error
+}
+
+func (f *fakeBuilds) LatestBuilds(_ context.Context) (map[string]gcb.BuildStatus, error) {
+	return f.builds, f.err
+}
+
+// TestStatusRendersBuildBadges: an in-progress build shows a "building"
+// badge linking to its log; build status is looked up by repo name (the
+// "foo" service maps to repo "foo_repo" via the test config's override).
+func TestStatusRendersBuildBadges(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	h.Builds = &fakeBuilds{builds: map[string]gcb.BuildStatus{
+		"foo_repo": {Status: "WORKING", SHA: "abc1234", LogURL: "https://console.example/build/1"},
+	}}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "building abc1234") {
+		t.Error("building badge missing")
+	}
+	if !strings.Contains(body, `href="https://console.example/build/1"`) {
+		t.Error("build log link missing")
+	}
+}
+
+func TestStatusRendersFailedBuildBadge(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	h.Builds = &fakeBuilds{builds: map[string]gcb.BuildStatus{
+		"foo_repo": {Status: "FAILURE", SHA: "abc1234"},
+	}}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if !strings.Contains(rec.Body.String(), "build failed abc1234") {
+		t.Error("failed-build badge missing")
+	}
+}
+
+// TestStatusNoBuildBadgeOnSuccessNilOrError: successful builds, a nil client
+// (feature disabled), and an API error all render no badge — and never break
+// the page.
+func TestStatusNoBuildBadgeOnSuccessNilOrError(t *testing.T) {
+	for name, builds := range map[string]gcb.Client{
+		"success":  &fakeBuilds{builds: map[string]gcb.BuildStatus{"foo_repo": {Status: "SUCCESS", SHA: "abc1234"}}},
+		"disabled": nil,
+		"error":    &fakeBuilds{err: errors.New("cloud build api down")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k := &fakeKube{imgs: map[string][]string{
+				"foo-staging": {"reg/foo:abc1234"},
+				"foo-prod":    {"reg/foo:abc1234"},
+			}}
+			h, _, sess := newTestHandlers(t, k)
+			h.Builds = builds
+
+			req := httptest.NewRequest("GET", "/", nil)
+			req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+			rec := httptest.NewRecorder()
+			h.Status(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, want 200", rec.Code)
+			}
+			if strings.Contains(rec.Body.String(), "building") || strings.Contains(rec.Body.String(), "build failed") {
+				t.Error("no build badge should render")
+			}
+		})
 	}
 }
 

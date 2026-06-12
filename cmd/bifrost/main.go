@@ -13,6 +13,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/web"
 )
@@ -68,9 +69,20 @@ func main() {
 		_, _ = w.Write(buf.Bytes())
 	}
 
+	// Build badges are an optional enhancement: no project configured or no
+	// credentials shouldn't keep the rest of the app from starting.
+	var builds gcb.Client
+	if cfg.GCPProject != "" {
+		builds, err = gcb.New(context.Background(), cfg.GCPProject)
+		if err != nil {
+			log.Printf("cloud build client unavailable, build badges disabled: %v", err)
+			builds = nil
+		}
+	}
+
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
-	webH := &web.Handlers{Cfg: cfg, Kube: kc, Renderer: rend}
+	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, Renderer: rend}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
 
