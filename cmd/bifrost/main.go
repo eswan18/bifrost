@@ -82,7 +82,14 @@ func main() {
 	mux.HandleFunc("GET /auth/login", authH.Login)
 	mux.HandleFunc("GET /auth/callback", authH.Callback)
 	mux.HandleFunc("POST /auth/logout", authH.Logout)
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir))))
+	// no-cache = revalidate before reuse (304 when unchanged). Without it,
+	// browsers heuristically cache /static/style.css and serve a stale
+	// stylesheet after deploys that add new CSS classes.
+	staticFiles := http.StripPrefix("/static/", http.FileServer(http.Dir(staticDir)))
+	mux.Handle("GET /static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		staticFiles.ServeHTTP(w, r)
+	}))
 	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Status)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
