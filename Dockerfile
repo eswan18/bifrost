@@ -21,7 +21,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o bifrost ./cmd/bifrost
+RUN CGO_ENABLED=0 GOOS=linux go build -o bifrost ./cmd/bifrost
 
 # Runtime
 FROM alpine:latest
