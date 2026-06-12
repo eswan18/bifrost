@@ -21,11 +21,19 @@ type Handlers struct {
 	Renderer *Renderer
 }
 
+type envStatus struct {
+	Tag        string
+	CommitURL  string // "" → render the tag without a link
+	Health     kube.HealthSummary
+	ArgoSync   string // "" → unknown; badge omitted
+	ArgoHealth string
+}
+
 type statusRow struct {
 	Name       string
 	State      promote.State
-	StagingTag string
-	ProdTag    string
+	Staging    envStatus
+	Prod       envStatus
 	NewProdTag string
 }
 
@@ -63,33 +71,54 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"state":      string(row.State),
-		"stagingTag": row.StagingTag,
-		"prodTag":    row.ProdTag,
+		"stagingTag": row.Staging.Tag,
+		"prodTag":    row.Prod.Tag,
 		"newProdTag": row.NewProdTag,
 	})
 }
 
-// statusRowFor reads staging+prod pod images for one service and derives its
-// status. Used by both the full status page and the per-service JSON endpoint.
+// statusRowFor reads staging+prod pods for one service and derives its
+// status. Used by both the full status page and the per-service JSON
+// endpoint. ArgoCD fields are stamped separately by collectStatus.
 func (h *Handlers) statusRowFor(ctx context.Context, svc string) statusRow {
 	row := statusRow{Name: svc, State: promote.Unknown}
-	staging, err := h.Kube.ListPodImages(ctx, svc+"-staging")
+	staging, err := h.Kube.ListPods(ctx, svc+"-staging")
 	if err != nil {
-		slog.Warn("list pod images failed", "service", svc, "namespace", svc+"-staging", "error", err)
+		slog.Warn("list pods failed", "service", svc, "namespace", svc+"-staging", "error", err)
 	}
-	prod, err := h.Kube.ListPodImages(ctx, svc+"-prod")
+	prod, err := h.Kube.ListPods(ctx, svc+"-prod")
 	if err != nil {
-		slog.Warn("list pod images failed", "service", svc, "namespace", svc+"-prod", "error", err)
+		slog.Warn("list pods failed", "service", svc, "namespace", svc+"-prod", "error", err)
 	}
-	s := promote.StatusOf(staging, prod)
+	s := promote.StatusOf(kube.Images(staging), kube.Images(prod))
 	row.State = s.State
-	row.StagingTag = s.StagingTag
-	row.ProdTag = s.ProdTag
 	row.NewProdTag = s.NewProdTag
+	repo := h.Cfg.RepoFor(svc)
+	row.Staging = envStatus{
+		Tag:       s.StagingTag,
+		CommitURL: commitURL(h.Cfg.GitHubOrg, repo, s.StagingTag),
+		Health:    kube.SummarizeHealth(staging),
+	}
+	row.Prod = envStatus{
+		Tag:       s.ProdTag,
+		CommitURL: commitURL(h.Cfg.GitHubOrg, repo, s.ProdTag),
+		Health:    kube.SummarizeHealth(prod),
+	}
 	return row
 }
 
 func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
+	// ArgoCD state is one bulk List shared by every row; fetch it
+	// concurrently with the per-service pod queries.
+	argoCh := make(chan map[string]kube.AppStatus, 1)
+	go func() {
+		apps, err := h.Kube.ListArgoApps(ctx)
+		if err != nil {
+			slog.Warn("list argocd applications failed", "error", err)
+		}
+		argoCh <- apps // nil on error → argo badges render as unknown
+	}()
+
 	type result struct {
 		idx int
 		row statusRow
@@ -109,7 +138,29 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 	for r := range results {
 		rows[r.idx] = r.row
 	}
+
+	apps := <-argoCh
+	for i := range rows {
+		if app, ok := apps[rows[i].Name+"-staging"]; ok {
+			rows[i].Staging.ArgoSync = app.SyncStatus
+			rows[i].Staging.ArgoHealth = app.HealthStatus
+		}
+		if app, ok := apps[rows[i].Name+"-prod"]; ok {
+			rows[i].Prod.ArgoSync = app.SyncStatus
+			rows[i].Prod.ArgoHealth = app.HealthStatus
+		}
+	}
 	return rows
+}
+
+// commitURL links an image tag to the commit it was built from. Returns ""
+// when the tag carries no recognizable SHA (GitHub resolves short SHAs).
+func commitURL(org, repo, tag string) string {
+	sha := promote.ExtractSHA(tag)
+	if sha == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://github.com/%s/%s/commit/%s", org, repo, sha)
 }
 
 func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
@@ -129,19 +180,20 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-derive the current state to make sure we promote what the user saw.
-	staging, err := h.Kube.ListPodImages(r.Context(), app+"-staging")
+	stagingPods, err := h.Kube.ListPods(r.Context(), app+"-staging")
 	if err != nil {
 		slog.Error("promote: read staging failed", "user", sess.Email, "service", app, "error", err)
 		h.respondPromote(w, r, http.StatusBadGateway, false, fmt.Sprintf("read staging: %v", err), "")
 		return
 	}
-	prod, err := h.Kube.ListPodImages(r.Context(), app+"-prod")
+	prodPods, err := h.Kube.ListPods(r.Context(), app+"-prod")
 	if err != nil {
 		slog.Error("promote: read prod failed", "user", sess.Email, "service", app, "error", err)
 		h.respondPromote(w, r, http.StatusBadGateway, false, fmt.Sprintf("read prod: %v", err), "")
 		return
 	}
-	s := promote.StatusOf(staging, prod)
+	staging := kube.Images(stagingPods)
+	s := promote.StatusOf(staging, kube.Images(prodPods))
 	if s.State != promote.OutOfSync {
 		slog.Warn("promote refused: nothing to promote", "user", sess.Email, "service", app, "state", string(s.State))
 		h.respondPromote(w, r, http.StatusConflict, false, fmt.Sprintf("%s: nothing to promote (state=%s)", app, s.State), "")

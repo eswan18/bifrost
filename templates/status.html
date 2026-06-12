@@ -7,9 +7,17 @@
       <div class="flex justify-between items-start">
         <div>
           <h2 class="card-title">{{.Name}}</h2>
-          <div class="text-sm opacity-70 mt-1">
-            <div>staging: <span class="font-mono">{{or .StagingTag "—"}}</span></div>
-            <div>prod: <span class="font-mono">{{or .ProdTag "—"}}</span></div>
+          <div class="text-sm opacity-70 mt-1 space-y-0.5">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span>staging:</span>
+              {{if .Staging.CommitURL}}<a href="{{.Staging.CommitURL}}" target="_blank" class="link font-mono">{{.Staging.Tag}}</a>{{else}}<span class="font-mono">{{or .Staging.Tag "—"}}</span>{{end}}
+              {{template "envbadges" .Staging}}
+            </div>
+            <div class="flex items-center gap-2 flex-wrap">
+              <span>prod:</span>
+              {{if .Prod.CommitURL}}<a href="{{.Prod.CommitURL}}" target="_blank" class="link font-mono">{{.Prod.Tag}}</a>{{else}}<span class="font-mono">{{or .Prod.Tag "—"}}</span>{{end}}
+              {{template "envbadges" .Prod}}
+            </div>
           </div>
         </div>
         <div class="js-badge">
@@ -42,4 +50,27 @@
 <div class="text-center mt-6">
   <a href="/" class="btn btn-ghost btn-sm">Refresh</a>
 </div>
+{{end}}
+
+{{/* envbadges renders the per-environment health badge plus ArgoCD badges.
+     ArgoCD badges appear only when something is off — Synced+Healthy is the
+     boring default and rendering it would just add noise to every card. */}}
+{{define "envbadges"}}
+  {{if eq (printf "%s" .Health.State) "healthy"}}
+    <span class="badge badge-success badge-xs" title="{{.Health.Detail}}"></span>
+  {{else if eq (printf "%s" .Health.State) "degraded"}}
+    <span class="badge badge-warning badge-sm">{{.Health.Detail}}</span>
+  {{else if eq (printf "%s" .Health.State) "crashlooping"}}
+    <span class="badge badge-error badge-sm">crashlooping — {{.Health.Detail}}</span>
+  {{else}}
+    <span class="badge badge-ghost badge-sm">{{or .Health.Detail "unknown"}}</span>
+  {{end}}
+  {{if eq .ArgoSync "OutOfSync"}}
+    <span class="badge badge-warning badge-sm badge-outline">argo: out of sync</span>
+  {{end}}
+  {{if or (eq .ArgoHealth "Degraded") (eq .ArgoHealth "Missing")}}
+    <span class="badge badge-error badge-sm badge-outline">argo: {{.ArgoHealth}}</span>
+  {{else if eq .ArgoHealth "Progressing"}}
+    <span class="badge badge-info badge-sm badge-outline">argo: progressing</span>
+  {{end}}
 {{end}}

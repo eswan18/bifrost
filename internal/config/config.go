@@ -18,6 +18,18 @@ type Config struct {
 	OIDCClientSecret   string
 	SessionSecret      []byte
 	ArgoCDNamespace    string
+	GitHubOrg          string
+	RepoOverrides      map[string]string // service name → repo name, when they differ
+}
+
+// RepoFor returns the GitHub repo name for a service. Most repos are named
+// after the service; REPO_OVERRIDES covers the exceptions
+// (e.g. asset-manager → asset_manager).
+func (c *Config) RepoFor(svc string) string {
+	if repo, ok := c.RepoOverrides[svc]; ok {
+		return repo
+	}
+	return svc
 }
 
 func Load() (*Config, error) {
@@ -27,6 +39,7 @@ func Load() (*Config, error) {
 		"OIDC_ISSUER_EXTERNAL", "OIDC_ISSUER_INTERNAL",
 		"OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
 		"SESSION_SECRET", "ARGOCD_NAMESPACE",
+		"GITHUB_ORG", "REPO_OVERRIDES",
 	} {
 		m[k] = os.Getenv(k)
 	}
@@ -73,6 +86,23 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		return nil, fmt.Errorf("SERVICES contains no service names")
 	}
 
+	org := m["GITHUB_ORG"]
+	if org == "" {
+		org = "eswan18"
+	}
+	overrides := map[string]string{}
+	for _, pair := range strings.Split(m["REPO_OVERRIDES"], ",") {
+		if pair = strings.TrimSpace(pair); pair == "" {
+			continue
+		}
+		svc, repo, ok := strings.Cut(pair, "=")
+		svc, repo = strings.TrimSpace(svc), strings.TrimSpace(repo)
+		if !ok || svc == "" || repo == "" {
+			return nil, fmt.Errorf("REPO_OVERRIDES entry %q is not svc=repo", pair)
+		}
+		overrides[svc] = repo
+	}
+
 	return &Config{
 		HTTPAddress:        addr,
 		BaseURL:            strings.TrimRight(m["BASE_URL"], "/"),
@@ -85,5 +115,7 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		OIDCClientSecret:   m["OIDC_CLIENT_SECRET"],
 		SessionSecret:      []byte(m["SESSION_SECRET"]),
 		ArgoCDNamespace:    ns,
+		GitHubOrg:          org,
+		RepoOverrides:      overrides,
 	}, nil
 }
