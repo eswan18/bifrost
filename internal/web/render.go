@@ -1,14 +1,18 @@
 package web
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
+	"os"
 	"path/filepath"
 )
 
 type Renderer struct {
-	tmpls map[string]*template.Template
+	tmpls      map[string]*template.Template
+	cssVersion string
 }
 
 // LoadTemplates parses every template under dir as a child of base.html.
@@ -21,11 +25,13 @@ func LoadTemplates(dir string) (*Renderer, error) {
 		return nil, err
 	}
 	r := &Renderer{tmpls: map[string]*template.Template{}}
+	// Late-bound so SetCSSVersion can be called after parsing.
+	funcs := template.FuncMap{"cssVersion": func() string { return r.cssVersion }}
 	for _, m := range matches {
 		if m == base {
 			continue
 		}
-		t, err := template.ParseFiles(base, m)
+		t, err := template.New(filepath.Base(base)).Funcs(funcs).ParseFiles(base, m)
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", m, err)
 		}
@@ -34,6 +40,23 @@ func LoadTemplates(dir string) (*Renderer, error) {
 		r.tmpls[name] = t
 	}
 	return r, nil
+}
+
+// SetCSSVersion sets the value the cssVersion template function returns;
+// base.html appends it to the stylesheet URL as a cache-busting query
+// param. Empty means no param (e.g. during tests).
+func (r *Renderer) SetCSSVersion(v string) { r.cssVersion = v }
+
+// CSSVersion content-hashes the compiled stylesheet. Each CSS change yields
+// a new URL, so no cache layer (browser heuristics, Cloudflare edge or
+// Browser Cache TTL) can ever serve a stale stylesheet against new HTML.
+func CSSVersion(staticDir string) string {
+	b, err := os.ReadFile(filepath.Join(staticDir, "style.css"))
+	if err != nil {
+		return "" // no busting, but the app still works
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:4])
 }
 
 func (r *Renderer) Render(w io.Writer, name string, data any) error {
