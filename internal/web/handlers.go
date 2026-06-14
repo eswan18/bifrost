@@ -26,6 +26,7 @@ type Handlers struct {
 type envStatus struct {
 	Tag        string
 	CommitURL  string // "" → render the tag without a link
+	URL        string // public app URL; "" → no "open" link
 	Health     kube.HealthSummary
 	ArgoSync   string // "" → unknown; badge omitted
 	ArgoHealth string
@@ -130,11 +131,13 @@ func (h *Handlers) statusRowFor(ctx context.Context, svc string) statusRow {
 	row.Staging = envStatus{
 		Tag:       s.StagingTag,
 		CommitURL: commitURL(h.Cfg.GitHubOrg, repo, s.StagingTag),
+		URL:       h.Cfg.StagingURLs[svc],
 		Health:    kube.SummarizeHealth(staging),
 	}
 	row.Prod = envStatus{
 		Tag:       s.ProdTag,
 		CommitURL: commitURL(h.Cfg.GitHubOrg, repo, s.ProdTag),
+		URL:       h.Cfg.ProdURLs[svc],
 		Health:    kube.SummarizeHealth(prod),
 	}
 	return row

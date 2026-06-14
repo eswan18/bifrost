@@ -22,11 +22,13 @@
               <span>staging:</span>
               {{if .Staging.CommitURL}}<a href="{{.Staging.CommitURL}}" target="_blank" class="link font-mono">{{.Staging.Tag}}</a>{{else}}<span class="font-mono">{{or .Staging.Tag "—"}}</span>{{end}}
               {{template "envbadges" .Staging}}
+              {{if .Staging.URL}}<a href="{{.Staging.URL}}" target="_blank" class="link opacity-60" title="open {{.Staging.URL}}" aria-label="open staging app">↗</a>{{end}}
             </div>
             <div class="flex items-center gap-2 flex-wrap">
               <span>prod:</span>
               {{if .Prod.CommitURL}}<a href="{{.Prod.CommitURL}}" target="_blank" class="link font-mono">{{.Prod.Tag}}</a>{{else}}<span class="font-mono">{{or .Prod.Tag "—"}}</span>{{end}}
               {{template "envbadges" .Prod}}
+              {{if .Prod.URL}}<a href="{{.Prod.URL}}" target="_blank" class="link opacity-60" title="open {{.Prod.URL}}" aria-label="open prod app">↗</a>{{end}}
             </div>
           </div>
         </div>

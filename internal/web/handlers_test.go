@@ -492,6 +492,33 @@ func TestStatusRendersHealthAndCommitLinks(t *testing.T) {
 	}
 }
 
+// TestStatusRendersOpenLinks: a service with a configured URL gets an "open"
+// link on that env line; an env with no configured URL gets none.
+func TestStatusRendersOpenLinks(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	// Prod URL configured, staging deliberately omitted (like a service with
+	// no tailnet ingress): only the prod env line should get an "open" link.
+	h.Cfg.ProdURLs = map[string]string{"foo": "https://foo.example.com"}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="https://foo.example.com"`) ||
+		!strings.Contains(body, `aria-label="open prod app"`) {
+		t.Error("prod open link missing")
+	}
+	if strings.Contains(body, `aria-label="open staging app"`) {
+		t.Error("no staging open link should render when STAGING_URLS lacks the service")
+	}
+}
+
 // TestStatusRendersArgoBadges: argo badges appear only when interesting —
 // OutOfSync/Progressing render, Synced+Healthy renders nothing.
 func TestStatusRendersArgoBadges(t *testing.T) {
