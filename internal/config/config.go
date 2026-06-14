@@ -20,6 +20,8 @@ type Config struct {
 	ArgoCDNamespace    string
 	GitHubOrg          string
 	RepoOverrides      map[string]string // service name → repo name, when they differ
+	StagingURLs        map[string]string // service name → public staging URL, for "open" links
+	ProdURLs           map[string]string // service name → public prod URL, for "open" links
 	GCPProject         string            // for Cloud Build status; "" disables it
 }
 
@@ -41,6 +43,7 @@ func Load() (*Config, error) {
 		"OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
 		"SESSION_SECRET", "ARGOCD_NAMESPACE",
 		"GITHUB_ORG", "REPO_OVERRIDES", "GCP_PROJECT",
+		"STAGING_URLS", "PROD_URLS",
 	} {
 		m[k] = os.Getenv(k)
 	}
@@ -91,17 +94,17 @@ func loadFromMap(m map[string]string) (*Config, error) {
 	if org == "" {
 		org = "eswan18"
 	}
-	overrides := map[string]string{}
-	for _, pair := range strings.Split(m["REPO_OVERRIDES"], ",") {
-		if pair = strings.TrimSpace(pair); pair == "" {
-			continue
-		}
-		svc, repo, ok := strings.Cut(pair, "=")
-		svc, repo = strings.TrimSpace(svc), strings.TrimSpace(repo)
-		if !ok || svc == "" || repo == "" {
-			return nil, fmt.Errorf("REPO_OVERRIDES entry %q is not svc=repo", pair)
-		}
-		overrides[svc] = repo
+	overrides, err := parsePairs(m["REPO_OVERRIDES"], "REPO_OVERRIDES")
+	if err != nil {
+		return nil, err
+	}
+	stagingURLs, err := parsePairs(m["STAGING_URLS"], "STAGING_URLS")
+	if err != nil {
+		return nil, err
+	}
+	prodURLs, err := parsePairs(m["PROD_URLS"], "PROD_URLS")
+	if err != nil {
+		return nil, err
 	}
 
 	return &Config{
@@ -118,6 +121,27 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		ArgoCDNamespace:    ns,
 		GitHubOrg:          org,
 		RepoOverrides:      overrides,
+		StagingURLs:        stagingURLs,
+		ProdURLs:           prodURLs,
 		GCPProject:         m["GCP_PROJECT"],
 	}, nil
+}
+
+// parsePairs parses a comma-separated list of "key=value" pairs, as used by
+// REPO_OVERRIDES and the per-env URL maps. Empty entries are skipped so a
+// trailing comma is harmless; label names the source var for error messages.
+func parsePairs(s, label string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		if pair = strings.TrimSpace(pair); pair == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(pair, "=")
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		if !ok || key == "" || val == "" {
+			return nil, fmt.Errorf("%s entry %q is not key=value", label, pair)
+		}
+		out[key] = val
+	}
+	return out, nil
 }

@@ -96,6 +96,39 @@ func TestRepoOverridesMalformed(t *testing.T) {
 	}
 }
 
+func TestPerEnvURLs(t *testing.T) {
+	env := minimalValidEnv()
+	env["STAGING_URLS"] = "identity=https://identity-staging.example.net, foo = https://foo ,"
+	env["PROD_URLS"] = "identity=https://identity.example.com"
+	cfg, err := loadFromMap(env)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got := cfg.StagingURLs["identity"]; got != "https://identity-staging.example.net" {
+		t.Errorf("StagingURLs[identity] = %q", got)
+	}
+	if got := cfg.StagingURLs["foo"]; got != "https://foo" {
+		t.Errorf("StagingURLs[foo] = %q (whitespace not trimmed)", got)
+	}
+	if got := cfg.ProdURLs["identity"]; got != "https://identity.example.com" {
+		t.Errorf("ProdURLs[identity] = %q", got)
+	}
+	// A service with no URL configured maps to "" (no link rendered).
+	if got := cfg.ProdURLs["comms"]; got != "" {
+		t.Errorf("ProdURLs[comms] = %q, want empty", got)
+	}
+}
+
+func TestPerEnvURLsMalformed(t *testing.T) {
+	for _, bad := range []string{"identity", "=https://x", "identity="} {
+		env := minimalValidEnv()
+		env["PROD_URLS"] = bad
+		if _, err := loadFromMap(env); err == nil {
+			t.Errorf("PROD_URLS=%q: expected error", bad)
+		}
+	}
+}
+
 func TestGitHubOrgDefault(t *testing.T) {
 	cfg, err := loadFromMap(minimalValidEnv())
 	if err != nil {
