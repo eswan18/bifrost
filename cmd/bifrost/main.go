@@ -104,6 +104,7 @@ func main() {
 		staticFiles.ServeHTTP(w, r)
 	}))
 	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Status)))
+	mux.Handle("GET /partial/status", requireAuth(http.HandlerFunc(webH.StatusFragment)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 

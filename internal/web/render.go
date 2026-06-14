@@ -60,9 +60,16 @@ func CSSVersion(staticDir string) string {
 }
 
 func (r *Renderer) Render(w io.Writer, name string, data any) error {
-	t, ok := r.tmpls[name]
+	return r.RenderNamed(w, name, "base", data)
+}
+
+// RenderNamed renders a specific block (e.g. "rows") from the page template
+// set, rather than the whole "base" document. Used to serve HTML fragments
+// the browser swaps in without a full-page reload.
+func (r *Renderer) RenderNamed(w io.Writer, page, block string, data any) error {
+	t, ok := r.tmpls[page]
 	if !ok {
-		return fmt.Errorf("template %q not found", name)
+		return fmt.Errorf("template %q not found", page)
 	}
-	return t.ExecuteTemplate(w, "base", data)
+	return t.ExecuteTemplate(w, block, data)
 }

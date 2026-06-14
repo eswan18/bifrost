@@ -20,8 +20,8 @@ import (
 
 type fakeKube struct {
 	mu       sync.Mutex
-	imgs     map[string][]string         // each image becomes one healthy running pod
-	pods     map[string][]kube.PodInfo   // overrides imgs for a namespace when set
+	imgs     map[string][]string       // each image becomes one healthy running pod
+	pods     map[string][]kube.PodInfo // overrides imgs for a namespace when set
 	argoApps map[string]kube.AppStatus
 	argoErr  error
 	patched  map[string]string
@@ -224,6 +224,103 @@ func TestStatusRendersDeployingSpinner(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), want) {
 		t.Error("mid-deploy badge should render an inline spinner")
 	}
+}
+
+// TestStatusFragment: the poller endpoint renders just the service rows
+// (the same markup as the full page, including live build state and promote
+// forms) with none of the page chrome, so the browser can swap it in place
+// without a full reload.
+func TestStatusFragment(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:def5678"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	h.Builds = &fakeBuilds{builds: map[string]gcb.BuildStatus{
+		"foo_repo": {Status: "WORKING", SHA: "abc1234", LogURL: "https://console.example/build/1"},
+	}}
+
+	req := httptest.NewRequest("GET", "/partial/status", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.StatusFragment(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// The rows themselves, with live build state and a working promote form.
+	if !strings.Contains(body, `data-service="foo"`) {
+		t.Error("service row missing from fragment")
+	}
+	if !strings.Contains(body, `action="/services/foo/promote"`) {
+		t.Error("promote form missing from fragment")
+	}
+	csrf := auth.CSRFToken(h.Cfg.SessionSecret, sess.ID)
+	if !strings.Contains(body, `name="csrf" value="`+csrf+`"`) {
+		t.Error("CSRF token missing from fragment promote form")
+	}
+	if !strings.Contains(body, "building abc1234") {
+		t.Error("live build badge missing from fragment")
+	}
+	// None of the page chrome — this is a fragment, not a full document.
+	if strings.Contains(body, "<!DOCTYPE") || strings.Contains(body, "Sign out") {
+		t.Error("fragment should not include the full-page chrome")
+	}
+}
+
+// TestStatusMarksActiveRows: rows that are mid-deploy or have an in-progress
+// build are tagged data-active so the client polls them on a fast cadence;
+// settled rows (in sync, out of sync) are not.
+func TestStatusMarksActiveRows(t *testing.T) {
+	// Render the fragment (rows only): the full page also embeds base.html's
+	// JS, which mentions the [data-active] selector and would false-match.
+	render := func(t *testing.T, k *fakeKube, builds gcb.Client) string {
+		t.Helper()
+		h, _, sess := newTestHandlers(t, k)
+		h.Builds = builds
+		req := httptest.NewRequest("GET", "/partial/status", nil)
+		req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+		rec := httptest.NewRecorder()
+		h.StatusFragment(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code = %d, want 200", rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	t.Run("building is active", func(t *testing.T) {
+		k := &fakeKube{imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:abc1234"},
+		}}
+		builds := &fakeBuilds{builds: map[string]gcb.BuildStatus{
+			"foo_repo": {Status: "WORKING", SHA: "abc1234"},
+		}}
+		if !strings.Contains(render(t, k, builds), "data-active") {
+			t.Error("a building service should be marked data-active")
+		}
+	})
+
+	t.Run("mid-deploy is active", func(t *testing.T) {
+		k := &fakeKube{imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234", "reg/foo:def5678"},
+			"foo-prod":    {"reg/foo:abc1234"},
+		}}
+		if !strings.Contains(render(t, k, nil), "data-active") {
+			t.Error("a mid-deploy service should be marked data-active")
+		}
+	})
+
+	t.Run("settled is not active", func(t *testing.T) {
+		k := &fakeKube{imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:abc1234"},
+		}}
+		if strings.Contains(render(t, k, nil), "data-active") {
+			t.Error("an in-sync service with no build should not be marked data-active")
+		}
+	})
 }
 
 func TestStatus404sNonRootPaths(t *testing.T) {
