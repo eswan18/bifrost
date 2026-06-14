@@ -1,8 +1,18 @@
 {{define "content"}}
 <h1 class="text-2xl font-bold mb-4">Service List</h1>
-<div class="space-y-3">
+<div class="space-y-3" id="service-list">
+  {{template "rows" .}}
+</div>
+<div class="text-center mt-6">
+  <a href="/" class="btn btn-ghost btn-sm">Refresh</a>
+</div>
+{{end}}
+
+{{/* rows is rendered both inside the full page and on its own by the
+     /partial/status poller, which swaps it into #service-list in place. */}}
+{{define "rows"}}
   {{range .Rows}}
-  <div class="card bg-base-100 shadow-sm" data-service="{{.Name}}">
+  <div class="card bg-base-100 shadow-sm" data-service="{{.Name}}"{{if .Active}} data-active{{end}}>
     <div class="card-body p-4">
       <div class="flex justify-between items-start">
         <div>
@@ -59,10 +69,6 @@
     </div>
   </div>
   {{end}}
-</div>
-<div class="text-center mt-6">
-  <a href="/" class="btn btn-ghost btn-sm">Refresh</a>
-</div>
 {{end}}
 
 {{/* envbadges renders the per-environment health badge plus ArgoCD badges.

@@ -46,6 +46,14 @@ type statusRow struct {
 	Build      *buildInfo // nil → no badge (no recent build, or it succeeded)
 }
 
+// Active reports whether the service is in flight — a deploy rolling out or a
+// build running — so the client should poll it on a fast cadence until it
+// settles. Settled states (in sync, or out of sync awaiting a manual promote)
+// are not active.
+func (r statusRow) Active() bool {
+	return r.State == promote.MidDeploy || (r.Build != nil && r.Build.State == "building")
+}
+
 func (h *Handlers) Status(w http.ResponseWriter, r *http.Request) {
 	// "GET /" is a catch-all pattern: without this, every unmatched path
 	// (favicon.ico, scanners) would trigger a full status collection.
@@ -84,6 +92,22 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 		"prodTag":    row.Prod.Tag,
 		"newProdTag": row.NewProdTag,
 	})
+}
+
+// StatusFragment renders just the service rows (no page chrome) so the
+// browser can poll it and swap the list in place without a full reload.
+func (h *Handlers) StatusFragment(w http.ResponseWriter, r *http.Request) {
+	rows := h.collectStatus(r.Context())
+	sess := auth.SessionFromContext(r.Context())
+	data := map[string]any{
+		"Rows": rows,
+		"CSRF": auth.CSRFToken(h.Cfg.SessionSecret, sess.ID),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := h.Renderer.RenderNamed(w, "status", "rows", data); err != nil {
+		slog.Error("render failed", "template", "rows", "error", err)
+		http.Error(w, "render error", http.StatusInternalServerError)
+	}
 }
 
 // statusRowFor reads staging+prod pods for one service and derives its

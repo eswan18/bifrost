@@ -36,9 +36,19 @@
     // Progressive enhancement for promote: confirm, show a spinner, POST via
     // fetch, then poll the service status until prod has rolled out the new
     // SHA. With JS disabled the plain <form> still POSTs and redirects.
+    //
+    // A background refresh also re-renders the service list every few seconds
+    // (so a build that starts, a deploy that finishes, or a health change shows
+    // up without a manual reload). It's paused while a promote is in flight and
+    // while the tab is hidden.
     (function () {
-      var POLL_MS = 3000;
+      var POLL_MS = 3000;            // post-promote rollout poll
       var TIMEOUT_MS = 5 * 60 * 1000;
+      var IDLE_MS = 30000;           // background refresh while everything's settled
+      var ACTIVE_MS = 3000;          // ...and while a build/deploy is in flight
+      var promoting = false;         // pauses the background refresh
+      var refreshTimer = null;
+      var refreshing = false;        // a background refresh fetch is in flight
 
       function spinner(label) {
         return '<span class="loading loading-spinner loading-xs"></span> ' + label;
@@ -60,35 +70,82 @@
           .catch(again);
       }
 
-      document.querySelectorAll('form.js-promote').forEach(function (form) {
-        form.addEventListener('submit', function (e) {
-          e.preventDefault();
-          var svc = form.dataset.service;
-          var tag = form.dataset.newtag;
-          if (!confirm('Promote ' + svc + ' prod to ' + tag + '?')) return;
+      // Delegated so promote forms swapped in by the background refresh keep
+      // working without re-binding listeners.
+      document.addEventListener('submit', function (e) {
+        var form = e.target.closest('form.js-promote');
+        if (!form) return;
+        e.preventDefault();
+        var svc = form.dataset.service;
+        var tag = form.dataset.newtag;
+        if (!confirm('Promote ' + svc + ' prod to ' + tag + '?')) return;
 
-          var btn = form.querySelector('button[type="submit"]');
-          btn.disabled = true;
-          btn.innerHTML = spinner('Promoting…');
-          var badge = document.querySelector('[data-service="' + svc + '"] .js-badge');
-          if (badge) {
-            badge.innerHTML = '<span class="badge badge-info gap-1">' +
-              '<span class="loading loading-spinner loading-xs"></span>deploying…</span>';
-          }
+        promoting = true; // stop the background refresh from clobbering the spinner
+        var btn = form.querySelector('button[type="submit"]');
+        btn.disabled = true;
+        btn.innerHTML = spinner('Promoting…');
+        var badge = document.querySelector('[data-service="' + svc + '"] .js-badge');
+        if (badge) {
+          badge.innerHTML = '<span class="badge badge-info gap-1">' +
+            '<span class="loading loading-spinner loading-xs"></span>deploying…</span>';
+        }
 
-          fetch(form.action, {
-            method: 'POST',
-            headers: { 'Accept': 'application/json' },
-            body: new URLSearchParams(new FormData(form))
+        fetch(form.action, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json' },
+          body: new URLSearchParams(new FormData(form))
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (res) {
+            if (!res.ok) { location.reload(); return; } // flash shows the reason
+            btn.innerHTML = spinner('Deploying…');
+            pollUntilRolledOut(svc, res.newTag, Date.now());
           })
-            .then(function (r) { return r.json(); })
-            .then(function (res) {
-              if (!res.ok) { location.reload(); return; } // flash shows the reason
-              btn.innerHTML = spinner('Deploying…');
-              pollUntilRolledOut(svc, res.newTag, Date.now());
-            })
-            .catch(function () { location.reload(); });
-        });
+          .catch(function () { location.reload(); });
+      });
+
+      // Background refresh: swap freshly-rendered rows into the list in place,
+      // adapting cadence to whether anything is in flight. Slow while every
+      // service is settled (just enough to notice a build or deploy starting),
+      // fast once a row is marked data-active so we catch it finishing.
+      function anyActive() {
+        return !!document.querySelector('#service-list [data-active]');
+      }
+      function scheduleRefresh(delay) {
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(refreshRows, delay);
+      }
+      function refreshRows() {
+        if (promoting || document.hidden || refreshing) { scheduleRefresh(IDLE_MS); return; }
+        refreshing = true;
+        fetch('/partial/status', { headers: { 'Accept': 'text/html' } })
+          .then(function (r) {
+            // Session expired → middleware redirects to login. Reload the whole
+            // page so the user lands on the sign-in flow, rather than swapping
+            // the login page's HTML into the service list.
+            if (r.redirected) { location.reload(); return null; }
+            return r.ok ? r.text() : null;
+          })
+          .then(function (html) {
+            // Re-check promoting: a promote may have started mid-flight, and
+            // swapping now would wipe out its spinner.
+            if (html === null || promoting) return;
+            var list = document.getElementById('service-list');
+            if (list) list.innerHTML = html;
+          })
+          .catch(function () { /* transient — try again next tick */ })
+          .finally(function () {
+            refreshing = false;
+            // Re-evaluate against the rows we just swapped in: a deploy that
+            // finished drops us back to the slow cadence.
+            scheduleRefresh(anyActive() ? ACTIVE_MS : IDLE_MS);
+          });
+      }
+      // Kick off from the server-rendered initial state, and refresh promptly
+      // whenever the tab returns to the foreground.
+      scheduleRefresh(anyActive() ? ACTIVE_MS : IDLE_MS);
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) scheduleRefresh(0);
       });
     })();
   </script>
