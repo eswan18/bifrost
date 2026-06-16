@@ -73,10 +73,13 @@
   {{end}}
 {{end}}
 
-{{/* envbadges renders the per-environment health badge plus ArgoCD badges.
-     ArgoCD badges appear only when something is off — Synced+Healthy is the
-     boring default and rendering it would just add noise to every card. */}}
+{{/* envbadges renders the per-environment deploy time, health badge, and
+     ArgoCD badges. The deploy time ("3h ago") shows when the running revision
+     went live; ArgoCD badges appear only when something is off — Synced+Healthy
+     is the boring default and rendering it would just add noise to every card. */}}
 {{define "envbadges"}}
+  {{$deployed := reltime .DeployedAt}}
+  {{if $deployed}}<span class="opacity-50 text-xs whitespace-nowrap" title="deployed {{abstime .DeployedAt}}">{{$deployed}}</span>{{end}}
   {{if eq (printf "%s" .Health.State) "healthy"}}
     {{/* A plain solid dot: daisyUI's status component layers a white
          "depth" highlight over the fill, which washes the green out to

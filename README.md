@@ -9,6 +9,8 @@ staging) and Asgard (gods → prod). Naming chose itself.
 ## What it does
 
 - Lists every service with its currently-deployed staging and prod image tags.
+- Shows when each environment's running revision was last deployed (from
+  ArgoCD's sync history).
 - Flags out-of-sync services and exposes a "Promote" button for each.
 - Promote = patches the prod ArgoCD `Application`, same operation as `ib promote`.
 

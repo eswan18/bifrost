@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
@@ -30,6 +31,7 @@ type envStatus struct {
 	Health     kube.HealthSummary
 	ArgoSync   string // "" → unknown; badge omitted
 	ArgoHealth string
+	DeployedAt time.Time // when the running revision went live; zero → omit
 }
 
 type buildInfo struct {
@@ -193,10 +195,12 @@ func (h *Handlers) collectStatus(ctx context.Context) []statusRow {
 		if app, ok := apps[rows[i].Name+"-staging"]; ok {
 			rows[i].Staging.ArgoSync = app.SyncStatus
 			rows[i].Staging.ArgoHealth = app.HealthStatus
+			rows[i].Staging.DeployedAt = app.DeployedAt
 		}
 		if app, ok := apps[rows[i].Name+"-prod"]; ok {
 			rows[i].Prod.ArgoSync = app.SyncStatus
 			rows[i].Prod.ArgoHealth = app.HealthStatus
+			rows[i].Prod.DeployedAt = app.DeployedAt
 		}
 		rows[i].Build = buildBadge(builds[h.Cfg.RepoFor(rows[i].Name)])
 	}
