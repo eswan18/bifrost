@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,6 +40,77 @@ func TestAppStatusFrom(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := appStatusFrom(tc.obj); got != tc.want {
 				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAppStatusDeployedAt: the deploy time is the newest entry in the
+// Application's sync history (when the running revision actually went live),
+// falling back to the last sync operation's finish time for apps that have
+// synced but recorded no history yet, and the zero time when neither exists.
+func TestAppStatusDeployedAt(t *testing.T) {
+	rfc := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("parse %q: %v", s, err)
+		}
+		return ts
+	}
+	cases := []struct {
+		name string
+		obj  map[string]any
+		want time.Time
+	}{
+		{
+			"latest history entry wins",
+			map[string]any{"status": map[string]any{
+				"history": []any{
+					map[string]any{"deployedAt": "2026-06-14T21:42:50Z"},
+					map[string]any{"deployedAt": "2026-06-14T21:47:29Z"},
+				},
+			}},
+			rfc("2026-06-14T21:47:29Z"),
+		},
+		{
+			"newest is chosen regardless of array order",
+			map[string]any{"status": map[string]any{
+				"history": []any{
+					map[string]any{"deployedAt": "2026-06-14T21:47:29Z"},
+					map[string]any{"deployedAt": "2026-06-14T21:42:50Z"},
+				},
+			}},
+			rfc("2026-06-14T21:47:29Z"),
+		},
+		{
+			"falls back to operationState when history is empty",
+			map[string]any{"status": map[string]any{
+				"operationState": map[string]any{"finishedAt": "2026-06-10T08:00:00Z"},
+			}},
+			rfc("2026-06-10T08:00:00Z"),
+		},
+		{
+			"history beats the operationState fallback",
+			map[string]any{"status": map[string]any{
+				"history":        []any{map[string]any{"deployedAt": "2026-06-14T21:47:29Z"}},
+				"operationState": map[string]any{"finishedAt": "2026-06-10T08:00:00Z"},
+			}},
+			rfc("2026-06-14T21:47:29Z"),
+		},
+		{
+			"unparseable history entries are skipped, fallback used",
+			map[string]any{"status": map[string]any{
+				"history":        []any{map[string]any{"deployedAt": "not-a-time"}},
+				"operationState": map[string]any{"finishedAt": "2026-06-10T08:00:00Z"},
+			}},
+			rfc("2026-06-10T08:00:00Z"),
+		},
+		{"no timestamps at all", map[string]any{"status": map[string]any{}}, time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := appStatusFrom(tc.obj).DeployedAt; !got.Equal(tc.want) {
+				t.Errorf("DeployedAt = %v, want %v", got, tc.want)
 			}
 		})
 	}

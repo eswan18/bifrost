@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type Renderer struct {
@@ -26,7 +27,13 @@ func LoadTemplates(dir string) (*Renderer, error) {
 	}
 	r := &Renderer{tmpls: map[string]*template.Template{}}
 	// Late-bound so SetCSSVersion can be called after parsing.
-	funcs := template.FuncMap{"cssVersion": func() string { return r.cssVersion }}
+	funcs := template.FuncMap{
+		"cssVersion": func() string { return r.cssVersion },
+		// reltime renders against the request-time clock, so the relative
+		// label stays fresh across the page's background re-renders.
+		"reltime": func(t time.Time) string { return relativeTime(t, time.Now()) },
+		"abstime": absTime,
+	}
 	for _, m := range matches {
 		if m == base {
 			continue

@@ -552,6 +552,59 @@ func TestStatusRendersArgoBadges(t *testing.T) {
 	}
 }
 
+// TestStatusRendersDeployTime: each env line shows how long ago its running
+// revision was deployed (from ArgoCD history), with the absolute timestamp in
+// a tooltip.
+func TestStatusRendersDeployTime(t *testing.T) {
+	k := &fakeKube{
+		imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:abc1234"},
+		},
+		argoApps: map[string]kube.AppStatus{
+			"foo-staging": {SyncStatus: "Synced", HealthStatus: "Healthy", DeployedAt: time.Now().Add(-3 * time.Hour)},
+			"foo-prod":    {SyncStatus: "Synced", HealthStatus: "Healthy", DeployedAt: time.Now().Add(-2 * 24 * time.Hour)},
+		},
+	}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "3h ago") {
+		t.Error("staging deploy time (3h ago) missing")
+	}
+	if !strings.Contains(body, "2d ago") {
+		t.Error("prod deploy time (2d ago) missing")
+	}
+	if !strings.Contains(body, `title="deployed `) {
+		t.Error("deploy-time tooltip missing")
+	}
+}
+
+// TestStatusOmitsDeployTimeWhenUnknown: with no deploy time available (e.g.
+// the ArgoCD lookup failed or returned no history), the env line renders no
+// deploy-time element rather than an empty or misleading one.
+func TestStatusOmitsDeployTimeWhenUnknown(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}} // no argoApps => zero DeployedAt
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if strings.Contains(rec.Body.String(), `title="deployed `) {
+		t.Error("no deploy-time element should render when the deploy time is unknown")
+	}
+}
+
 // TestStatusSurvivesArgoListFailure: an ArgoCD API failure must not take down
 // the status page — health and promote still work, argo badges are omitted.
 func TestStatusSurvivesArgoListFailure(t *testing.T) {
