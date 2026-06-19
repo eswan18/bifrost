@@ -28,11 +28,16 @@ func ExtractSHA(tag string) string {
 	return ""
 }
 
-// NewProdTag returns the tag we'd write to prod when promoting. Matches
-// ib.py:220 — if either current tag carries a -staging/-prod suffix, the
-// service uses the suffixed naming convention.
+// NewProdTag returns the tag we'd write to prod when promoting. Mirrors
+// ib.py's new_prod_tag_for. The tag scheme follows the artifact being
+// promoted — the staging image — NOT the current prod image. A service can
+// migrate to environment-agnostic builds (plain {sha} + latest, no suffix)
+// while prod still runs a legacy {sha}-prod image; keying off the stale prod
+// tag in that window synthesizes a {sha}-prod reference that was never built,
+// causing ImagePullBackOff (forecasting prod outage, June 2026). prodTag is
+// intentionally unused.
 func NewProdTag(sha, stagingTag, prodTag string) string {
-	if strings.Contains(stagingTag, "-staging") || strings.Contains(prodTag, "-prod") {
+	if strings.Contains(stagingTag, "-staging") {
 		return sha + "-prod"
 	}
 	return sha
