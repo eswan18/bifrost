@@ -45,7 +45,12 @@ func TestNewProdTag(t *testing.T) {
 	}{
 		{"plain", "abc1234", "abc1234", "def5678", "abc1234"},
 		{"suffixed via staging", "abc1234", "abc1234-staging", "def5678-prod", "abc1234-prod"},
-		{"suffixed via prod only", "abc1234", "abc1234", "def5678-prod", "abc1234-prod"},
+		// Migration window: staging already on environment-agnostic (plain)
+		// builds while prod still runs a legacy {sha}-prod image. The tag scheme
+		// follows the staging artifact, so a plain {sha}-prod must NOT be
+		// synthesized (it was never built). Regression: forecasting prod
+		// ImagePullBackOff, June 2026.
+		{"plain staging, legacy prod", "e521080", "e521080", "2679590-prod", "e521080"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
