@@ -131,7 +131,18 @@
             // swapping now would wipe out its spinner.
             if (html === null || promoting) return;
             var list = document.getElementById('service-list');
-            if (list) list.innerHTML = html;
+            if (!list) return;
+            // Preserve which cards the user has expanded: the swap replaces the
+            // whole list (server always renders cards collapsed), so remember
+            // the open ones and re-open them afterwards.
+            var open = {};
+            list.querySelectorAll('details[data-service][open]').forEach(function (d) {
+              open[d.getAttribute('data-service')] = true;
+            });
+            list.innerHTML = html;
+            list.querySelectorAll('details[data-service]').forEach(function (d) {
+              if (open[d.getAttribute('data-service')]) d.open = true;
+            });
           })
           .catch(function () { /* transient — try again next tick */ })
           .finally(function () {

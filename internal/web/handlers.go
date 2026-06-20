@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,10 +19,11 @@ import (
 )
 
 type Handlers struct {
-	Cfg      *config.Config
-	Kube     kube.Client
-	Builds   gcb.Client // nil → build badges disabled
-	Renderer *Renderer
+	Cfg        *config.Config
+	Kube       kube.Client
+	Builds     gcb.Client        // nil → build badges disabled
+	TriggerIDs map[string]string // service → Cloud Build trigger ID, for pipeline links; nil → links omitted
+	Renderer   *Renderer
 }
 
 type envStatus struct {
@@ -47,6 +49,8 @@ type statusRow struct {
 	Prod       envStatus
 	NewProdTag string
 	Build      *buildInfo // nil → no badge (no recent build, or it succeeded)
+	BuildURL   string     // Cloud Build history for this service's trigger; "" → no link
+	RepoURL    string     // GitHub source repo; "" → no link
 }
 
 // Active reports whether the service is in flight — a deploy rolling out or a
@@ -118,6 +122,7 @@ func (h *Handlers) StatusFragment(w http.ResponseWriter, r *http.Request) {
 // endpoint. ArgoCD fields are stamped separately by collectStatus.
 func (h *Handlers) statusRowFor(ctx context.Context, svc string) statusRow {
 	row := statusRow{Name: svc, State: promote.Unknown}
+	row.BuildURL = buildPipelineURL(h.Cfg.GCPProject, h.TriggerIDs[svc])
 	staging, err := h.Kube.ListPods(ctx, svc+"-staging")
 	if err != nil {
 		slog.Warn("list pods failed", "service", svc, "namespace", svc+"-staging", "error", err)
@@ -130,6 +135,7 @@ func (h *Handlers) statusRowFor(ctx context.Context, svc string) statusRow {
 	row.State = s.State
 	row.NewProdTag = s.NewProdTag
 	repo := h.Cfg.RepoFor(svc)
+	row.RepoURL = repoURL(h.Cfg.GitHubOrg, repo)
 	row.Staging = envStatus{
 		Tag:       s.StagingTag,
 		CommitURL: commitURL(h.Cfg.GitHubOrg, repo, s.StagingTag),
@@ -217,6 +223,26 @@ func buildBadge(b gcb.BuildStatus) *buildInfo {
 		return &buildInfo{State: "failed", SHA: b.SHA, LogURL: b.LogURL}
 	}
 	return nil
+}
+
+// buildPipelineURL links a service to its Cloud Build trigger's build history
+// in the GCP console (the "build pipeline" for that service). Returns "" when
+// the project or trigger ID is unknown — e.g. Cloud Build integration is
+// disabled, or the trigger list didn't load — so the template omits the link.
+func buildPipelineURL(project, triggerID string) string {
+	if project == "" || triggerID == "" {
+		return ""
+	}
+	return "https://console.cloud.google.com/cloud-build/builds;region=global?project=" +
+		url.QueryEscape(project) + "&query=" + url.QueryEscape(`trigger_id="`+triggerID+`"`)
+}
+
+// repoURL links to a service's GitHub source repo (the "Repo" button).
+func repoURL(org, repo string) string {
+	if org == "" || repo == "" {
+		return ""
+	}
+	return "https://github.com/" + org + "/" + repo
 }
 
 // commitURL links an image tag to the commit it was built from. Returns ""

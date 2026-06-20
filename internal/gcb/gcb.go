@@ -56,6 +56,29 @@ func New(ctx context.Context, project string) (Client, error) {
 	return &client{svc: svc, project: project}, nil
 }
 
+// TriggerIDs returns a map of build-trigger name → trigger ID for the project.
+// bifrost calls this once at startup to build per-service "view build pipeline"
+// links (the console filters build history by trigger ID). All of this
+// project's triggers live in the global region, which the non-regional list
+// endpoint returns; one page covers far more triggers than there are services.
+func TriggerIDs(ctx context.Context, project string) (map[string]string, error) {
+	svc, err := cloudbuild.NewService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := svc.Projects.Triggers.List(project).Context(ctx).Do()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(resp.Triggers))
+	for _, t := range resp.Triggers {
+		if t.Name != "" && t.Id != "" {
+			out[t.Name] = t.Id
+		}
+	}
+	return out, nil
+}
+
 // LatestBuilds lists recent builds (newest first) and keeps the newest one
 // per repo. One page is plenty: the page covers far more builds than there
 // are services, and a service whose last build fell off the page simply

@@ -12,50 +12,62 @@
      /partial/status poller, which swaps it into #service-list in place. */}}
 {{define "rows"}}
   {{range .Rows}}
-  <div class="card bg-base-100 shadow-sm" data-service="{{.Name}}"{{if .Active}} data-active{{end}}>
-    <div class="card-body p-4">
-      <div class="flex justify-between items-start">
-        <div>
-          <h2 class="card-title">{{.Name}}</h2>
-          <div class="text-sm opacity-70 mt-1 space-y-0.5">
-            <div class="flex items-center gap-2 flex-wrap">
-              <span>staging:</span>
-              {{if .Staging.CommitURL}}<a href="{{.Staging.CommitURL}}" target="_blank" class="link font-mono">{{.Staging.Tag}}</a>{{else}}<span class="font-mono">{{or .Staging.Tag "—"}}</span>{{end}}
-              {{template "envbadges" .Staging}}
-              {{if .Staging.URL}}<a href="{{.Staging.URL}}" target="_blank" class="link opacity-60" title="open {{.Staging.URL}}" aria-label="open staging app">↗</a>{{end}}
-            </div>
-            <div class="flex items-center gap-2 flex-wrap">
-              <span>prod:</span>
-              {{if .Prod.CommitURL}}<a href="{{.Prod.CommitURL}}" target="_blank" class="link font-mono">{{.Prod.Tag}}</a>{{else}}<span class="font-mono">{{or .Prod.Tag "—"}}</span>{{end}}
-              {{template "envbadges" .Prod}}
-              {{if .Prod.URL}}<a href="{{.Prod.URL}}" target="_blank" class="link opacity-60" title="open {{.Prod.URL}}" aria-label="open prod app">↗</a>{{end}}
-            </div>
-          </div>
+  {{/* Each service is a collapsible <details> card: the summary is the thin
+       always-visible row (name + sync badge); everything else lives in the
+       body and only shows when expanded. <details> means it works without JS;
+       base.html re-opens cards that were open across the background refresh. */}}
+  <details class="card card-collapse bg-base-100 shadow-sm" data-service="{{.Name}}"{{if .Active}} data-active{{end}}>
+    <summary class="flex items-center justify-between gap-2 px-4 py-3">
+      <span class="flex items-center gap-2 min-w-0">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="chevron size-4 opacity-50 shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" /></svg>
+        <span class="font-semibold truncate">{{.Name}}</span>
+      </span>
+      <span class="js-badge">
+        {{if eq (printf "%s" .State) "in_sync"}}
+          <span class="badge badge-success">in sync</span>
+        {{else if eq (printf "%s" .State) "out_of_sync"}}
+          <span class="badge badge-warning">out of sync</span>
+        {{else if eq (printf "%s" .State) "mid_deploy"}}
+          <span class="badge badge-info gap-1"><span class="loading loading-spinner loading-xs"></span>deploying…</span>
+        {{else}}
+          <span class="badge badge-ghost">unknown</span>
+        {{end}}
+      </span>
+    </summary>
+
+    <div class="px-4 pb-4">
+      <div class="text-sm opacity-70 space-y-0.5">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span>staging:</span>
+          {{if .Staging.CommitURL}}<a href="{{.Staging.CommitURL}}" target="_blank" class="link font-mono">{{.Staging.Tag}}</a>{{else}}<span class="font-mono">{{or .Staging.Tag "—"}}</span>{{end}}
+          {{template "envbadges" .Staging}}
+          {{if .Staging.URL}}<a href="{{.Staging.URL}}" target="_blank" class="link opacity-60" title="open {{.Staging.URL}}" aria-label="open staging app">↗</a>{{end}}
         </div>
-        <div class="flex flex-col items-end gap-1">
-          <div class="js-badge">
-            {{if eq (printf "%s" .State) "in_sync"}}
-              <span class="badge badge-success">in sync</span>
-            {{else if eq (printf "%s" .State) "out_of_sync"}}
-              <span class="badge badge-warning">out of sync</span>
-            {{else if eq (printf "%s" .State) "mid_deploy"}}
-              <span class="badge badge-info gap-1"><span class="loading loading-spinner loading-xs"></span>deploying…</span>
-            {{else}}
-              <span class="badge badge-ghost">unknown</span>
-            {{end}}
-          </div>
-          {{if .Build}}
-            {{if eq .Build.State "building"}}
-              <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-info badge-sm gap-1">
-                <span class="loading loading-spinner loading-xs"></span>building {{.Build.SHA}}
-              </a>
-            {{else}}
-              <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-error badge-sm">
-                build failed {{.Build.SHA}}
-              </a>
-            {{end}}
-          {{end}}
+        <div class="flex items-center gap-2 flex-wrap">
+          <span>prod:</span>
+          {{if .Prod.CommitURL}}<a href="{{.Prod.CommitURL}}" target="_blank" class="link font-mono">{{.Prod.Tag}}</a>{{else}}<span class="font-mono">{{or .Prod.Tag "—"}}</span>{{end}}
+          {{template "envbadges" .Prod}}
+          {{if .Prod.URL}}<a href="{{.Prod.URL}}" target="_blank" class="link opacity-60" title="open {{.Prod.URL}}" aria-label="open prod app">↗</a>{{end}}
         </div>
+      </div>
+
+      {{if .Build}}
+      <div class="mt-2">
+        {{if eq .Build.State "building"}}
+          <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-info badge-sm gap-1">
+            <span class="loading loading-spinner loading-xs"></span>building {{.Build.SHA}}
+          </a>
+        {{else}}
+          <a {{if .Build.LogURL}}href="{{.Build.LogURL}}" target="_blank"{{end}} class="badge badge-error badge-sm">
+            build failed {{.Build.SHA}}
+          </a>
+        {{end}}
+      </div>
+      {{end}}
+
+      <div class="flex flex-wrap gap-2 mt-3">
+        {{if .RepoURL}}<a href="{{.RepoURL}}" target="_blank" class="btn btn-xs btn-outline gap-1" aria-label="open repo for {{.Name}}"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" class="size-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M17.25 6.75 22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3-4.5 16.5" /></svg>Repo</a>{{end}}
+        {{if .BuildURL}}<a href="{{.BuildURL}}" target="_blank" class="btn btn-xs btn-outline gap-1" aria-label="open build pipeline for {{.Name}}"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" class="size-3.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z" /></svg>Builds</a>{{end}}
       </div>
 
       {{if eq (printf "%s" .State) "out_of_sync"}}
@@ -69,7 +81,7 @@
       </form>
       {{end}}
     </div>
-  </div>
+  </details>
   {{end}}
 {{end}}
 

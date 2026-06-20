@@ -519,6 +519,128 @@ func TestStatusRendersOpenLinks(t *testing.T) {
 	}
 }
 
+func TestBuildPipelineURL(t *testing.T) {
+	got := buildPipelineURL("ethans-services", "trig-123")
+	want := `https://console.cloud.google.com/cloud-build/builds;region=global?project=ethans-services&query=trigger_id%3D%22trig-123%22`
+	if got != want {
+		t.Errorf("buildPipelineURL = %q, want %q", got, want)
+	}
+	if buildPipelineURL("", "trig-123") != "" {
+		t.Error("no URL should be built without a project")
+	}
+	if buildPipelineURL("ethans-services", "") != "" {
+		t.Error("no URL should be built without a trigger ID")
+	}
+}
+
+func TestRepoURL(t *testing.T) {
+	if got := repoURL("eswan18", "asset_manager"); got != "https://github.com/eswan18/asset_manager" {
+		t.Errorf("repoURL = %q", got)
+	}
+	if repoURL("", "foo") != "" || repoURL("eswan18", "") != "" {
+		t.Error("repoURL should be empty when org or repo is missing")
+	}
+}
+
+// TestStatusCardsAreCollapsible: each service renders as a <details> card so it
+// can be expanded/collapsed, with the sync badge in the always-visible summary.
+func TestStatusCardsAreCollapsible(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `<details class="card card-collapse`) {
+		t.Error("service should render as a collapsible <details> card")
+	}
+	if !strings.Contains(body, "<summary") {
+		t.Error("collapsible card should have a summary row")
+	}
+}
+
+// TestStatusRendersRepoButton: the expanded card links to the GitHub source
+// repo, honoring the repo override (foo → foo_repo).
+func TestStatusRendersRepoButton(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="https://github.com/eswan18/foo_repo"`) {
+		t.Error("Repo button should link to the GitHub repo using the override name")
+	}
+	if !strings.Contains(body, `aria-label="open repo for foo"`) {
+		t.Error("Repo button missing")
+	}
+}
+
+// TestStatusRendersBuildPipelineLink: a service with a known trigger ID gets a
+// "build pipeline" link on its card, pointing at that trigger's Cloud Build
+// history. The query string is HTML-attribute-escaped (& → &amp;), so the
+// assertions check the structurally-stable parts either side of the separator.
+func TestStatusRendersBuildPipelineLink(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k)
+	h.Cfg.GCPProject = "ethans-services"
+	h.TriggerIDs = map[string]string{"foo": "trig-123"}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `aria-label="open build pipeline for foo"`) {
+		t.Error("build pipeline link missing from card")
+	}
+	if !strings.Contains(body, "Builds</a>") {
+		t.Error("build pipeline link should render as a labeled \"Builds\" button")
+	}
+	if !strings.Contains(body, "cloud-build/builds;region=global?project=ethans-services") {
+		t.Error("pipeline link should point at the service's Cloud Build history")
+	}
+	if !strings.Contains(body, "query=trigger_id%3D%22trig-123%22") {
+		t.Error("pipeline link should filter history by the trigger ID")
+	}
+}
+
+// TestStatusOmitsBuildPipelineLinkWhenUnknown: with no trigger ID for the
+// service (or Cloud Build disabled), the card renders no pipeline link rather
+// than a broken one.
+func TestStatusOmitsBuildPipelineLinkWhenUnknown(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, _, sess := newTestHandlers(t, k) // no GCPProject, no TriggerIDs
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(auth.WithSessionForTest(req.Context(), sess))
+	rec := httptest.NewRecorder()
+	h.Status(rec, req)
+
+	if strings.Contains(rec.Body.String(), "build pipeline") {
+		t.Error("no pipeline link should render when the trigger ID is unknown")
+	}
+}
+
 // TestStatusRendersArgoBadges: argo badges appear only when interesting —
 // OutOfSync/Progressing render, Synced+Healthy renders nothing.
 func TestStatusRendersArgoBadges(t *testing.T) {
