@@ -70,20 +70,35 @@ func main() {
 		_, _ = w.Write(buf.Bytes())
 	}
 
-	// Build badges are an optional enhancement: no project configured or no
-	// credentials shouldn't keep the rest of the app from starting.
+	// Build badges and pipeline links are an optional enhancement: no project
+	// configured or no credentials shouldn't keep the rest of the app from
+	// starting.
 	var builds gcb.Client
+	var triggerIDs map[string]string
 	if cfg.GCPProject != "" {
 		builds, err = gcb.New(context.Background(), cfg.GCPProject)
 		if err != nil {
 			log.Printf("cloud build client unavailable, build badges disabled: %v", err)
 			builds = nil
 		}
+		// Trigger IDs are static infra; resolve them once so each service card
+		// can link to its build pipeline. Keyed by the "{service}-build"
+		// convention all triggers follow.
+		if names, err := gcb.TriggerIDs(context.Background(), cfg.GCPProject); err != nil {
+			log.Printf("cloud build triggers unavailable, pipeline links disabled: %v", err)
+		} else {
+			triggerIDs = make(map[string]string, len(cfg.Services))
+			for _, svc := range cfg.Services {
+				if id, ok := names[svc+"-build"]; ok {
+					triggerIDs[svc] = id
+				}
+			}
+		}
 	}
 
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
-	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, Renderer: rend}
+	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
 
