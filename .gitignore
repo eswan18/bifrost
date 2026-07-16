@@ -3,12 +3,6 @@
 *.test
 *.out
 
-# Generated CSS
-/static/style.css
-
-# Node
-/node_modules/
-
 # Editor / OS
 .DS_Store
 .idea/
