@@ -37,6 +37,11 @@ func New(argoNS string) (Client, error) {
 	}
 	// Bound every API call so a hung API server can't hang requests forever.
 	cfg.Timeout = 15 * time.Second
+	// A single dashboard refresh fans out ~56 concurrent List calls; client-go's
+	// default client-side rate limit (5 QPS / 10 burst) queued most of them and
+	// added multi-second latency, so raise it well above the steady-state burst.
+	cfg.QPS = 50
+	cfg.Burst = 100
 	typed, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err

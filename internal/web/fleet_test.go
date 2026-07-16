@@ -1,0 +1,152 @@
+package web
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/eswan18/bifrost/internal/kube"
+)
+
+// --- argo visibility (label-only) --------------------------------------------
+
+func TestDeriveEnvArgoVisibility(t *testing.T) {
+	healthyPods := []kube.PodInfo{
+		{Name: "p", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234", Ready: true}}},
+	}
+	cases := []struct {
+		name      string
+		argo      kube.AppStatus
+		wantLabel string
+		wantClass string
+		wantBold  bool
+	}{
+		{"degraded", kube.AppStatus{HealthStatus: "Degraded"}, "argo degraded", "c-amb", true},
+		{"missing", kube.AppStatus{HealthStatus: "Missing"}, "argo missing", "c-amb", true},
+		{"out of sync", kube.AppStatus{SyncStatus: "OutOfSync"}, "argo out of sync", "c-amb", true},
+		{"health beats sync", kube.AppStatus{HealthStatus: "Degraded", SyncStatus: "OutOfSync"}, "argo degraded", "c-amb", true},
+		{"healthy unchanged", kube.AppStatus{HealthStatus: "Healthy", SyncStatus: "Synced"}, "healthy", "c-mut", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := deriveEnv("prod", envRaw{pods: healthyPods}, tc.argo, "eswan18", "foo", "", time.UTC)
+			// Status is deliberately left "ok" — the fix is label-only.
+			if ev.Status != "ok" {
+				t.Errorf("Status = %q, want ok (visibility fix must not change status)", ev.Status)
+			}
+			if ev.Label != tc.wantLabel {
+				t.Errorf("Label = %q, want %q", ev.Label, tc.wantLabel)
+			}
+			if ev.LabelClass != tc.wantClass {
+				t.Errorf("LabelClass = %q, want %q", ev.LabelClass, tc.wantClass)
+			}
+			if ev.Bold != tc.wantBold {
+				t.Errorf("Bold = %v, want %v", ev.Bold, tc.wantBold)
+			}
+			if tc.wantLabel != "healthy" && !strings.Contains(ev.Detail, "ArgoCD") {
+				t.Errorf("Detail = %q, want it to mention the ArgoCD state", ev.Detail)
+			}
+		})
+	}
+}
+
+func TestDeriveEnvArgoDoesNotOverrideCrash(t *testing.T) {
+	// A crashing env already reads crash; argo's Degraded view must not relabel
+	// it (only otherwise-healthy envs get the amber argo label).
+	raw := envRaw{pods: []kube.PodInfo{
+		{Name: "p", Phase: "Running", Containers: []kube.ContainerInfo{
+			{Image: "reg/foo:abc1234", Ready: false, WaitingReason: "CrashLoopBackOff", RestartCount: 3},
+		}},
+	}}
+	ev := deriveEnv("prod", raw, kube.AppStatus{HealthStatus: "Degraded"}, "eswan18", "foo", "", time.UTC)
+	if ev.Status != "crash" {
+		t.Fatalf("Status = %q, want crash", ev.Status)
+	}
+	if strings.HasPrefix(ev.Label, "argo") {
+		t.Errorf("Label = %q; a crashing env must keep its crash label", ev.Label)
+	}
+}
+
+// --- overview RECENT FAILURES 24h window -------------------------------------
+
+func TestDeriveOverviewRecentFailuresWindow(t *testing.T) {
+	now := time.Now()
+	f := &fleet{Jobs: []jobView{
+		{App: "foo", Name: "old-fail", State: "failed", EnvLabel: "prod", LastRunTime: now.Add(-5 * 24 * time.Hour)},
+		{App: "foo", Name: "recent-fail", State: "failed", EnvLabel: "prod", LastRunTime: now.Add(-2 * time.Hour)},
+	}}
+	f.deriveOverview(now)
+
+	if len(f.Overview.Failed) != 1 {
+		t.Fatalf("overview Failed = %d, want 1 (only the last-24h failure)", len(f.Overview.Failed))
+	}
+	if f.Overview.Failed[0].Name != "recent-fail" {
+		t.Errorf("Failed[0] = %q, want recent-fail", f.Overview.Failed[0].Name)
+	}
+	// Fleet-wide counts stay unbounded: both failures still count.
+	if f.JobIssues != 2 {
+		t.Errorf("JobIssues = %d, want 2 (counts are unbounded, only the column is windowed)", f.JobIssues)
+	}
+}
+
+// --- LAST RUN fallback -------------------------------------------------------
+
+func TestBuildJobsLastRunFallsBackToDash(t *testing.T) {
+	now := time.Now()
+	// A retained Job with no state flags and no start/completion time hits the
+	// default branch; jobTime is the zero time, which dayRelative renders as "",
+	// so the label must fall back to an em dash.
+	raw := envRaw{
+		cronjobs: []kube.CronJobInfo{{Name: "j", Schedule: "0 0 * * *"}},
+		jobs:     []kube.JobInfo{{Name: "j-1", OwnerCron: "j"}},
+	}
+	jobs := buildJobs("foo", "prod", raw, "eswan18", "foo", now, time.UTC)
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want 1", len(jobs))
+	}
+	if jobs[0].LastRunLabel != "—" {
+		t.Errorf("LastRunLabel = %q, want em dash", jobs[0].LastRunLabel)
+	}
+	if jobs[0].LastLabel != "—" {
+		t.Errorf("LastLabel = %q, want em dash", jobs[0].LastLabel)
+	}
+}
+
+// --- exit detail -------------------------------------------------------------
+
+func TestExitDetail(t *testing.T) {
+	job := &kube.JobInfo{Name: "nightly-1", FailReason: "BackoffLimitExceeded"}
+	cases := []struct {
+		name string
+		pods []kube.PodInfo
+		want string
+	}{
+		{
+			name: "exit code only",
+			pods: []kube.PodInfo{{OwnerName: "nightly-1", Containers: []kube.ContainerInfo{{ExitCode: i32(2)}}}},
+			want: "exit 2",
+		},
+		{
+			name: "exit code plus informative reason",
+			pods: []kube.PodInfo{{OwnerName: "nightly-1", Containers: []kube.ContainerInfo{{ExitCode: i32(137), TerminatedReason: "OOMKilled"}}}},
+			want: "exit 137 (OOMKilled)",
+		},
+		{
+			name: "generic Error reason is not appended",
+			pods: []kube.PodInfo{{OwnerName: "nightly-1", Containers: []kube.ContainerInfo{{ExitCode: i32(1), TerminatedReason: "Error"}}}},
+			want: "exit 1",
+		},
+		{
+			name: "no failing pod falls back to the Job condition",
+			pods: []kube.PodInfo{{OwnerName: "someone-else", Containers: []kube.ContainerInfo{{ExitCode: i32(1)}}}},
+			want: "BackoffLimitExceeded",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exitDetail(job, tc.pods); got != tc.want {
+				t.Errorf("exitDetail = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -23,7 +23,7 @@
     <div class="jobs-grid jobs-row">
       <span class="w6 job-app">{{.App}}</span>
       <span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span>
-      <span class="mono">{{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash">{{.SHA}}</a>{{else}}{{or .SHA "—"}}{{end}}</span>
+      <span>{{template "job-sha" .}}</span>
       <span class="{{.StateClass}} w6">{{.StateLabel}}</span>
       <span class="c-mut"{{if not .LastRunTime.IsZero}} title="{{abstime .LastRunTime}}"{{end}}>{{.LastLabel}}</span>
       <span class="c-mut">{{.Next}}</span>
@@ -37,7 +37,7 @@
     {{range .Jobs.Jobs}}
     <div class="job-card">
       <div class="job-card-top"><span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
-      <div class="c-mut job-card-meta">{{.App}} · {{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash mono">{{.SHA}}</a>{{else}}<span class="mono">{{or .SHA "—"}}</span>{{end}} · last {{.LastLabel}} · next {{.Next}}</div>
+      <div class="c-mut job-card-meta">{{.App}} · {{template "job-sha" .}} · last {{.LastLabel}} · next {{.Next}}</div>
     </div>
     {{else}}
     <div class="jobs-empty c-faint">no jobs</div>
@@ -46,3 +46,8 @@
 
 </div>
 {{end}}
+
+{{/* job-sha renders a job's image SHA as a commit link when known, or the SHA
+     (falling back to an em dash) as plain mono text. Shared by the desktop
+     IMAGE column and the mobile job card meta line. */}}
+{{define "job-sha"}}{{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash mono">{{.SHA}}</a>{{else}}<span class="mono">{{or .SHA "—"}}</span>{{end}}{{end}}

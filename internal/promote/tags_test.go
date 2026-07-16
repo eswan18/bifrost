@@ -39,6 +39,24 @@ func TestExtractSHA(t *testing.T) {
 	}
 }
 
+func TestImageBase(t *testing.T) {
+	tests := []struct {
+		image, want string
+	}{
+		{"reg/foo:abc1234", "reg/foo"},
+		{"reg/foo:abc1234-staging", "reg/foo"},
+		{"host:5000/repo:tag", "host:5000/repo"},
+		{"noTag", "noTag"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.image, func(t *testing.T) {
+			if got := ImageBase(tt.image); got != tt.want {
+				t.Errorf("ImageBase(%q) = %q, want %q", tt.image, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewProdTag(t *testing.T) {
 	tests := []struct {
 		name, sha, stagingTag, prodTag, want string

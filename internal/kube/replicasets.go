@@ -60,23 +60,34 @@ func (c *client) ListReplicaSets(ctx context.Context, namespace string) ([]Repli
 	return out, nil
 }
 
-// PreviousImage returns the image an environment ran before the current one:
-// the image of the highest-revision ReplicaSet whose image differs from
-// current. "" when the history holds no other image (e.g. a fresh deploy with
-// a single revision).
-func PreviousImage(sets []ReplicaSetInfo, current string) string {
+// NewestReplicaSet returns the highest-revision ReplicaSet for which keep
+// returns true, and whether any matched. A nil keep matches every set. It is
+// the shared "newest rollout" reduction behind both PreviousImage (keep =
+// differs from current) and the deploy-progress lookup (keep = nil).
+func NewestReplicaSet(sets []ReplicaSetInfo, keep func(ReplicaSetInfo) bool) (ReplicaSetInfo, bool) {
 	var best ReplicaSetInfo
 	found := false
 	for _, rs := range sets {
-		if rs.Image == "" || rs.Image == current {
+		if keep != nil && !keep(rs) {
 			continue
 		}
 		if !found || rs.Revision > best.Revision {
 			best, found = rs, true
 		}
 	}
-	if !found {
+	return best, found
+}
+
+// PreviousImage returns the image an environment ran before the current one:
+// the image of the highest-revision ReplicaSet whose image differs from
+// current. "" when the history holds no other image (e.g. a fresh deploy with
+// a single revision).
+func PreviousImage(sets []ReplicaSetInfo, current string) string {
+	rs, ok := NewestReplicaSet(sets, func(rs ReplicaSetInfo) bool {
+		return rs.Image != "" && rs.Image != current
+	})
+	if !ok {
 		return ""
 	}
-	return best.Image
+	return rs.Image
 }

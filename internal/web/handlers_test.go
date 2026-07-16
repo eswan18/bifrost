@@ -330,6 +330,44 @@ func TestRollbackJSONSuccess(t *testing.T) {
 	}
 }
 
+func TestRollbackJSONReturnsFullSuffixedTag(t *testing.T) {
+	// Suffix-tagged service: staging is settled on abc1234-staging with
+	// def5678-staging as the prior revision. The browser poll compares newTag
+	// against the env's FULL tag, so the JSON must carry "def5678-staging" — the
+	// full previous tag — not the bare SHA, or the poll would never match.
+	k := &fakeKube{
+		pods: map[string][]kube.PodInfo{
+			"foo-staging": {{Name: "p", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234-staging", Ready: true}}}},
+			"foo-prod":    {{Name: "p", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234-staging", Ready: true}}}},
+		},
+		rsets: map[string][]kube.ReplicaSetInfo{
+			"foo-staging": {
+				{Name: "rs2", Revision: 2, Image: "reg/foo:abc1234-staging"},
+				{Name: "rs1", Revision: 1, Image: "reg/foo:def5678-staging"},
+			},
+		},
+	}
+	h, sess := newTestHandlers(t, k)
+	// to_sha / expected_current_sha stay bare SHAs (correct for form validation).
+	body := "csrf=" + csrf(h, sess) + "&env=staging&to_sha=def5678&expected_current_sha=abc1234"
+	req := authed(t, "POST", "/services/foo/rollback", body, sess)
+	req.Header.Set("Accept", "application/json")
+	req.SetPathValue("name", "foo")
+	rec := httptest.NewRecorder()
+	h.Rollback(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	got := decodeJSON(t, rec)
+	if got["newTag"] != "def5678-staging" {
+		t.Errorf("newTag = %v, want def5678-staging (full suffixed tag for the poll)", got["newTag"])
+	}
+	if k.patched["foo-staging"] != "reg/foo:def5678-staging" {
+		t.Errorf("patched = %q, want reg/foo:def5678-staging", k.patched["foo-staging"])
+	}
+}
+
 func TestRollbackRejectsBadCSRF(t *testing.T) {
 	k := rollbackKube()
 	h, sess := newTestHandlers(t, k)
@@ -643,6 +681,28 @@ func TestAppsRendersRepoAndBuildLinks(t *testing.T) {
 	}
 }
 
+func TestAppsBuildLinksToPipelineWithoutTrackedBuild(t *testing.T) {
+	// No h.Builds → no tracked build (Build.Label is empty), but the pipeline
+	// history URL is still derivable from the project + trigger ID, so the BUILD
+	// cell must render a link there rather than an inert em dash.
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:abc1234"},
+	}}
+	h, sess := newTestHandlers(t, k)
+	h.Cfg.GCPProject = "ethans-services"
+	h.TriggerIDs = map[string]string{"foo": "trig-123"}
+	req := authed(t, "GET", "/apps", "", sess)
+	rec := httptest.NewRecorder()
+	h.Apps(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "console.cloud.google.com/cloud-build/builds") {
+		t.Error("build cell should link to the pipeline history when no build is tracked")
+	}
+}
+
 // --- fragments ---------------------------------------------------------------
 
 func TestAppsFragment(t *testing.T) {
@@ -823,7 +883,7 @@ func TestJobsAssembly(t *testing.T) {
 			"foo-staging": {
 				{Name: "web", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234", Ready: true}}},
 				{Name: "nightly-123-pod", Phase: "Failed", OwnerKind: "Job", OwnerName: "nightly-123",
-					Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234", ExitCode: i32(137)}}},
+					Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234", ExitCode: i32(137), TerminatedReason: "OOMKilled"}}},
 			},
 			"foo-prod": {
 				{Name: "web", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:abc1234", Ready: true}}},
@@ -850,7 +910,7 @@ func TestJobsAssembly(t *testing.T) {
 	for _, want := range []string{
 		"nightly", "cleanup",
 		`class="micro-inline">stg`, `class="micro-inline">prod`, // env micro-labels
-		"✗ Failed", "exit 137", // failed job with exit code from its pod
+		"✗ Failed", "exit 137 (OOMKilled)", // failed job: exit code + terminated reason from its pod
 		"✓ Succeeded", "1m 30s", // completed duration
 		"Jan 1 14:00", // next run
 	} {

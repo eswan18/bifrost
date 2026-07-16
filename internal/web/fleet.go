@@ -97,8 +97,7 @@ type appView struct {
 	Badge        string // CRASHLOOP | DRIFT | DEPLOYING | IN SYNC | UNKNOWN
 	BadgeClass   string
 
-	Build    buildView
-	BuildURL string
+	Build buildView
 
 	Jobs      []jobView
 	HasJobs   bool
@@ -238,7 +237,7 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 	for _, a := range apps {
 		f.Jobs = append(f.Jobs, a.Jobs...)
 	}
-	f.deriveOverview()
+	f.deriveOverview(now)
 	return f
 }
 
@@ -291,11 +290,11 @@ func (h *Handlers) assembleApp(ctx context.Context, svc string, now time.Time, a
 	a.PromoteTo = ps.NewProdTag
 	a.PromoteNote = "prod is " + prod.Label + " · staging is " + staging.Label
 
-	// Build.
+	// Build. When no build is tracked (no LogURL), fall back to the pipeline
+	// history so the BUILD cell still links somewhere useful.
 	a.Build = buildViewFor(builds[repo], now, loc)
-	a.BuildURL = buildPipelineURL(h.Cfg.GCPProject, h.TriggerIDs[svc])
 	if a.Build.URL == "" {
-		a.Build.URL = a.BuildURL
+		a.Build.URL = buildPipelineURL(h.Cfg.GCPProject, h.TriggerIDs[svc])
 	}
 
 	// Jobs across both environments.
@@ -375,7 +374,7 @@ func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL st
 		// env (partial readiness, ImagePullBackOff) has no state of its own, so
 		// it reads as "deploying N/M" — the closest not-yet-healthy signal.
 		ev.Status = "deploying"
-		if rs, ok := newestReplicaSet(raw.rsets); ok {
+		if rs, ok := kube.NewestReplicaSet(raw.rsets, nil); ok {
 			ev.Progress = fmt.Sprintf("%d/%d", readyPodsOnImage(raw.pods, rs.Image), rs.Replicas)
 		}
 	default:
@@ -387,6 +386,24 @@ func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL st
 	ev.Bold = ev.Status == "crash" || ev.Status == "deploying"
 	if ev.Status == "crash" {
 		ev.HashClass = "c-red"
+	}
+
+	// ArgoCD visibility (label-only): an env that reads healthy from pod state
+	// alone still hides an Application ArgoCD reports as Degraded/Missing or
+	// OutOfSync. Surface argo's own view as an amber label without touching the
+	// env's status — overall precedence, promote/rollback gating, and fleet
+	// counts all key off ev.Status, which is deliberately left unchanged.
+	if ev.Status == "ok" {
+		if label, detail := argoAttention(argo); label != "" {
+			ev.Label = label
+			ev.LabelClass = "c-amb"
+			ev.Bold = true
+			if ev.Detail != "" {
+				ev.Detail += " · " + detail
+			} else {
+				ev.Detail = detail
+			}
+		}
 	}
 
 	if ev.PrevImage = kube.PreviousImage(raw.rsets, image); ev.PrevImage != "" {
@@ -419,6 +436,23 @@ func deployingEnv(raw envRaw, argo kube.AppStatus) bool {
 		return true
 	}
 	return argo.HealthStatus == "Progressing"
+}
+
+// argoAttention surfaces an ArgoCD problem that an otherwise-healthy env would
+// hide, returning an amber status label and a tooltip fragment (both "" when
+// argo looks fine). A Degraded/Missing health takes precedence over an
+// OutOfSync sync, matching how a human would triage the Application.
+func argoAttention(argo kube.AppStatus) (label, detail string) {
+	switch argo.HealthStatus {
+	case "Degraded":
+		return "argo degraded", "ArgoCD health: Degraded"
+	case "Missing":
+		return "argo missing", "ArgoCD health: Missing"
+	}
+	if argo.SyncStatus == "OutOfSync" {
+		return "argo out of sync", "ArgoCD sync: OutOfSync"
+	}
+	return "", ""
 }
 
 func deriveOverall(s, p envView, ps promote.Status) string {
@@ -556,7 +590,13 @@ func buildJobs(app, env string, raw envRaw, org, repo string, now time.Time, loc
 			jv.StateLabel = "—"
 			jv.StateClass = "c-faint"
 			jv.LastRunTime = jobTime(latest)
-			jv.LastRunLabel = dayRelative(jv.LastRunTime, now, loc)
+			// A retained Job with no start/completion time has no run to date;
+			// dayRelative renders the zero time as "", so fall back to an em dash.
+			if jv.LastRunTime.IsZero() {
+				jv.LastRunLabel = "—"
+			} else {
+				jv.LastRunLabel = dayRelative(jv.LastRunTime, now, loc)
+			}
 		}
 
 		jv.LastLabel = jv.LastRunLabel
@@ -622,7 +662,14 @@ func exitDetail(job *kube.JobInfo, pods []kube.PodInfo) string {
 		}
 		for _, c := range p.Containers {
 			if c.ExitCode != nil && *c.ExitCode != 0 {
-				return fmt.Sprintf("exit %d", *c.ExitCode)
+				detail := fmt.Sprintf("exit %d", *c.ExitCode)
+				// TerminatedReason names why the kernel/kubelet killed it (e.g.
+				// "OOMKilled"); "Error" is just the generic non-zero-exit reason
+				// the code already conveys, so only append something informative.
+				if c.TerminatedReason != "" && c.TerminatedReason != "Error" {
+					detail += fmt.Sprintf(" (%s)", c.TerminatedReason)
+				}
+				return detail
 			}
 		}
 	}
@@ -661,18 +708,23 @@ func jobsSummary(jobs []jobView) (label, class string, bold bool) {
 	} else {
 		label = fmt.Sprintf("%d jobs", len(jobs))
 	}
-	class = "c-mut"
+	// The summary takes the color of the most severe job state present.
+	// stateRank stays the single source of truth for that failed>running>ok
+	// precedence: the lowest rank wins.
+	best := 3
 	for _, j := range jobs {
-		if j.State == "failed" {
-			return label, "c-red", true
+		if r := stateRank(j.State); r < best {
+			best = r
 		}
 	}
-	for _, j := range jobs {
-		if j.State == "running" {
-			return label, "c-blu", true
-		}
+	switch best {
+	case 0: // failed
+		return label, "c-red", true
+	case 1: // running
+		return label, "c-blu", true
+	default:
+		return label, "c-mut", false
 	}
-	return label, class, false
 }
 
 // --- pod / replicaset helpers -------------------------------------------------
@@ -681,7 +733,7 @@ func jobsSummary(jobs []jobView) (label, class string, bold bool) {
 // ReplicaSet's image (the rollout target), falling back to any long-running
 // pod image when ReplicaSet history is unavailable.
 func currentImage(pods []kube.PodInfo, sets []kube.ReplicaSetInfo) string {
-	if rs, ok := newestReplicaSet(sets); ok && rs.Image != "" {
+	if rs, ok := kube.NewestReplicaSet(sets, nil); ok && rs.Image != "" {
 		return rs.Image
 	}
 	if imgs := kube.Images(pods); len(imgs) > 0 {
@@ -701,17 +753,6 @@ func longRunningPods(pods []kube.PodInfo) []kube.PodInfo {
 		out = append(out, p)
 	}
 	return out
-}
-
-func newestReplicaSet(sets []kube.ReplicaSetInfo) (kube.ReplicaSetInfo, bool) {
-	var best kube.ReplicaSetInfo
-	found := false
-	for _, rs := range sets {
-		if !found || rs.Revision > best.Revision {
-			best, found = rs, true
-		}
-	}
-	return best, found
 }
 
 // readyPodsOnImage counts long-running pods fully ready and running the given
@@ -752,7 +793,7 @@ func crashRestarts(pods []kube.PodInfo) int32 {
 
 // --- overview derivation ------------------------------------------------------
 
-func (f *fleet) deriveOverview() {
+func (f *fleet) deriveOverview(now time.Time) {
 	o := &f.Overview
 	for _, a := range f.Apps {
 		switch a.Overall {
@@ -832,6 +873,11 @@ func (f *fleet) deriveOverview() {
 				Meta:     j.App + " " + j.EnvLabel + " · running for " + j.RunningFor,
 			})
 		case "failed":
+			// The overview's RECENT FAILURES column is scoped to the last 24h (its
+			// empty state says so); fleet counts and attention items stay unbounded.
+			if j.LastRunTime.IsZero() || now.Sub(j.LastRunTime) > 24*time.Hour {
+				continue
+			}
 			o.Failed = append(o.Failed, overviewJob{
 				Name:     j.Name,
 				EnvLabel: j.EnvLabel,

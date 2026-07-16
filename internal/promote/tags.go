@@ -18,6 +18,17 @@ func ExtractTag(image string) string {
 	return "latest"
 }
 
+// ImageBase returns the registry/repository portion of a full image ref,
+// dropping the ":tag" suffix. Only the last colon separates the tag, so a
+// registry host:port (e.g. "host:5000/repo:tag" → "host:5000/repo") is
+// preserved. A ref with no tag is returned unchanged.
+func ImageBase(image string) string {
+	if i := strings.LastIndex(image, ":"); i >= 0 {
+		return image[:i]
+	}
+	return image
+}
+
 func ExtractSHA(tag string) string {
 	if m := suffixedSHA.FindStringSubmatch(tag); m != nil {
 		return m[1]

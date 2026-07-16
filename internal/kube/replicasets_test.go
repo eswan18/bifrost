@@ -112,6 +112,37 @@ func TestListReplicaSets(t *testing.T) {
 	}
 }
 
+func TestNewestReplicaSet(t *testing.T) {
+	sets := []ReplicaSetInfo{
+		{Name: "a", Revision: 1, Image: "reg/app:v1"},
+		{Name: "c", Revision: 3, Image: "reg/app:v3"},
+		{Name: "b", Revision: 2, Image: "reg/app:v2"},
+	}
+
+	// Nil predicate matches every set → highest revision wins regardless of order.
+	if rs, ok := NewestReplicaSet(sets, nil); !ok || rs.Name != "c" {
+		t.Errorf("NewestReplicaSet(nil) = %+v, %v; want c, true", rs, ok)
+	}
+
+	// Predicate filters: exclude the newest, next-highest wins.
+	rs, ok := NewestReplicaSet(sets, func(rs ReplicaSetInfo) bool {
+		return rs.Image != "reg/app:v3"
+	})
+	if !ok || rs.Name != "b" {
+		t.Errorf("NewestReplicaSet(keep) = %+v, %v; want b, true", rs, ok)
+	}
+
+	// No match → false.
+	if _, ok := NewestReplicaSet(sets, func(ReplicaSetInfo) bool { return false }); ok {
+		t.Error("NewestReplicaSet with a never-true predicate should report no match")
+	}
+
+	// Empty input → false.
+	if _, ok := NewestReplicaSet(nil, nil); ok {
+		t.Error("NewestReplicaSet(nil sets) should report no match")
+	}
+}
+
 func TestPreviousImage(t *testing.T) {
 	cases := []struct {
 		name    string

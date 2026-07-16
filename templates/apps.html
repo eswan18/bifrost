@@ -60,7 +60,7 @@
         </div>
       </div>
       <div class="card-meta">
-        <span class="c-mut">build {{if .Build.Label}}<a {{if .Build.URL}}href="{{.Build.URL}}" target="_blank"{{end}} class="{{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{.Build.Label}}</a>{{else}}<span class="c-faint">—</span>{{end}}</span>
+        <span class="c-mut">build {{if .Build.URL}}<a href="{{.Build.URL}}" target="_blank" class="{{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{or .Build.Label "—"}}</a>{{else}}<span class="c-faint">—</span>{{end}}</span>
         {{if .HasJobs}}<a href="/jobs?app={{.Name}}" class="jobs-link {{.JobsClass}}{{if .JobsBold}} w6{{end}}">{{.JobsLabel}} →</a>{{end}}
       </div>
       {{if .HasJobs}}
@@ -87,7 +87,7 @@
 
 {{define "env-cell"}}<span class="mono env-hash">{{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash {{.HashClass}}">{{.Tag}}</a>{{else}}<span class="hash {{.HashClass}}">{{or .Tag "—"}}</span>{{end}}</span> <span class="env-status {{.LabelClass}}{{if .Bold}} w6{{end}}"{{if .Detail}} title="{{.Detail}}"{{end}}>· {{.Label}}</span>{{if .AppURL}} <a href="{{.AppURL}}" target="_blank" class="ext" aria-label="open {{.Env}} app">↗</a>{{end}}{{end}}
 
-{{define "build-cell"}}{{if .Build.Label}}<a {{if .Build.URL}}href="{{.Build.URL}}" target="_blank"{{end}} class="build-link {{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{.Build.Label}}</a>{{else}}<span class="c-faint">—</span>{{end}}{{end}}
+{{define "build-cell"}}{{if .Build.URL}}<a href="{{.Build.URL}}" target="_blank" class="build-link {{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{or .Build.Label "—"}}</a>{{else}}<span class="c-faint">—</span>{{end}}{{end}}
 
 {{define "jobs-link"}}{{if .HasJobs}}<a href="/jobs?app={{.Name}}" class="jobs-link {{.JobsClass}}{{if .JobsBold}} w6{{end}}">{{.JobsLabel}}</a>{{else}}<span class="c-faint">no jobs</span>{{end}}{{end}}
 

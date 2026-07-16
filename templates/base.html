@@ -171,6 +171,24 @@
   function anyActive() { return TAB && (TAB.hasAttribute('data-active') || !!TAB.querySelector('[data-active]')); }
   function schedule(delay) { clearTimeout(timer); timer = setTimeout(refresh, delay); }
   function reloadClean() { location.replace(location.pathname + location.search); }
+  // closeModal clears the :target the same way the ✕ / Cancel links do.
+  function closeModal() { location.hash = 'close'; }
+
+  // showNotice drops a transient flash-styled banner just above the tab body.
+  // It lives outside #tab-body so the background refresh (which only rewrites
+  // #tab-body) leaves it in place; reloadClean replaces it with the server-side
+  // flash once the rollout settles.
+  function showNotice(msg) {
+    if (!TAB || !TAB.parentNode) return;
+    var n = document.getElementById('mutation-notice');
+    if (!n) {
+      n = document.createElement('div');
+      n.id = 'mutation-notice';
+      n.className = 'flash flash-ok';
+      TAB.parentNode.insertBefore(n, TAB);
+    }
+    n.textContent = msg;
+  }
 
   // Background refresh: re-render the active tab's body in place, preserving
   // which app rows the user has expanded. Paused while a mutation is running,
@@ -208,6 +226,7 @@
     e.preventDefault();
     mutating = true;
     var svc = form.dataset.service, env = form.dataset.env;
+    var promoting = form.action.indexOf('/promote') !== -1;
     var btn = form.querySelector('button[type="submit"]');
     if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
     fetch(form.action, {
@@ -218,6 +237,14 @@
       .then(function (r) { return r.json(); })
       .then(function (res) {
         if (!res.ok) { reloadClean(); return; }
+        // Success: unpause the background refresh, close the modal, and show a
+        // transient deploying notice while polling for the rollout to land.
+        mutating = false;
+        closeModal();
+        showNotice(promoting
+          ? 'Promoting ' + svc + ' → ' + res.newTag + ' — deploying…'
+          : 'Rolling back ' + svc + ' ' + res.env + ' → ' + res.newTag + '…');
+        schedule(ACTIVE);
         pollRollout(svc, res.env, res.newTag, Date.now());
       })
       .catch(function () { reloadClean(); });

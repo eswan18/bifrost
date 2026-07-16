@@ -45,7 +45,6 @@ type pageVM struct {
 	JobCount  int
 	JobIssues int
 
-	Fleet    *fleet
 	Apps     []appView
 	Overview *overviewData
 	Jobs     *jobsPage
@@ -194,7 +193,6 @@ func (h *Handlers) dashboardVM(r *http.Request, tab, refresh string, f *fleet) p
 		AppIssues:  f.AppIssues,
 		JobCount:   f.JobCount,
 		JobIssues:  f.JobIssues,
-		Fleet:      f,
 		Apps:       f.Apps,
 		Overview:   &f.Overview,
 	}
@@ -284,19 +282,31 @@ func (h *Handlers) readPodsRS(ctx context.Context, ns string) ([]kube.PodInfo, [
 
 // --- promote -----------------------------------------------------------------
 
-func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
-	app := r.PathValue("name")
-	if !h.knownService(app) {
+// authorizeMutation runs the guards every mutating endpoint shares: the path
+// must name a known service, the form must parse, and the request must carry a
+// valid CSRF token for the session. It writes the matching error response and
+// returns ok=false when any guard fails.
+func (h *Handlers) authorizeMutation(w http.ResponseWriter, r *http.Request) (*auth.Session, bool) {
+	if !h.knownService(r.PathValue("name")) {
 		http.Error(w, "unknown service", http.StatusNotFound)
-		return
+		return nil, false
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	sess := auth.SessionFromContext(r.Context())
 	if !auth.VerifyCSRF(h.Cfg.SessionSecret, sess.ID, r.FormValue("csrf")) {
 		http.Error(w, "bad csrf", http.StatusForbidden)
+		return nil, false
+	}
+	return sess, true
+}
+
+func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
+	app := r.PathValue("name")
+	sess, ok := h.authorizeMutation(w, r)
+	if !ok {
 		return
 	}
 
@@ -352,17 +362,8 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 // (mirroring promote's staleness guard).
 func (h *Handlers) Rollback(w http.ResponseWriter, r *http.Request) {
 	app := r.PathValue("name")
-	if !h.knownService(app) {
-		http.Error(w, "unknown service", http.StatusNotFound)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	sess := auth.SessionFromContext(r.Context())
-	if !auth.VerifyCSRF(h.Cfg.SessionSecret, sess.ID, r.FormValue("csrf")) {
-		http.Error(w, "bad csrf", http.StatusForbidden)
+	sess, ok := h.authorizeMutation(w, r)
+	if !ok {
 		return
 	}
 
@@ -410,7 +411,8 @@ func (h *Handlers) Rollback(w http.ResponseWriter, r *http.Request) {
 		h.respondMutation(w, r, http.StatusConflict, false, fmt.Sprintf("%s %s: no previous image known", app, env), "", env)
 		return
 	}
-	prevSHA := promote.ExtractSHA(promote.ExtractTag(prevImage))
+	prevTag := promote.ExtractTag(prevImage)
+	prevSHA := promote.ExtractSHA(prevTag)
 	if toSHA != "" && prevSHA != toSHA {
 		slog.Warn("rollback refused: target changed since page load",
 			"user", sess.Email, "service", app, "env", env,
@@ -429,8 +431,12 @@ func (h *Handlers) Rollback(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("rollback succeeded", "user", sess.Email, "service", app,
 		"env", env, "from", currentSHA, "to", prevSHA)
+	// newTag is the FULL previous tag (e.g. "def5678-staging"), not the bare
+	// SHA: the browser poll compares it against the env's live tag, which carries
+	// the {sha}-{env} suffix for suffix-tagged services. Passing the bare SHA
+	// would never match and the poll would spin until timeout.
 	h.respondMutation(w, r, http.StatusOK, true,
-		fmt.Sprintf("Rolled back %s %s → %s", app, env, prevSHA), prevSHA, env)
+		fmt.Sprintf("Rolled back %s %s → %s", app, env, prevSHA), prevTag, env)
 }
 
 // respondMutation sets the flash (shown after the page reloads) and replies in
@@ -509,11 +515,7 @@ func backTo(r *http.Request) string {
 
 // replaceTag swaps the tag on a full image ref, keeping the registry path.
 func replaceTag(image, tag string) string {
-	base := image
-	if i := strings.LastIndex(image, ":"); i >= 0 {
-		base = image[:i]
-	}
-	return base + ":" + tag
+	return promote.ImageBase(image) + ":" + tag
 }
 
 // buildPipelineURL links a service to its Cloud Build trigger's build history
