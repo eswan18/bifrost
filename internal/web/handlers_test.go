@@ -20,7 +20,9 @@ import (
 
 // fakeKube serves per-namespace fixtures. imgs is a shorthand that expands each
 // image into one healthy running pod; pods/rsets/cronjobs/jobs override or
-// supplement it for a namespace when set.
+// supplement it for a namespace when set. Like the real client, an empty
+// namespace lists across all namespaces, with Namespace stamped on each item
+// so the fleet's grouping works.
 type fakeKube struct {
 	mu       sync.Mutex
 	imgs     map[string][]string
@@ -37,18 +39,44 @@ type fakeKube struct {
 func (f *fakeKube) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if pods, ok := f.pods[ns]; ok {
-		return pods, nil
+	if ns != "" {
+		return f.podsIn(ns), nil
 	}
+	// Cluster-wide: the union of explicit pod fixtures and imgs-shorthand
+	// namespaces.
+	seen := map[string]bool{}
 	var out []kube.PodInfo
-	for i, img := range f.imgs[ns] {
-		out = append(out, kube.PodInfo{
-			Name:       fmt.Sprintf("pod-%d", i),
-			Phase:      "Running",
-			Containers: []kube.ContainerInfo{{Image: img, Ready: true}},
-		})
+	for ns := range f.pods {
+		seen[ns] = true
+		out = append(out, f.podsIn(ns)...)
+	}
+	for ns := range f.imgs {
+		if !seen[ns] {
+			out = append(out, f.podsIn(ns)...)
+		}
 	}
 	return out, nil
+}
+
+// podsIn expands the imgs shorthand unless explicit pods override the
+// namespace, stamping Namespace on copies so fixtures stay untouched.
+func (f *fakeKube) podsIn(ns string) []kube.PodInfo {
+	src, ok := f.pods[ns]
+	if !ok {
+		for i, img := range f.imgs[ns] {
+			src = append(src, kube.PodInfo{
+				Name:       fmt.Sprintf("pod-%d", i),
+				Phase:      "Running",
+				Containers: []kube.ContainerInfo{{Image: img, Ready: true}},
+			})
+		}
+	}
+	out := make([]kube.PodInfo, len(src))
+	for i, p := range src {
+		p.Namespace = ns
+		out[i] = p
+	}
+	return out
 }
 
 func (f *fakeKube) ListArgoApps(_ context.Context) (map[string]kube.AppStatus, error) {
@@ -72,15 +100,45 @@ func (f *fakeKube) PatchAppImage(_ context.Context, app, env, image string) erro
 }
 
 func (f *fakeKube) ListCronJobs(_ context.Context, ns string) ([]kube.CronJobInfo, error) {
-	return f.cronjobs[ns], nil
+	if ns != "" {
+		return f.cronjobs[ns], nil
+	}
+	var out []kube.CronJobInfo
+	for ns, items := range f.cronjobs {
+		for _, cj := range items {
+			cj.Namespace = ns
+			out = append(out, cj)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeKube) ListJobs(_ context.Context, ns string) ([]kube.JobInfo, error) {
-	return f.jobs[ns], nil
+	if ns != "" {
+		return f.jobs[ns], nil
+	}
+	var out []kube.JobInfo
+	for ns, items := range f.jobs {
+		for _, j := range items {
+			j.Namespace = ns
+			out = append(out, j)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeKube) ListReplicaSets(_ context.Context, ns string) ([]kube.ReplicaSetInfo, error) {
-	return f.rsets[ns], nil
+	if ns != "" {
+		return f.rsets[ns], nil
+	}
+	var out []kube.ReplicaSetInfo
+	for ns, items := range f.rsets {
+		for _, rs := range items {
+			rs.Namespace = ns
+			out = append(out, rs)
+		}
+	}
+	return out, nil
 }
 
 func i32(v int32) *int32 { return &v }

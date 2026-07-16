@@ -16,6 +16,9 @@ const revisionAnnotation = "deployment.kubernetes.io/revision"
 // history. Old revisions (replicas 0) are the source for "previous image"
 // when rolling back.
 type ReplicaSetInfo struct {
+	// Namespace groups cluster-wide List results back to their {svc}-{env}
+	// namespace.
+	Namespace  string
 	Name       string
 	Deployment string // owning Deployment name; "" for unowned ReplicaSets
 	// Revision is the deployment.kubernetes.io/revision annotation; 0 when
@@ -29,7 +32,7 @@ type ReplicaSetInfo struct {
 }
 
 // ListReplicaSets returns the ReplicaSets in a namespace, including scaled-down
-// historical revisions.
+// historical revisions. An empty namespace lists across all namespaces.
 func (c *client) ListReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetInfo, error) {
 	list, err := c.typed.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -38,6 +41,7 @@ func (c *client) ListReplicaSets(ctx context.Context, namespace string) ([]Repli
 	out := make([]ReplicaSetInfo, 0, len(list.Items))
 	for _, rs := range list.Items {
 		info := ReplicaSetInfo{
+			Namespace:     rs.Namespace,
 			Name:          rs.Name,
 			Replicas:      1, // K8s default when spec.replicas is unset
 			ReadyReplicas: rs.Status.ReadyReplicas,

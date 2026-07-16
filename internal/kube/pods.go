@@ -31,7 +31,10 @@ type ContainerInfo struct {
 }
 
 type PodInfo struct {
-	Name string
+	// Namespace groups cluster-wide List results back to their {svc}-{env}
+	// namespace.
+	Namespace string
+	Name      string
 	// OwnerKind is the pod's controller kind ("ReplicaSet", "Job", ...), ""
 	// for bare pods. Job-owned pods run to completion on whatever image the
 	// Job was created with, so they don't reflect what's deployed.
@@ -43,6 +46,8 @@ type PodInfo struct {
 	Containers []ContainerInfo
 }
 
+// ListPods returns the pods in a namespace. An empty namespace lists across
+// all namespaces.
 func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, error) {
 	pods, err := c.typed.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -50,7 +55,7 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 	}
 	out := make([]PodInfo, 0, len(pods.Items))
 	for _, p := range pods.Items {
-		info := PodInfo{Name: p.Name, Phase: string(p.Status.Phase)}
+		info := PodInfo{Namespace: p.Namespace, Name: p.Name, Phase: string(p.Status.Phase)}
 		if ref := metav1.GetControllerOf(&p); ref != nil {
 			info.OwnerKind = ref.Kind
 			info.OwnerName = ref.Name

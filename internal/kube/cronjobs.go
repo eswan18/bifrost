@@ -12,8 +12,11 @@ import (
 
 // CronJobInfo is one CronJob in a service namespace.
 type CronJobInfo struct {
-	Name     string
-	Schedule string // raw cron expression, e.g. "0 9 * * *"
+	// Namespace groups cluster-wide List results back to their {svc}-{env}
+	// namespace.
+	Namespace string
+	Name      string
+	Schedule  string // raw cron expression, e.g. "0 9 * * *"
 	// TimeZone is spec.timeZone; "" means the cluster default (UTC on GKE).
 	TimeZone  string
 	Suspended bool
@@ -29,7 +32,10 @@ type CronJobInfo struct {
 // JobInfo is one Job in a service namespace, including finished Jobs still
 // retained by history limits.
 type JobInfo struct {
-	Name string
+	// Namespace groups cluster-wide List results back to their {svc}-{env}
+	// namespace.
+	Namespace string
+	Name      string
 	// OwnerCron is the owning CronJob's name; "" for one-off Jobs.
 	OwnerCron string
 	// Image is the first container image in the Job's pod template — the image
@@ -56,6 +62,7 @@ func (c *client) ListCronJobs(ctx context.Context, namespace string) ([]CronJobI
 	out := make([]CronJobInfo, 0, len(list.Items))
 	for _, cj := range list.Items {
 		info := CronJobInfo{
+			Namespace: cj.Namespace,
 			Name:      cj.Name,
 			Schedule:  cj.Spec.Schedule,
 			Suspended: cj.Spec.Suspend != nil && *cj.Spec.Suspend,
@@ -84,8 +91,9 @@ func (c *client) ListJobs(ctx context.Context, namespace string) ([]JobInfo, err
 	out := make([]JobInfo, 0, len(list.Items))
 	for _, j := range list.Items {
 		info := JobInfo{
-			Name:   j.Name,
-			Active: j.Status.Active > 0,
+			Namespace: j.Namespace,
+			Name:      j.Name,
+			Active:    j.Status.Active > 0,
 		}
 		if ref := metav1.GetControllerOf(&j); ref != nil && ref.Kind == "CronJob" {
 			info.OwnerCron = ref.Name
