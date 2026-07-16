@@ -8,11 +8,11 @@ data:
   TEMPLATES_DIR: "/app/templates"
   STATIC_DIR: "/app/static"
   ALLOWED_EMAIL: "ethanpswan@gmail.com"
-  SERVICES: "asset-manager,bifrost,comms,fitness-api,fitness-dashboard,forecasting,identity"
-  REPO_OVERRIDES: "asset-manager=asset_manager,fitness-api=footstrike-api,fitness-dashboard=footstrike-dashboard"
+  SERVICES: "asset-manager,bifrost,comms,footstrike-api,footstrike-dashboard,forecasting,identity"
+  REPO_OVERRIDES: "asset-manager=asset_manager"
   GCP_PROJECT: "ethans-services"
   # Public URLs for the "open ↗" links on each service card. comms is omitted
   # (background worker, no ingress). Staging hosts are the Tailscale operator
   # names (tailnet-only). svc=url pairs, comma-separated.
-  STAGING_URLS: "asset-manager=https://assets-staging.tailc06f30.ts.net,bifrost=https://bifrost-staging.tailc06f30.ts.net,fitness-api=https://api.staging.footstrike.run,fitness-dashboard=https://staging.footstrike.run,forecasting=https://forecasting-staging.tailc06f30.ts.net,identity=https://identity-staging.tailc06f30.ts.net"
-  PROD_URLS: "asset-manager=https://assets.ethanswan.com,bifrost=https://bifrost.ethanswan.com,fitness-api=https://api.footstrike.run,fitness-dashboard=https://footstrike.run,forecasting=https://forecasting.ethanswan.com,identity=https://identity.ethanswan.com"
+  STAGING_URLS: "asset-manager=https://assets-staging.tailc06f30.ts.net,bifrost=https://bifrost-staging.tailc06f30.ts.net,footstrike-api=https://api.staging.footstrike.run,footstrike-dashboard=https://staging.footstrike.run,forecasting=https://forecasting-staging.tailc06f30.ts.net,identity=https://identity-staging.tailc06f30.ts.net"
+  PROD_URLS: "asset-manager=https://assets.ethanswan.com,bifrost=https://bifrost.ethanswan.com,footstrike-api=https://api.footstrike.run,footstrike-dashboard=https://footstrike.run,forecasting=https://forecasting.ethanswan.com,identity=https://identity.ethanswan.com"
