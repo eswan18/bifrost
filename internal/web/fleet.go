@@ -169,9 +169,8 @@ type overviewData struct {
 	NextRuns []overviewJob
 }
 
-// envRaw is the raw cluster reads for one namespace. Each field is written by
-// its own goroutine; the struct is only read after that goroutine's WaitGroup
-// has drained.
+// envRaw is the raw cluster reads for one namespace, grouped out of the
+// cluster-wide List results.
 type envRaw struct {
 	pods     []kube.PodInfo
 	rsets    []kube.ReplicaSetInfo
@@ -179,21 +178,24 @@ type envRaw struct {
 	jobs     []kube.JobInfo
 }
 
-// assembleFleet fans out staging+prod × (pods, replicasets, cronjobs, jobs)
-// for every service, plus one bulk ArgoCD list and one Cloud Build list, then
-// derives the whole UI model. Per-namespace errors degrade that service/env to
+// assembleFleet issues six concurrent cluster-wide reads — pods, replicasets,
+// cronjobs, jobs, ArgoCD Applications, Cloud Builds — groups the K8s results
+// by namespace, and derives the whole UI model. Call count stays constant as
+// services are added. A failed List degrades the affected services/envs to
 // "unknown" rather than failing the page.
 func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 	now := time.Now()
 
-	// Two bulk calls shared by every service; run them concurrently and wait,
-	// since per-env deploy detection consults ArgoCD health.
 	var argo map[string]kube.AppStatus
 	var builds map[string]gcb.BuildStatus
-	var bulkWG sync.WaitGroup
-	bulkWG.Add(2)
+	var pods []kube.PodInfo
+	var rsets []kube.ReplicaSetInfo
+	var cronjobs []kube.CronJobInfo
+	var jobs []kube.JobInfo
+	var wg sync.WaitGroup
+	wg.Add(6)
 	go func() {
-		defer bulkWG.Done()
+		defer wg.Done()
 		apps, err := h.Kube.ListArgoApps(ctx)
 		if err != nil {
 			slog.Warn("list argocd applications failed", "error", err)
@@ -201,7 +203,7 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 		argo = apps
 	}()
 	go func() {
-		defer bulkWG.Done()
+		defer wg.Done()
 		if h.Builds == nil {
 			return
 		}
@@ -211,26 +213,45 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 		}
 		builds = b
 	}()
-	bulkWG.Wait()
+	go func() {
+		defer wg.Done()
+		p, err := h.Kube.ListPods(ctx, "")
+		if err != nil {
+			slog.Warn("list pods failed", "error", err)
+		}
+		pods = p
+	}()
+	go func() {
+		defer wg.Done()
+		rs, err := h.Kube.ListReplicaSets(ctx, "")
+		if err != nil {
+			slog.Warn("list replicasets failed", "error", err)
+		}
+		rsets = rs
+	}()
+	go func() {
+		defer wg.Done()
+		cj, err := h.Kube.ListCronJobs(ctx, "")
+		if err != nil {
+			slog.Warn("list cronjobs failed", "error", err)
+		}
+		cronjobs = cj
+	}()
+	go func() {
+		defer wg.Done()
+		j, err := h.Kube.ListJobs(ctx, "")
+		if err != nil {
+			slog.Warn("list jobs failed", "error", err)
+		}
+		jobs = j
+	}()
+	wg.Wait()
 
-	type result struct {
-		idx int
-		app appView
-	}
-	results := make(chan result, len(h.Cfg.Services))
-	var wg sync.WaitGroup
-	for i, svc := range h.Cfg.Services {
-		wg.Add(1)
-		go func(i int, svc string) {
-			defer wg.Done()
-			results <- result{i, h.assembleApp(ctx, svc, now, argo, builds)}
-		}(i, svc)
-	}
-	go func() { wg.Wait(); close(results) }()
+	raws := groupByNamespace(pods, rsets, cronjobs, jobs)
 
 	apps := make([]appView, len(h.Cfg.Services))
-	for r := range results {
-		apps[r.idx] = r.app
+	for i, svc := range h.Cfg.Services {
+		apps[i] = h.assembleApp(svc, now, argo, builds, raws[svc+"-staging"], raws[svc+"-prod"])
 	}
 
 	f := &fleet{Apps: apps, AppCount: len(apps)}
@@ -241,19 +262,42 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 	return f
 }
 
-// assembleApp reads both environments of one service concurrently and derives
-// its full view.
-func (h *Handlers) assembleApp(ctx context.Context, svc string, now time.Time, argo map[string]kube.AppStatus, builds map[string]gcb.BuildStatus) appView {
+// groupByNamespace splits the cluster-wide List results into per-namespace
+// envRaws. Namespaces the fleet doesn't own (kube-system, argocd, tailscale,
+// …) land in the map too but are never looked up; a service namespace with no
+// resources is simply absent, and the zero envRaw derives to "unknown" — the
+// same degradation a failed per-namespace call produced before.
+func groupByNamespace(pods []kube.PodInfo, rsets []kube.ReplicaSetInfo, cronjobs []kube.CronJobInfo, jobs []kube.JobInfo) map[string]envRaw {
+	m := map[string]envRaw{}
+	for _, p := range pods {
+		r := m[p.Namespace]
+		r.pods = append(r.pods, p)
+		m[p.Namespace] = r
+	}
+	for _, rs := range rsets {
+		r := m[rs.Namespace]
+		r.rsets = append(r.rsets, rs)
+		m[rs.Namespace] = r
+	}
+	for _, cj := range cronjobs {
+		r := m[cj.Namespace]
+		r.cronjobs = append(r.cronjobs, cj)
+		m[cj.Namespace] = r
+	}
+	for _, j := range jobs {
+		r := m[j.Namespace]
+		r.jobs = append(r.jobs, j)
+		m[j.Namespace] = r
+	}
+	return m
+}
+
+// assembleApp derives one service's full view from its two environments' raw
+// reads. Pure derivation — all cluster I/O happens up front in assembleFleet.
+func (h *Handlers) assembleApp(svc string, now time.Time, argo map[string]kube.AppStatus, builds map[string]gcb.BuildStatus, sRaw, pRaw envRaw) appView {
 	org := h.Cfg.GitHubOrg
 	repo := h.Cfg.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
-
-	var sRaw, pRaw envRaw
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); h.readEnv(ctx, svc+"-staging", &sRaw) }()
-	go func() { defer wg.Done(); h.readEnv(ctx, svc+"-prod", &pRaw) }()
-	wg.Wait()
 
 	staging := deriveEnv("staging", sRaw, argo[svc+"-staging"], org, repo, h.Cfg.StagingURLs[svc], loc)
 	prod := deriveEnv("prod", pRaw, argo[svc+"-prod"], org, repo, h.Cfg.ProdURLs[svc], loc)
@@ -307,38 +351,10 @@ func (h *Handlers) assembleApp(ctx context.Context, svc string, now time.Time, a
 	return a
 }
 
-// readEnv issues the four per-namespace list calls concurrently. Each writes a
-// distinct field of raw, so there's no shared-memory race; errors are logged
-// and leave that field nil (the derivation degrades to unknown).
-func (h *Handlers) readEnv(ctx context.Context, ns string, raw *envRaw) {
-	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		raw.pods, raw.rsets = h.readPodsRS(ctx, ns)
-	}()
-	go func() {
-		defer wg.Done()
-		cj, err := h.Kube.ListCronJobs(ctx, ns)
-		if err != nil {
-			slog.Warn("list cronjobs failed", "namespace", ns, "error", err)
-		}
-		raw.cronjobs = cj
-	}()
-	go func() {
-		defer wg.Done()
-		j, err := h.Kube.ListJobs(ctx, ns)
-		if err != nil {
-			slog.Warn("list jobs failed", "namespace", ns, "error", err)
-		}
-		raw.jobs = j
-	}()
-	wg.Wait()
-}
-
 // readPodsRS lists a namespace's pods and replicasets concurrently — the
-// deploy-state half of readEnv, also polled standalone by StatusJSON (which
-// has no use for cronjobs/jobs). Errors are logged and leave that slice nil.
+// deploy-state pair StatusJSON polls per-service after a promote/rollback
+// (which has no use for the fleet's cluster-wide reads). Errors are logged
+// and leave that slice nil.
 func (h *Handlers) readPodsRS(ctx context.Context, ns string) (pods []kube.PodInfo, rsets []kube.ReplicaSetInfo) {
 	var wg sync.WaitGroup
 	wg.Add(2)

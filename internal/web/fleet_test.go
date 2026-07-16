@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -148,5 +149,61 @@ func TestExitDetail(t *testing.T) {
 				t.Errorf("exitDetail = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- cluster-wide grouping -----------------------------------------------------
+
+func TestGroupByNamespace(t *testing.T) {
+	raws := groupByNamespace(
+		[]kube.PodInfo{
+			{Namespace: "foo-staging", Name: "p1"},
+			{Namespace: "kube-system", Name: "dns"},
+			{Namespace: "foo-staging", Name: "p2"},
+		},
+		[]kube.ReplicaSetInfo{{Namespace: "foo-prod", Name: "rs1"}},
+		[]kube.CronJobInfo{{Namespace: "foo-staging", Name: "cj"}},
+		[]kube.JobInfo{{Namespace: "foo-prod", Name: "j"}},
+	)
+
+	s := raws["foo-staging"]
+	if len(s.pods) != 2 || s.pods[0].Name != "p1" || s.pods[1].Name != "p2" {
+		t.Errorf("foo-staging pods = %+v, want p1,p2 in order", s.pods)
+	}
+	if len(s.cronjobs) != 1 || len(s.rsets) != 0 || len(s.jobs) != 0 {
+		t.Errorf("foo-staging raw = %+v, want 1 cronjob only", s)
+	}
+	p := raws["foo-prod"]
+	if len(p.rsets) != 1 || len(p.jobs) != 1 || len(p.pods) != 0 {
+		t.Errorf("foo-prod raw = %+v, want 1 replicaset + 1 job", p)
+	}
+	if r := raws["absent-ns"]; len(r.pods)+len(r.rsets)+len(r.cronjobs)+len(r.jobs) != 0 {
+		t.Errorf("absent namespace raw = %+v, want zero envRaw", r)
+	}
+}
+
+// Unrelated namespaces in the cluster-wide List results (kube-system, argocd,
+// ...) must not leak into a service's derived view.
+func TestAssembleFleetIgnoresUnrelatedNamespaces(t *testing.T) {
+	k := &fakeKube{
+		imgs: map[string][]string{
+			"foo-staging": {"reg/foo:abc1234"},
+			"foo-prod":    {"reg/foo:abc1234"},
+			"kube-system": {"reg/dns:v1", "reg/proxy:v2"},
+			"argocd":      {"reg/argo:v3"},
+		},
+	}
+	h, _ := newTestHandlers(t, k)
+	f := h.assembleFleet(context.Background())
+
+	if len(f.Apps) != 1 {
+		t.Fatalf("apps = %d, want 1", len(f.Apps))
+	}
+	a := f.Apps[0]
+	if a.Overall != "sync" {
+		t.Errorf("overall = %q, want sync", a.Overall)
+	}
+	if a.Staging.Image != "reg/foo:abc1234" || a.Prod.Image != "reg/foo:abc1234" {
+		t.Errorf("images = %q / %q, want reg/foo:abc1234 for both envs", a.Staging.Image, a.Prod.Image)
 	}
 }
