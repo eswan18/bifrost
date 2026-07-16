@@ -40,6 +40,85 @@ func TestRelativeTime(t *testing.T) {
 	}
 }
 
+// TestDayRelative covers the day-relative wall-clock formatter used for build
+// and job times. 2026-06-15 is a Monday, so a Friday 3 days back and a Friday 4
+// days ahead both render as "Friday".
+func TestDayRelative(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		t    time.Time
+		want string
+	}{
+		{"zero renders nothing", time.Time{}, ""},
+		{"same day", time.Date(2026, 6, 15, 9, 58, 0, 0, time.UTC), "today 09:58"},
+		{"yesterday", time.Date(2026, 6, 14, 16, 3, 0, 0, time.UTC), "yesterday 16:03"},
+		{"tomorrow (next run)", time.Date(2026, 6, 16, 0, 5, 0, 0, time.UTC), "tomorrow 00:05"},
+		{"three days ago is a weekday", time.Date(2026, 6, 12, 14, 10, 0, 0, time.UTC), "Friday 14:10"},
+		{"four days ahead is a weekday", time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC), "Friday 08:00"},
+		{"far past is a date", time.Date(2026, 1, 2, 15, 4, 0, 0, time.UTC), "Jan 2 15:04"},
+		{"far future is a date", time.Date(2030, 1, 1, 14, 0, 0, 0, time.UTC), "Jan 1 14:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dayRelative(tc.t, now, time.UTC); got != tc.want {
+				t.Errorf("dayRelative(%v) = %q, want %q", tc.t, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDayRelativeHonorsLocation renders in the display timezone, not UTC.
+func TestDayRelativeHonorsLocation(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC) // 08:00 EDT, still the 15th
+	// 01:30 UTC on the 15th is 21:30 EDT on the 14th → "yesterday 21:30".
+	in := time.Date(2026, 6, 15, 1, 30, 0, 0, time.UTC)
+	if got, want := dayRelative(in, now, ny), "yesterday 21:30"; got != want {
+		t.Errorf("dayRelative = %q, want %q", got, want)
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{-5 * time.Second, "0s"},
+		{42 * time.Second, "42s"},
+		{72 * time.Second, "1m 12s"},
+		{362 * time.Second, "6m 02s"},
+		{time.Hour, "1h 00m"},
+		{time.Hour + 61*time.Second, "1h 01m"},
+	}
+	for _, tc := range cases {
+		if got := humanDuration(tc.d); got != tc.want {
+			t.Errorf("humanDuration(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestRunningFor(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "30s"},
+		{2 * time.Minute, "2m"},
+		{4 * time.Minute, "4m"},
+		{time.Hour + time.Minute, "1h 1m"},
+	}
+	for _, tc := range cases {
+		if got := runningFor(tc.d); got != tc.want {
+			t.Errorf("runningFor(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
 func TestAbsTime(t *testing.T) {
 	if got := absTime(time.Time{}); got != "" {
 		t.Errorf("absTime(zero) = %q, want empty", got)

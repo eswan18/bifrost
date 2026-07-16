@@ -1,23 +1,15 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
-TEMPLATES := $(wildcard templates/*.html)
 
 .DEFAULT_GOAL := build
 
-.PHONY: css css-watch run build test lint
+.PHONY: run build test lint
 
-css: static/style.css
-
-static/style.css: static/input.css $(TEMPLATES)
-	npx @tailwindcss/cli -i static/input.css -o static/style.css --minify
-
-css-watch:
-	npx @tailwindcss/cli -i static/input.css -o static/style.css --watch
-
-run: css
+# static/style.css is hand-written and committed — there is no CSS build step.
+run:
 	go run ./cmd/bifrost
 
-build: css
+build:
 	CGO_ENABLED=0 go build -o bifrost ./cmd/bifrost
 
 test:

@@ -8,11 +8,28 @@ staging) and Asgard (gods → prod). Naming chose itself.
 
 ## What it does
 
-- Lists every service with its currently-deployed staging and prod image tags.
-- Shows when each environment's running revision was last deployed (from
-  ArgoCD's sync history).
-- Flags out-of-sync services and exposes a "Promote" button for each.
-- Promote = patches the prod ArgoCD `Application`, same operation as `ib promote`.
+Three tabs (real routes; each has a polling fragment endpoint that swaps its
+body in place):
+
+- **Overview** (`/`) — an attention queue (crashlooping apps, failed jobs,
+  drift ready to promote), fleet counts, and running / recently-failed /
+  next-scheduled jobs.
+- **Apps** (`/apps`) — every service across staging and prod: image hash +
+  health per env, last CI build, and job count. Drift exposes **Promote**; a
+  crash exposes **Roll back**; in-sync rows offer a ghost roll-back.
+- **Jobs** (`/jobs`, `?app=` filter) — every CronJob across both environments,
+  each tagged `stg`/`prod`, with last-run state (incl. exit code), duration,
+  and next run.
+
+Promote and roll back are confirmed in a hash-diff modal. Both re-validate live
+cluster state server-side before patching (a stale hash is refused) and patch
+the ArgoCD `Application`, the same operation as `ib promote` / a manual image
+override. The UI is server-rendered `html/template` with a single inline
+vanilla-JS block: plain form POSTs work without JS; JS upgrades to `fetch()`,
+background polling, a light/dark theme toggle, and a "refreshed Ns ago" ticker.
+
+The "Blueprint" theme (`static/style.css`) is hand-written from design tokens —
+there is **no CSS build step** and no Node toolchain.
 
 ## Architecture
 
@@ -26,8 +43,9 @@ and bricks the UI, `ib promote bifrost` from a laptop is the fallback.
 
 ## Development
 
-    make css-watch   # one terminal
-    make run         # another
+    make run
+
+`static/style.css` is committed and edited by hand — no build step, no Node.
 
 Requires these env vars to run (see `internal/config/config.go`):
 

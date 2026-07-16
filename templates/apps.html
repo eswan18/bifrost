@@ -1,0 +1,94 @@
+{{define "tab-body"}}
+<div class="apps"{{if .AnyActive}} data-active{{end}}>
+
+  <div class="apps-desktop">
+    <div class="apps-grid apps-head">
+      <span>APPLICATION</span><span>STAGING</span><span>PRODUCTION</span><span>BUILD</span><span>JOBS</span><span></span>
+    </div>
+    {{range .Apps}}
+    <div class="app-row" data-key="{{.Name}}">
+      {{if .HasJobs}}<input type="checkbox" class="exp-toggle" id="exp-d-{{.Name}}" hidden>{{end}}
+      <div class="apps-grid app-line">
+        <span class="cell-app">
+          {{if .RepoURL}}<a href="{{.RepoURL}}" target="_blank" class="app-name">{{.Name}}</a>{{else}}<span class="app-name">{{.Name}}</span>{{end}}
+          {{if .HasJobs}}<label for="exp-d-{{.Name}}" class="chev" aria-label="Toggle jobs for {{.Name}}"></label>{{end}}
+        </span>
+        <span class="cell-env">{{template "env-cell" .Staging}}</span>
+        <span class="cell-env">{{template "env-cell" .Prod}}</span>
+        <span class="cell-build">{{template "build-cell" .}}</span>
+        <span class="cell-jobs">{{template "jobs-link" .}}</span>
+        <span class="cell-actions">{{template "app-actions" .}}</span>
+      </div>
+      {{if .HasJobs}}
+      <div class="job-subtable">
+        <div class="jobsub-grid jobsub-head"><span>JOB</span><span>STATE</span><span>LAST RUN</span><span>NEXT RUN</span></div>
+        {{range .Jobs}}
+        <div class="jobsub-grid jobsub-row">
+          <span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span>
+          <span class="{{.StateClass}} w6">{{.StateLabel}}</span>
+          <span class="c-mut"{{if not .LastRunTime.IsZero}} title="{{abstime .LastRunTime}}"{{end}}>{{.LastLabel}}</span>
+          <span class="c-mut">{{.Next}}</span>
+        </div>
+        {{end}}
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+
+  <div class="apps-mobile">
+    {{range .Apps}}
+    <div class="app-card" data-key="{{.Name}}">
+      {{if .HasJobs}}<input type="checkbox" class="exp-toggle" id="exp-m-{{.Name}}" hidden>{{end}}
+      <div class="card-head">
+        <span class="card-name">
+          {{if .RepoURL}}<a href="{{.RepoURL}}" target="_blank" class="app-name">{{.Name}}</a>{{else}}<span class="app-name">{{.Name}}</span>{{end}}
+          {{if .HasJobs}}<label for="exp-m-{{.Name}}" class="chev" aria-label="Toggle jobs for {{.Name}}"></label>{{end}}
+        </span>
+        <span class="card-badge {{.BadgeClass}}"><span class="dot dot-cur"></span>{{.Badge}}</span>
+      </div>
+      <div class="env-tiles">
+        <div class="env-tile">
+          <div class="tile-label">STAGING</div>
+          <div class="mono tile-hash {{.Staging.HashClass}}">{{or .Staging.Tag "—"}}{{if .Staging.AppURL}} <a href="{{.Staging.AppURL}}" target="_blank" class="ext" aria-label="open staging app">↗</a>{{end}}</div>
+          <div class="tile-status {{.Staging.LabelClass}}{{if .Staging.Bold}} w6{{end}}"{{if .Staging.Detail}} title="{{.Staging.Detail}}"{{end}}>{{.Staging.Label}}</div>
+        </div>
+        <div class="env-tile">
+          <div class="tile-label">PROD</div>
+          <div class="mono tile-hash {{.Prod.HashClass}}">{{or .Prod.Tag "—"}}{{if .Prod.AppURL}} <a href="{{.Prod.AppURL}}" target="_blank" class="ext" aria-label="open prod app">↗</a>{{end}}</div>
+          <div class="tile-status {{.Prod.LabelClass}}{{if .Prod.Bold}} w6{{end}}"{{if .Prod.Detail}} title="{{.Prod.Detail}}"{{end}}>{{.Prod.Label}}</div>
+        </div>
+      </div>
+      <div class="card-meta">
+        <span class="c-mut">build {{if .Build.Label}}<a {{if .Build.URL}}href="{{.Build.URL}}" target="_blank"{{end}} class="{{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{.Build.Label}}</a>{{else}}<span class="c-faint">—</span>{{end}}</span>
+        {{if .HasJobs}}<a href="/jobs?app={{.Name}}" class="jobs-link {{.JobsClass}}{{if .JobsBold}} w6{{end}}">{{.JobsLabel}} →</a>{{end}}
+      </div>
+      {{if .HasJobs}}
+      <div class="job-subtable card-jobs">
+        {{range .Jobs}}
+        <div class="card-job">
+          <div class="card-job-top"><span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
+          <div class="c-mut card-job-meta">last {{.LastLabel}} · next {{.Next}}</div>
+        </div>
+        {{end}}
+      </div>
+      {{end}}
+      <div class="card-actions">
+        {{if .ShowPromote}}<a href="#modal-promote-{{.Name}}" class="pill-block pill-primary">Promote ↗</a>{{end}}
+        {{if .ShowRollbackPrimary}}<a href="#modal-rollback-{{.Name}}" class="pill-block pill-secondary">Roll back</a>{{end}}
+        {{if .ShowRollbackGhost}}<a href="#modal-rollback-{{.Name}}" class="pill-block pill-ghost">↺ Roll back…</a>{{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+
+</div>
+{{end}}
+
+{{define "env-cell"}}<span class="mono env-hash">{{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash {{.HashClass}}">{{.Tag}}</a>{{else}}<span class="hash {{.HashClass}}">{{or .Tag "—"}}</span>{{end}}</span> <span class="env-status {{.LabelClass}}{{if .Bold}} w6{{end}}"{{if .Detail}} title="{{.Detail}}"{{end}}>· {{.Label}}</span>{{if .AppURL}} <a href="{{.AppURL}}" target="_blank" class="ext" aria-label="open {{.Env}} app">↗</a>{{end}}{{end}}
+
+{{define "build-cell"}}{{if .Build.Label}}<a {{if .Build.URL}}href="{{.Build.URL}}" target="_blank"{{end}} class="build-link {{.Build.Class}}{{if .Build.Bold}} w6{{end}}">{{.Build.Label}}</a>{{else}}<span class="c-faint">—</span>{{end}}{{end}}
+
+{{define "jobs-link"}}{{if .HasJobs}}<a href="/jobs?app={{.Name}}" class="jobs-link {{.JobsClass}}{{if .JobsBold}} w6{{end}}">{{.JobsLabel}}</a>{{else}}<span class="c-faint">no jobs</span>{{end}}{{end}}
+
+{{define "app-actions"}}{{if .ShowPromote}}<a href="#modal-promote-{{.Name}}" class="pill pill-primary nowrap">Promote ↗</a>{{end}}{{if .ShowRollbackPrimary}}<a href="#modal-rollback-{{.Name}}" class="pill pill-secondary nowrap">Roll back</a>{{end}}{{if .SyncText}}<span class="c-faint sync-text">{{.SyncText}}</span>{{end}}{{if .ShowRollbackGhost}}<a href="#modal-rollback-{{.Name}}" class="ghost-btn" title="Roll back…" aria-label="Roll back {{.Name}}">↺</a>{{end}}{{end}}

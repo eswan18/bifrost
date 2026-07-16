@@ -1,5 +1,9 @@
 {{define "content"}}
-<div class="alert alert-error">
-  <span>{{.Message}}</span>
-</div>
+<div class="app-shell"><div class="auth-page">
+  <div class="auth-card">
+    <div class="auth-title">Bifrost</div>
+    <div class="flash flash-error auth-flash">{{.Message}}</div>
+    <a href="/auth/login" class="pill pill-primary">Try signing in again</a>
+  </div>
+</div></div>
 {{end}}

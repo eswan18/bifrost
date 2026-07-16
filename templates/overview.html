@@ -1,0 +1,70 @@
+{{define "tab-body"}}
+<div class="ov"{{if .AnyActive}} data-active{{end}}>
+  <p class="intro">Every application in the fleet, across staging and production — running versions, health, and scheduled jobs. Promote staging to prod or roll back an environment from here.</p>
+
+  <div class="band band-attn">
+    <div class="attn-col">
+      <div class="sec-label{{if .Overview.AttnCount}} c-red{{end}}">{{.Overview.AttnHead}}</div>
+      {{if not .Overview.Attention}}
+      <div class="attn-empty"><span class="dot dot-grn"></span>All clear — nothing needs your attention.</div>
+      {{else}}
+      <div class="attn-list">
+        {{range .Overview.Attention}}
+        <div class="attn-item">
+          <div class="attn-text">
+            <span class="dot {{if eq .Class "c-red"}}dot-red{{else}}dot-amb{{end}}"></span>
+            <span><strong>{{.Title}}</strong> <span class="c-mut">{{.Sub}}</span></span>
+          </div>
+          <a href="{{.Href}}" class="pill pill-secondary attn-action">{{.Action}}</a>
+        </div>
+        {{end}}
+      </div>
+      {{end}}
+    </div>
+
+    <div class="fleet">
+      <div class="sec-label">FLEET</div>
+      <div class="fleet-row"><span>In sync</span><span class="mono c-ink">{{.Overview.Sync}}</span></div>
+      <div class="fleet-row"><span>Drifted</span><span class="mono {{if .Overview.Drift}}c-amb{{else}}c-ink{{end}}">{{.Overview.Drift}}</span></div>
+      <div class="fleet-row"><span>Deploying</span><span class="mono c-ink">{{.Overview.Deploying}}</span></div>
+      <div class="fleet-row fleet-rule"><span>Crashed</span><span class="mono {{if .Overview.Crash}}c-red{{else}}c-ink{{end}}">{{.Overview.Crash}}</span></div>
+      <div class="fleet-row"><span>Jobs scheduled</span><span class="mono c-ink">{{.Overview.JobsTotal}}</span></div>
+      <div class="fleet-row"><span>Failed</span><span class="mono {{if .Overview.JobsFailed}}c-red{{else}}c-ink{{end}}">{{.Overview.JobsFailed}}</span></div>
+      <div class="fleet-row"><span>Running now</span><span class="mono c-ink">{{.Overview.JobsRunning}}</span></div>
+    </div>
+  </div>
+
+  <div class="band band-cols">
+    <div class="col">
+      <div class="sec-label">RUNNING NOW</div>
+      <div class="col-list">
+        {{range .Overview.Running}}
+        <div><span class="mono c-blu">◌ {{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
+        {{else}}
+        <span class="c-faint">none</span>
+        {{end}}
+      </div>
+    </div>
+    <div class="col">
+      <div class="sec-label">RECENT FAILURES</div>
+      <div class="col-list">
+        {{range .Overview.Failed}}
+        <div><span class="mono c-red">✗ {{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
+        {{else}}
+        <span class="c-faint">none in the last 24h</span>
+        {{end}}
+      </div>
+    </div>
+    <div class="col">
+      <div class="sec-label">NEXT RUNS</div>
+      <div class="col-list">
+        {{range .Overview.NextRuns}}
+        <div class="nextrun"><span><span class="mono">{{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span></span><span class="c-mut">{{.Meta}}</span></div>
+        {{else}}
+        <span class="c-faint">none</span>
+        {{end}}
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

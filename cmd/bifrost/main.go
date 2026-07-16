@@ -60,7 +60,7 @@ func main() {
 	// instead of a bare 502 that Cloudflare would mask as "Bad Gateway".
 	renderError := func(w http.ResponseWriter, status int, message string) {
 		var buf bytes.Buffer
-		if err := rend.Render(&buf, "error", map[string]any{"Message": message}); err != nil {
+		if err := rend.Render(&buf, "error", map[string]any{"Title": "Bifrost", "Theme": "light", "Message": message}); err != nil {
 			log.Printf("render error page failed: %v", err)
 			http.Error(w, message, status)
 			return
@@ -118,10 +118,17 @@ func main() {
 		w.Header().Set("Cache-Control", "no-cache")
 		staticFiles.ServeHTTP(w, r)
 	}))
-	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Status)))
-	mux.Handle("GET /partial/status", requireAuth(http.HandlerFunc(webH.StatusFragment)))
+	// Tabs are real routes; each has a polling fragment endpoint that renders
+	// just the swappable tab body.
+	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Overview)))
+	mux.Handle("GET /apps", requireAuth(http.HandlerFunc(webH.Apps)))
+	mux.Handle("GET /jobs", requireAuth(http.HandlerFunc(webH.Jobs)))
+	mux.Handle("GET /partial/overview", requireAuth(http.HandlerFunc(webH.OverviewFragment)))
+	mux.Handle("GET /partial/apps", requireAuth(http.HandlerFunc(webH.AppsFragment)))
+	mux.Handle("GET /partial/jobs", requireAuth(http.HandlerFunc(webH.JobsFragment)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
+	mux.Handle("POST /services/{name}/rollback", requireAuth(http.HandlerFunc(webH.Rollback)))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddress,

@@ -1,0 +1,48 @@
+{{define "tab-body"}}
+<div class="jobs-view"{{if .AnyActive}} data-active{{end}}>
+
+  <div class="jobs-filter">
+    <span class="c-mut jobs-summary">{{.Jobs.SummaryLabel}}</span>
+    <span class="filter-right">
+      {{if .Jobs.Filter}}<a href="/jobs" class="clear-filter">✕ clear</a>{{end}}
+      <span class="select-wrap">
+        <select class="filter-select" aria-label="Filter jobs by app" onchange="location.href='/jobs'+(this.value?('?app='+encodeURIComponent(this.value)):'')">
+          <option value=""{{if not .Jobs.Filter}} selected{{end}}>All apps</option>
+          {{range .Jobs.Options}}<option value="{{.Name}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+        <span class="select-caret">▾</span>
+      </span>
+    </span>
+  </div>
+
+  <div class="jobs-desktop">
+    <div class="jobs-grid jobs-head">
+      <span>APPLICATION</span><span>JOB</span><span>IMAGE</span><span>STATE</span><span>LAST RUN</span><span>NEXT RUN</span>
+    </div>
+    {{range .Jobs.Jobs}}
+    <div class="jobs-grid jobs-row">
+      <span class="w6 job-app">{{.App}}</span>
+      <span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span>
+      <span class="mono">{{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash">{{.SHA}}</a>{{else}}{{or .SHA "—"}}{{end}}</span>
+      <span class="{{.StateClass}} w6">{{.StateLabel}}</span>
+      <span class="c-mut"{{if not .LastRunTime.IsZero}} title="{{abstime .LastRunTime}}"{{end}}>{{.LastLabel}}</span>
+      <span class="c-mut">{{.Next}}</span>
+    </div>
+    {{else}}
+    <div class="jobs-empty c-faint">no jobs</div>
+    {{end}}
+  </div>
+
+  <div class="jobs-mobile">
+    {{range .Jobs.Jobs}}
+    <div class="job-card">
+      <div class="job-card-top"><span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
+      <div class="c-mut job-card-meta">{{.App}} · {{if .CommitURL}}<a href="{{.CommitURL}}" target="_blank" class="hash mono">{{.SHA}}</a>{{else}}<span class="mono">{{or .SHA "—"}}</span>{{end}} · last {{.LastLabel}} · next {{.Next}}</div>
+    </div>
+    {{else}}
+    <div class="jobs-empty c-faint">no jobs</div>
+    {{end}}
+  </div>
+
+</div>
+{{end}}
