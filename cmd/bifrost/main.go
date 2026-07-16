@@ -11,6 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	// Embed the IANA timezone database: the alpine runtime image ships no
+	// tzdata, so DISPLAY_TIMEZONE's time.LoadLocation would fail at startup
+	// (crashloop, July 2026).
+	_ "time/tzdata"
+
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
