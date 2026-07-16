@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -253,31 +252,6 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 
 func envJSON(e envView) map[string]any {
 	return map[string]any{"tag": e.Tag, "sha": e.SHA, "status": e.Status}
-}
-
-func (h *Handlers) readPodsRS(ctx context.Context, ns string) ([]kube.PodInfo, []kube.ReplicaSetInfo) {
-	var pods []kube.PodInfo
-	var rsets []kube.ReplicaSetInfo
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		p, err := h.Kube.ListPods(ctx, ns)
-		if err != nil {
-			slog.Warn("list pods failed", "namespace", ns, "error", err)
-		}
-		pods = p
-	}()
-	go func() {
-		defer wg.Done()
-		rs, err := h.Kube.ListReplicaSets(ctx, ns)
-		if err != nil {
-			slog.Warn("list replicasets failed", "namespace", ns, "error", err)
-		}
-		rsets = rs
-	}()
-	wg.Wait()
-	return pods, rsets
 }
 
 // --- promote -----------------------------------------------------------------

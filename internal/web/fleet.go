@@ -312,22 +312,10 @@ func (h *Handlers) assembleApp(ctx context.Context, svc string, now time.Time, a
 // and leave that field nil (the derivation degrades to unknown).
 func (h *Handlers) readEnv(ctx context.Context, ns string, raw *envRaw) {
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		pods, err := h.Kube.ListPods(ctx, ns)
-		if err != nil {
-			slog.Warn("list pods failed", "namespace", ns, "error", err)
-		}
-		raw.pods = pods
-	}()
-	go func() {
-		defer wg.Done()
-		rs, err := h.Kube.ListReplicaSets(ctx, ns)
-		if err != nil {
-			slog.Warn("list replicasets failed", "namespace", ns, "error", err)
-		}
-		raw.rsets = rs
+		raw.pods, raw.rsets = h.readPodsRS(ctx, ns)
 	}()
 	go func() {
 		defer wg.Done()
@@ -346,6 +334,32 @@ func (h *Handlers) readEnv(ctx context.Context, ns string, raw *envRaw) {
 		raw.jobs = j
 	}()
 	wg.Wait()
+}
+
+// readPodsRS lists a namespace's pods and replicasets concurrently — the
+// deploy-state half of readEnv, also polled standalone by StatusJSON (which
+// has no use for cronjobs/jobs). Errors are logged and leave that slice nil.
+func (h *Handlers) readPodsRS(ctx context.Context, ns string) (pods []kube.PodInfo, rsets []kube.ReplicaSetInfo) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		p, err := h.Kube.ListPods(ctx, ns)
+		if err != nil {
+			slog.Warn("list pods failed", "namespace", ns, "error", err)
+		}
+		pods = p
+	}()
+	go func() {
+		defer wg.Done()
+		rs, err := h.Kube.ListReplicaSets(ctx, ns)
+		if err != nil {
+			slog.Warn("list replicasets failed", "namespace", ns, "error", err)
+		}
+		rsets = rs
+	}()
+	wg.Wait()
+	return pods, rsets
 }
 
 func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL string, loc *time.Location) envView {
