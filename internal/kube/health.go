@@ -14,6 +14,9 @@ const (
 type HealthSummary struct {
 	State  HealthState
 	Detail string
+	// Reason is the first waiting reason behind a Degraded state (e.g.
+	// "ImagePullBackOff"); "" when the degradation is partial readiness alone.
+	Reason string
 }
 
 // SummarizeHealth derives a single health state for a namespace from its
@@ -64,7 +67,7 @@ func SummarizeHealth(pods []PodInfo) HealthSummary {
 		if waitingReason != "" {
 			detail += " — " + waitingReason
 		}
-		return HealthSummary{State: Degraded, Detail: detail}
+		return HealthSummary{State: Degraded, Detail: detail, Reason: waitingReason}
 	}
 	return HealthSummary{State: Healthy, Detail: fmt.Sprintf("%d/%d ready", ready, total)}
 }

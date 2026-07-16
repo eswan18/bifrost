@@ -30,7 +30,7 @@ func TestDeriveEnvArgoVisibility(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ev := deriveEnv("prod", envRaw{pods: healthyPods}, tc.argo, "eswan18", "foo", "", time.UTC)
+			ev := deriveEnv("prod", envRaw{pods: healthyPods}, tc.argo, "eswan18", "foo", "", time.Now(), time.UTC)
 			// Status is deliberately left "ok" — the fix is label-only.
 			if ev.Status != "ok" {
 				t.Errorf("Status = %q, want ok (visibility fix must not change status)", ev.Status)
@@ -59,7 +59,7 @@ func TestDeriveEnvArgoDoesNotOverrideCrash(t *testing.T) {
 			{Image: "reg/foo:abc1234", Ready: false, WaitingReason: "CrashLoopBackOff", RestartCount: 3},
 		}},
 	}}
-	ev := deriveEnv("prod", raw, kube.AppStatus{HealthStatus: "Degraded"}, "eswan18", "foo", "", time.UTC)
+	ev := deriveEnv("prod", raw, kube.AppStatus{HealthStatus: "Degraded"}, "eswan18", "foo", "", time.Now(), time.UTC)
 	if ev.Status != "crash" {
 		t.Fatalf("Status = %q, want crash", ev.Status)
 	}
@@ -205,5 +205,73 @@ func TestAssembleFleetIgnoresUnrelatedNamespaces(t *testing.T) {
 	}
 	if a.Staging.Image != "reg/foo:abc1234" || a.Prod.Image != "reg/foo:abc1234" {
 		t.Errorf("images = %q / %q, want reg/foo:abc1234 for both envs", a.Staging.Image, a.Prod.Image)
+	}
+}
+
+// --- stuck rollouts ------------------------------------------------------------
+
+func TestDeriveEnvStuckRollout(t *testing.T) {
+	now := time.Now()
+	degradedPods := []kube.PodInfo{
+		{Name: "old", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:old1234", Ready: true}}},
+		{Name: "new", Phase: "Pending", Containers: []kube.ContainerInfo{{Image: "reg/foo:bad5678", Ready: false, WaitingReason: "ImagePullBackOff"}}},
+	}
+	rsAt := func(created time.Time) []kube.ReplicaSetInfo {
+		return []kube.ReplicaSetInfo{{Name: "rs-2", Revision: 2, Image: "reg/foo:bad5678", Replicas: 1, CreatedAt: created}}
+	}
+
+	// Inside the deploy window the env reads as an ordinary rollout.
+	fresh := deriveEnv("prod", envRaw{pods: degradedPods, rsets: rsAt(now.Add(-time.Minute))}, kube.AppStatus{}, "eswan18", "foo", "", now, time.UTC)
+	if fresh.Stuck || fresh.Status != "deploying" || fresh.Label != "deploying 0/1" {
+		t.Errorf("fresh rollout: stuck=%v status=%q label=%q, want deploying 0/1, not stuck", fresh.Stuck, fresh.Status, fresh.Label)
+	}
+
+	// Past stuckAfter it goes amber with the waiting reason in the label,
+	// keeping status "deploying" (3-state vocabulary).
+	stuck := deriveEnv("prod", envRaw{pods: degradedPods, rsets: rsAt(now.Add(-2 * stuckAfter))}, kube.AppStatus{}, "eswan18", "foo", "", now, time.UTC)
+	if !stuck.Stuck || stuck.Status != "deploying" {
+		t.Fatalf("old degraded rollout: stuck=%v status=%q, want stuck deploying", stuck.Stuck, stuck.Status)
+	}
+	if stuck.Label != "stuck · ImagePullBackOff" {
+		t.Errorf("label = %q, want stuck · ImagePullBackOff", stuck.Label)
+	}
+	if stuck.LabelClass != "c-amb" || !stuck.Bold {
+		t.Errorf("label class/bold = %q/%v, want c-amb bold", stuck.LabelClass, stuck.Bold)
+	}
+
+	// A genuine mid-rollout that isn't degraded (all pods ready, old+new
+	// images coexisting) must never read as stuck, however old the RS.
+	rollingPods := []kube.PodInfo{
+		{Name: "old", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:old1234", Ready: true}}},
+		{Name: "new", Phase: "Running", Containers: []kube.ContainerInfo{{Image: "reg/foo:new5678", Ready: true}}},
+	}
+	rolling := deriveEnv("prod", envRaw{pods: rollingPods, rsets: rsAt(now.Add(-2 * stuckAfter))}, kube.AppStatus{}, "eswan18", "foo", "", now, time.UTC)
+	if rolling.Stuck {
+		t.Errorf("healthy mid-rollout marked stuck: %+v", rolling)
+	}
+}
+
+func TestActiveExcludesStuckEnvs(t *testing.T) {
+	stuckEnv := envView{Status: "deploying", Stuck: true}
+	rollingEnv := envView{Status: "deploying"}
+	okEnv := envView{Status: "ok"}
+
+	cases := []struct {
+		name string
+		app  appView
+		want bool
+	}{
+		{"stuck env only", appView{Overall: "deploying", Staging: okEnv, Prod: stuckEnv}, false},
+		{"both envs stuck", appView{Overall: "deploying", Staging: stuckEnv, Prod: stuckEnv}, false},
+		{"genuine rollout", appView{Overall: "deploying", Staging: okEnv, Prod: rollingEnv}, true},
+		{"stuck staging, rolling prod", appView{Overall: "deploying", Staging: stuckEnv, Prod: rollingEnv}, true},
+		{"mid-deploy only", appView{Overall: "deploying", Staging: okEnv, Prod: okEnv}, true},
+		{"building", appView{Overall: "sync", Staging: okEnv, Prod: okEnv, Build: buildView{State: "building"}}, true},
+		{"settled", appView{Overall: "sync", Staging: okEnv, Prod: okEnv}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.app.Active(); got != tc.want {
+			t.Errorf("%s: Active() = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
