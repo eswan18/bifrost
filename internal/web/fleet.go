@@ -41,6 +41,11 @@ type envView struct {
 	Status     string // "ok" | "deploying" | "crash" | "unknown"
 	Label      string // "healthy" | "deploying 2/3" | "CrashLoopBackOff ×7" | "unknown"
 	LabelClass string
+	// Stuck marks a deploying env that has stayed degraded past stuckAfter —
+	// e.g. ImagePullBackOff on a bad image ref. It renders as an amber
+	// "stuck · <reason>" label and stops counting toward the fast poll
+	// cadence; Status stays "deploying" (the design's 3-state vocabulary).
+	Stuck bool
 	Bold       bool
 	HashClass  string // "c-red" when this env crashes, else ""
 	Restarts   int32
@@ -119,10 +124,31 @@ type appView struct {
 	PromoteNote string
 }
 
+// stuckAfter is how long an env may stay degraded mid-rollout before it reads
+// as stuck rather than deploying. Kubernetes' own default progress deadline is
+// 10 minutes; half that flags a never-resolving ImagePullBackOff early without
+// catching ordinary slow starts.
+const stuckAfter = 5 * time.Minute
+
 // Active reports whether the app is in flight — rolling out or building — so
-// the client polls it on the fast cadence until it settles.
+// the client polls it on the fast cadence until it settles. Stuck rollouts
+// don't count: a deploy that stopped progressing would otherwise pin the fast
+// cadence indefinitely.
 func (a appView) Active() bool {
-	return a.Overall == "deploying" || a.Build.State == "building"
+	if a.Build.State == "building" {
+		return true
+	}
+	if a.Overall != "deploying" {
+		return false
+	}
+	rolling := func(ev envView) bool { return ev.Status == "deploying" && !ev.Stuck }
+	if rolling(a.Staging) || rolling(a.Prod) {
+		return true
+	}
+	// Neither env is actively rolling, so Overall reads "deploying" either
+	// from promote's mid-deploy detection alone (keep polling) or purely from
+	// stuck envs (back off — nothing is progressing).
+	return a.Staging.Status != "deploying" && a.Prod.Status != "deploying"
 }
 
 // anyActive reports whether anything in the fleet warrants the fast poll
@@ -299,8 +325,8 @@ func (h *Handlers) assembleApp(svc string, now time.Time, argo map[string]kube.A
 	repo := h.Cfg.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
 
-	staging := deriveEnv("staging", sRaw, argo[svc+"-staging"], org, repo, h.Cfg.StagingURLs[svc], loc)
-	prod := deriveEnv("prod", pRaw, argo[svc+"-prod"], org, repo, h.Cfg.ProdURLs[svc], loc)
+	staging := deriveEnv("staging", sRaw, argo[svc+"-staging"], org, repo, h.Cfg.StagingURLs[svc], now, loc)
+	prod := deriveEnv("prod", pRaw, argo[svc+"-prod"], org, repo, h.Cfg.ProdURLs[svc], now, loc)
 
 	ps := promote.StatusOf(kube.Images(sRaw.pods), kube.Images(pRaw.pods))
 	overall := deriveOverall(staging, prod, ps)
@@ -378,7 +404,7 @@ func (h *Handlers) readPodsRS(ctx context.Context, ns string) (pods []kube.PodIn
 	return pods, rsets
 }
 
-func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL string, loc *time.Location) envView {
+func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL string, now time.Time, loc *time.Location) envView {
 	image := currentImage(raw.pods, raw.rsets)
 	ev := envView{Env: env, Image: image, AppURL: appURL}
 	if image != "" {
@@ -406,6 +432,12 @@ func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL st
 		ev.Status = "deploying"
 		if rs, ok := kube.NewestReplicaSet(raw.rsets, nil); ok {
 			ev.Progress = fmt.Sprintf("%d/%d", readyPodsOnImage(raw.pods, rs.Image), rs.Replicas)
+			// A rollout still degraded well past the deploy window isn't
+			// progressing — a bad image ref's ImagePullBackOff never resolves
+			// on its own. The newest ReplicaSet's age is the rollout clock.
+			if health.State == kube.Degraded && !rs.CreatedAt.IsZero() && now.Sub(rs.CreatedAt) > stuckAfter {
+				ev.Stuck = true
+			}
 		}
 	default:
 		ev.Status = "ok"
@@ -414,6 +446,18 @@ func deriveEnv(env string, raw envRaw, argo kube.AppStatus, org, repo, appURL st
 	ev.Label = envLabel(ev)
 	ev.LabelClass = statusClass(ev.Status)
 	ev.Bold = ev.Status == "crash" || ev.Status == "deploying"
+	if ev.Stuck {
+		// Surface stuckness in the status line itself — the Detail tooltip
+		// ("0/1 ready — ImagePullBackOff") is invisible on mobile.
+		ev.Label = "stuck"
+		switch {
+		case health.Reason != "":
+			ev.Label += " · " + health.Reason
+		case ev.Progress != "":
+			ev.Label += " " + ev.Progress
+		}
+		ev.LabelClass = "c-amb"
+	}
 	if ev.Status == "crash" {
 		ev.HashClass = "c-red"
 	}

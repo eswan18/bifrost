@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
@@ -235,8 +236,9 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 	go func() { defer wg.Done(); pRaw.pods, pRaw.rsets = h.readPodsRS(r.Context(), svc+"-prod") }()
 	wg.Wait()
 
-	staging := deriveEnv("staging", sRaw, kube.AppStatus{}, org, repo, "", loc)
-	prod := deriveEnv("prod", pRaw, kube.AppStatus{}, org, repo, "", loc)
+	now := time.Now()
+	staging := deriveEnv("staging", sRaw, kube.AppStatus{}, org, repo, "", now, loc)
+	prod := deriveEnv("prod", pRaw, kube.AppStatus{}, org, repo, "", now, loc)
 	s := promote.StatusOf(kube.Images(sRaw.pods), kube.Images(pRaw.pods))
 
 	w.Header().Set("Content-Type", "application/json")
