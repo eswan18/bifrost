@@ -1,164 +1,269 @@
 {{define "base"}}<!DOCTYPE html>
-<html lang="en" data-theme="synthwave">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bifrost</title>
+  <title>{{.Title}}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css{{with cssVersion}}?v={{.}}{{end}}">
 </head>
-<body class="min-h-screen">
-  <div class="navbar bg-base-100 shadow-sm">
-    <div class="flex-1">
-      <a href="/" class="btn btn-ghost text-xl">Bifrost</a>
-    </div>
+<body data-theme="{{.Theme}}" data-refresh="{{.RefreshURL}}">
+  {{template "content" .}}
+  {{if .Dashboard}}{{template "dashboard-js" .}}{{end}}
+</body>
+</html>{{end}}
+
+{{/* content is the shared dashboard shell. login.html and error.html each
+     redefine "content" to override this with their own plain, centered page. */}}
+{{define "content"}}
+<div class="app-shell"><div class="page">
+  {{template "header" .}}
+  {{template "flashbar" .}}
+  {{template "tabs" .}}
+  <div id="tab-body">{{template "tab-body" .}}</div>
+</div></div>
+{{if .Dashboard}}{{template "modals" .}}{{end}}
+{{end}}
+
+{{define "header"}}
+<div class="header">
+  <div class="brand">Bifrost</div>
+  <div class="header-right">
+    <span id="refreshed" class="refreshed">refreshed just now</span>
+    <button id="theme-toggle" type="button" class="theme-toggle">{{.ThemeLabel}}</button>
     {{if .Session}}
-    <div class="flex-none">
-      <form method="POST" action="/auth/logout">
-        <button class="btn btn-ghost btn-sm">Sign out</button>
-      </form>
-    </div>
+    <form method="POST" action="/auth/logout" class="signout-form">
+      <button type="submit" class="theme-toggle">Sign out</button>
+    </form>
     {{end}}
   </div>
+</div>
+{{end}}
 
-  {{if .Flash}}
-  <div class="container mx-auto px-4 mt-4">
-    <div class="alert alert-{{if eq (printf "%s" .Flash.Kind) "error"}}error{{else}}success{{end}}">
-      <span>{{.Flash.Msg}}</span>
+{{define "flashbar"}}
+{{if .Flash}}
+<div class="flash flash-{{if eq (printf "%s" .Flash.Kind) "error"}}error{{else}}ok{{end}}">{{.Flash.Msg}}</div>
+{{end}}
+{{end}}
+
+{{define "tabs"}}
+<div class="tabs">
+  <a href="/" class="tab{{if eq .Tab "overview"}} active{{end}}">Overview</a>
+  <a href="/apps" class="tab{{if eq .Tab "apps"}} active{{end}}">Apps<span class="tab-count">{{.AppCount}}</span>{{if .AppIssues}}<span class="tab-issue">{{.AppIssues}}</span>{{end}}</a>
+  <a href="/jobs" class="tab{{if eq .Tab "jobs"}} active{{end}}">Jobs<span class="tab-count">{{.JobCount}}</span>{{if .JobIssues}}<span class="tab-issue">{{.JobIssues}}</span>{{end}}</a>
+</div>
+{{end}}
+
+{{/* modals: one promote modal per drifted app, one rollback modal per app.
+     Opened by :target (href="#modal-…"), so they work with JS disabled; the
+     confirm buttons are real form POSTs the dashboard JS upgrades to fetch. */}}
+{{define "modals"}}
+{{$csrf := .CSRF}}
+{{range .Apps}}
+  {{if .NewProdTag}}
+  <div id="modal-promote-{{.Name}}" class="modal">
+    <a href="#close" class="modal-backdrop" aria-label="Close"></a>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <div class="modal-title">Promote {{.Name}}</div>
+        <a href="#close" class="modal-x" aria-label="Close">✕</a>
+      </div>
+      <div class="modal-sub">The staging image will replace the production image.</div>
+      <div class="modal-rows">
+        <div class="modal-row">
+          <div class="micro">PRODUCTION</div>
+          <div class="hash-diff"><span class="from">{{.PromoteFrom}}</span><span class="arrow">→</span><span class="to">{{.PromoteTo}}</span></div>
+          <div class="modal-note">{{.PromoteNote}}</div>
+          <form method="POST" action="/services/{{.Name}}/promote" class="js-mutate" data-service="{{.Name}}" data-env="prod" data-newtag="{{.PromoteTo}}">
+            <input type="hidden" name="csrf" value="{{$csrf}}">
+            <input type="hidden" name="expected_sha" value="{{.PromoteTo}}">
+            <button type="submit" class="pill pill-primary">Promote to prod</button>
+          </form>
+        </div>
+      </div>
+      <a href="#close" class="modal-cancel">Cancel</a>
     </div>
   </div>
   {{end}}
 
-  <main class="container mx-auto px-4 py-6 max-w-3xl">
-    {{template "content" .}}
-  </main>
+  <div id="modal-rollback-{{.Name}}" class="modal">
+    <a href="#close" class="modal-backdrop" aria-label="Close"></a>
+    <div class="modal-panel">
+      <div class="modal-head">
+        <div class="modal-title">Roll back {{.Name}}</div>
+        <a href="#close" class="modal-x" aria-label="Close">✕</a>
+      </div>
+      <div class="modal-sub">Each environment reverts to its previous image.</div>
+      <div class="modal-rows">
+        {{template "rollback-row" dict "App" .Name "Label" "STAGING" "EnvKey" "staging" "Env" .Staging "CSRF" $csrf "Caveat" true}}
+        {{template "rollback-row" dict "App" .Name "Label" "PRODUCTION" "EnvKey" "prod" "Env" .Prod "CSRF" $csrf "Caveat" false}}
+      </div>
+      <a href="#close" class="modal-cancel">Cancel</a>
+    </div>
+  </div>
+{{end}}
+{{end}}
 
-  <script>
-    // Progressive enhancement for promote: confirm, show a spinner, POST via
-    // fetch, then poll the service status until prod has rolled out the new
-    // SHA. With JS disabled the plain <form> still POSTs and redirects.
-    //
-    // A background refresh also re-renders the service list every few seconds
-    // (so a build that starts, a deploy that finishes, or a health change shows
-    // up without a manual reload). It's paused while a promote is in flight and
-    // while the tab is hidden.
-    (function () {
-      var POLL_MS = 3000;            // post-promote rollout poll
-      var TIMEOUT_MS = 5 * 60 * 1000;
-      var IDLE_MS = 30000;           // background refresh while everything's settled
-      var ACTIVE_MS = 3000;          // ...and while a build/deploy is in flight
-      var promoting = false;         // pauses the background refresh
-      var refreshTimer = null;
-      var refreshing = false;        // a background refresh fetch is in flight
+{{/* rollback-row renders one env's current→previous revert. When no previous
+     image is known the button is disabled and the diff reads accordingly. The
+     staging row (Caveat) always carries the image-updater re-pin note. */}}
+{{define "rollback-row"}}
+<div class="modal-row">
+  <div class="micro">{{.Label}}</div>
+  {{if .Env.PrevImage}}
+  <div class="hash-diff"><span class="from">{{.Env.Tag}}</span><span class="arrow">→</span><span class="to">{{.Env.PrevSHA}}</span></div>
+  <div class="modal-note">currently {{.Env.Label}}{{if .Caveat}} · staging is pinned by image-updater — a rollback will be re-pinned to the newest build within minutes{{end}}</div>
+  <form method="POST" action="/services/{{.App}}/rollback" class="js-mutate" data-service="{{.App}}" data-env="{{.EnvKey}}" data-newtag="{{.Env.PrevSHA}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="env" value="{{.EnvKey}}">
+    <input type="hidden" name="to_sha" value="{{.Env.PrevSHA}}">
+    <input type="hidden" name="expected_current_sha" value="{{.Env.SHA}}">
+    <button type="submit" class="pill pill-primary">Roll back {{.EnvKey}}</button>
+  </form>
+  {{else}}
+  <div class="hash-diff"><span class="from">{{or .Env.Tag "—"}}</span></div>
+  <div class="modal-note">no previous image known{{if .Caveat}} · staging is pinned by image-updater — a rollback will be re-pinned to the newest build within minutes{{end}}</div>
+  <button type="button" class="pill pill-primary" disabled>Roll back {{.EnvKey}}</button>
+  {{end}}
+</div>
+{{end}}
 
-      function spinner(label) {
-        return '<span class="loading loading-spinner loading-xs"></span> ' + label;
-      }
+{{define "dashboard-js"}}
+<script>
+(function () {
+  var body = document.body;
+  var TAB = document.getElementById('tab-body');
+  var refreshURL = body.getAttribute('data-refresh') || '';
+  var IDLE = 30000, ACTIVE = 4000, POLL = 3000, TIMEOUT = 5 * 60 * 1000;
+  var mutating = false, refreshing = false, timer = null;
+  var lastOk = Date.now(), stale = false;
 
-      function pollUntilRolledOut(svc, newTag, started) {
-        function again() {
-          if (Date.now() - started > TIMEOUT_MS) { location.reload(); return; }
-          setTimeout(function () { pollUntilRolledOut(svc, newTag, started); }, POLL_MS);
-        }
-        fetch('/services/' + encodeURIComponent(svc) + '/status', {
-          headers: { 'Accept': 'application/json' }
-        })
-          .then(function (r) { return r.json(); })
-          .then(function (s) {
-            if (s.prodTag === newTag) { location.reload(); return; }
-            again();
-          })
-          .catch(again);
-      }
+  function fmtAgo(ms) {
+    var s = Math.round(ms / 1000);
+    if (s < 60) return s + 's';
+    var m = Math.round(s / 60);
+    if (m < 60) return m + 'm';
+    return Math.round(m / 60) + 'h';
+  }
+  function tick() {
+    var el = document.getElementById('refreshed');
+    if (!el) return;
+    el.textContent = (stale ? 'stale — last ok ' : 'refreshed ') + fmtAgo(Date.now() - lastOk) + ' ago';
+    el.classList.toggle('is-stale', stale);
+  }
+  setInterval(tick, 1000);
 
-      // Delegated so promote forms swapped in by the background refresh keep
-      // working without re-binding listeners.
-      document.addEventListener('submit', function (e) {
-        var form = e.target.closest('form.js-promote');
-        if (!form) return;
-        e.preventDefault();
-        var svc = form.dataset.service;
-        var tag = form.dataset.newtag;
-        if (!confirm('Promote ' + svc + ' prod to ' + tag + '?')) return;
+  // Theme toggle: flip the attribute, remember it in a cookie so the server
+  // paints the right theme on the next load, update the pill label.
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest('#theme-toggle');
+    if (!t) return;
+    e.preventDefault();
+    var next = body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    body.setAttribute('data-theme', next);
+    document.cookie = 'bifrost_theme=' + next + ';path=/;max-age=31536000;samesite=lax';
+    t.textContent = next === 'dark' ? '◐ dark' : '☀ light';
+  });
 
-        promoting = true; // stop the background refresh from clobbering the spinner
-        var btn = form.querySelector('button[type="submit"]');
-        btn.disabled = true;
-        btn.innerHTML = spinner('Promoting…');
-        var badge = document.querySelector('[data-service="' + svc + '"] .js-badge');
-        if (badge) {
-          badge.innerHTML = '<span class="badge badge-info gap-1">' +
-            '<span class="loading loading-spinner loading-xs"></span>deploying…</span>';
-        }
+  function modalOpen() { return location.hash.indexOf('#modal') === 0; }
+  function anyActive() { return TAB && (TAB.hasAttribute('data-active') || !!TAB.querySelector('[data-active]')); }
+  function schedule(delay) { clearTimeout(timer); timer = setTimeout(refresh, delay); }
+  function reloadClean() { location.replace(location.pathname + location.search); }
+  // closeModal clears the :target the same way the ✕ / Cancel links do.
+  function closeModal() { location.hash = 'close'; }
 
-        fetch(form.action, {
-          method: 'POST',
-          headers: { 'Accept': 'application/json' },
-          body: new URLSearchParams(new FormData(form))
-        })
-          .then(function (r) { return r.json(); })
-          .then(function (res) {
-            if (!res.ok) { location.reload(); return; } // flash shows the reason
-            btn.innerHTML = spinner('Deploying…');
-            pollUntilRolledOut(svc, res.newTag, Date.now());
-          })
-          .catch(function () { location.reload(); });
-      });
+  // showNotice drops a transient flash-styled banner just above the tab body.
+  // It lives outside #tab-body so the background refresh (which only rewrites
+  // #tab-body) leaves it in place; reloadClean replaces it with the server-side
+  // flash once the rollout settles.
+  function showNotice(msg) {
+    if (!TAB || !TAB.parentNode) return;
+    var n = document.getElementById('mutation-notice');
+    if (!n) {
+      n = document.createElement('div');
+      n.id = 'mutation-notice';
+      n.className = 'flash flash-ok';
+      TAB.parentNode.insertBefore(n, TAB);
+    }
+    n.textContent = msg;
+  }
 
-      // Background refresh: swap freshly-rendered rows into the list in place,
-      // adapting cadence to whether anything is in flight. Slow while every
-      // service is settled (just enough to notice a build or deploy starting),
-      // fast once a row is marked data-active so we catch it finishing.
-      function anyActive() {
-        return !!document.querySelector('#service-list [data-active]');
-      }
-      function scheduleRefresh(delay) {
-        clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(refreshRows, delay);
-      }
-      function refreshRows() {
-        if (promoting || document.hidden || refreshing) { scheduleRefresh(IDLE_MS); return; }
-        refreshing = true;
-        fetch('/partial/status', { headers: { 'Accept': 'text/html' } })
-          .then(function (r) {
-            // Session expired → middleware redirects to login. Reload the whole
-            // page so the user lands on the sign-in flow, rather than swapping
-            // the login page's HTML into the service list.
-            if (r.redirected) { location.reload(); return null; }
-            return r.ok ? r.text() : null;
-          })
-          .then(function (html) {
-            // Re-check promoting: a promote may have started mid-flight, and
-            // swapping now would wipe out its spinner.
-            if (html === null || promoting) return;
-            var list = document.getElementById('service-list');
-            if (!list) return;
-            // Preserve which cards the user has expanded: the swap replaces the
-            // whole list (server always renders cards collapsed), so remember
-            // the open ones and re-open them afterwards.
-            var open = {};
-            list.querySelectorAll('details[data-service][open]').forEach(function (d) {
-              open[d.getAttribute('data-service')] = true;
-            });
-            list.innerHTML = html;
-            list.querySelectorAll('details[data-service]').forEach(function (d) {
-              if (open[d.getAttribute('data-service')]) d.open = true;
-            });
-          })
-          .catch(function () { /* transient — try again next tick */ })
-          .finally(function () {
-            refreshing = false;
-            // Re-evaluate against the rows we just swapped in: a deploy that
-            // finished drops us back to the slow cadence.
-            scheduleRefresh(anyActive() ? ACTIVE_MS : IDLE_MS);
-          });
-      }
-      // Kick off from the server-rendered initial state, and refresh promptly
-      // whenever the tab returns to the foreground.
-      scheduleRefresh(anyActive() ? ACTIVE_MS : IDLE_MS);
-      document.addEventListener('visibilitychange', function () {
-        if (!document.hidden) scheduleRefresh(0);
-      });
-    })();
-  </script>
-</body>
-</html>{{end}}
+  // Background refresh: re-render the active tab's body in place, preserving
+  // which app rows the user has expanded. Paused while a mutation is running,
+  // a modal is open, or the tab is hidden.
+  function refresh() {
+    if (!refreshURL || !TAB) return;
+    if (mutating || document.hidden || refreshing || modalOpen()) { schedule(IDLE); return; }
+    refreshing = true;
+    fetch(refreshURL, { headers: { 'Accept': 'text/html' } })
+      .then(function (r) {
+        if (r.redirected) { location.reload(); return null; }
+        if (!r.ok) { stale = true; tick(); return null; }
+        return r.text();
+      })
+      .then(function (html) {
+        if (html === null || mutating || modalOpen()) return;
+        stale = false; lastOk = Date.now(); tick();
+        var open = [];
+        TAB.querySelectorAll('.exp-toggle:checked').forEach(function (c) { open.push(c.id); });
+        TAB.innerHTML = html;
+        open.forEach(function (id) { var c = document.getElementById(id); if (c) c.checked = true; });
+      })
+      .catch(function () { stale = true; tick(); })
+      .finally(function () { refreshing = false; schedule(anyActive() ? ACTIVE : IDLE); });
+  }
+  schedule(anyActive() ? ACTIVE : IDLE);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) schedule(0); });
+
+  // Promote / rollback: intercept the modal confirm form, POST via fetch, then
+  // poll until the target environment reports the new tag. Without JS the plain
+  // form POST still works and redirects with a flash.
+  document.addEventListener('submit', function (e) {
+    var form = e.target.closest('form.js-mutate');
+    if (!form) return;
+    e.preventDefault();
+    mutating = true;
+    var svc = form.dataset.service, env = form.dataset.env;
+    var promoting = form.action.indexOf('/promote') !== -1;
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+    fetch(form.action, {
+      method: 'POST',
+      headers: { 'Accept': 'application/json' },
+      body: new URLSearchParams(new FormData(form))
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (!res.ok) { reloadClean(); return; }
+        // Success: unpause the background refresh, close the modal, and show a
+        // transient deploying notice while polling for the rollout to land.
+        mutating = false;
+        closeModal();
+        showNotice(promoting
+          ? 'Promoting ' + svc + ' → ' + res.newTag + ' — deploying…'
+          : 'Rolling back ' + svc + ' ' + res.env + ' → ' + res.newTag + '…');
+        schedule(ACTIVE);
+        pollRollout(svc, res.env, res.newTag, Date.now());
+      })
+      .catch(function () { reloadClean(); });
+  });
+
+  function pollRollout(svc, env, newTag, started) {
+    function again() {
+      if (Date.now() - started > TIMEOUT) { reloadClean(); return; }
+      setTimeout(function () { pollRollout(svc, env, newTag, started); }, POLL);
+    }
+    fetch('/services/' + encodeURIComponent(svc) + '/status', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        var e = s[env];
+        if (e && e.tag === newTag) { reloadClean(); return; }
+        again();
+      })
+      .catch(again);
+  }
+})();
+</script>
+{{end}}

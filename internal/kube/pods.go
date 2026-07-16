@@ -22,6 +22,12 @@ type ContainerInfo struct {
 	Ready         bool
 	RestartCount  int32
 	WaitingReason string // e.g. "CrashLoopBackOff", "ImagePullBackOff"; "" when not waiting
+	// ExitCode is the container's most recent termination exit code (current
+	// state if terminated, else last termination); nil when it has never
+	// terminated. Lets failed job pods surface "exit 137".
+	ExitCode *int32
+	// TerminatedReason accompanies ExitCode, e.g. "OOMKilled", "Error".
+	TerminatedReason string
 }
 
 type PodInfo struct {
@@ -29,7 +35,10 @@ type PodInfo struct {
 	// OwnerKind is the pod's controller kind ("ReplicaSet", "Job", ...), ""
 	// for bare pods. Job-owned pods run to completion on whatever image the
 	// Job was created with, so they don't reflect what's deployed.
-	OwnerKind  string
+	OwnerKind string
+	// OwnerName is the controller's name — for Job-owned pods, the Job name,
+	// which joins a pod's exit code back to its JobInfo.
+	OwnerName  string
 	Phase      string
 	Containers []ContainerInfo
 }
@@ -44,6 +53,7 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 		info := PodInfo{Name: p.Name, Phase: string(p.Status.Phase)}
 		if ref := metav1.GetControllerOf(&p); ref != nil {
 			info.OwnerKind = ref.Kind
+			info.OwnerName = ref.Name
 		}
 		for _, ctr := range p.Spec.Containers {
 			ci := ContainerInfo{Image: ctr.Image}
@@ -55,6 +65,13 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 				ci.RestartCount = cs.RestartCount
 				if cs.State.Waiting != nil {
 					ci.WaitingReason = cs.State.Waiting.Reason
+				}
+				if t := cs.State.Terminated; t != nil {
+					ci.ExitCode = &t.ExitCode
+					ci.TerminatedReason = t.Reason
+				} else if t := cs.LastTerminationState.Terminated; t != nil {
+					ci.ExitCode = &t.ExitCode
+					ci.TerminatedReason = t.Reason
 				}
 				break
 			}

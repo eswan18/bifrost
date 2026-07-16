@@ -1,16 +1,3 @@
-# Tailwind CSS build stage
-FROM node:22-alpine AS tailwind
-
-WORKDIR /build
-
-COPY package.json package-lock.json ./
-RUN npm ci
-
-COPY static/input.css ./static/
-COPY templates ./templates
-
-RUN npx @tailwindcss/cli -i static/input.css -o static/style.css --minify
-
 # Go build stage
 FROM golang:1.26-alpine AS builder
 
@@ -42,9 +29,10 @@ RUN apk --no-cache add ca-certificates \
 
 WORKDIR /app
 
+# style.css is hand-written and committed (no build step); ship it as-is.
 COPY --from=builder /build/bifrost .
 COPY --from=builder /build/templates ./templates
-COPY --from=tailwind /build/static ./static
+COPY --from=builder /build/static ./static
 
 USER appuser
 

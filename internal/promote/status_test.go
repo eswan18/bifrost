@@ -4,12 +4,12 @@ import "testing"
 
 func TestStatusOf(t *testing.T) {
 	tests := []struct {
-		name             string
-		staging, prod    []string
-		wantState        State
-		wantStagingTag   string
-		wantProdTag      string
-		wantNewProdTag   string
+		name           string
+		staging, prod  []string
+		wantState      State
+		wantStagingTag string
+		wantProdTag    string
+		wantNewProdTag string
 	}{
 		{
 			name:           "in sync, plain SHAs",

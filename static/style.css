@@ -1,0 +1,291 @@
+/* Bifrost — "Blueprint" theme. Hand-written from the design tokens; no build
+   step. Two themes via a data-theme attribute on <body>; every component
+   references the CSS variables. */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background: var(--bg);
+  color: var(--ink);
+  /* Light (default) */
+  --bg: #f7f5f1;
+  --ink: #1c1a17;
+  --mut: #8a827a;
+  --faint: #b5aca0;
+  --line: rgba(30, 26, 20, .16);
+  --line2: rgba(30, 26, 20, .08);
+  --panel: rgba(30, 26, 20, .03);
+  --red: oklch(0.55 0.16 25);
+  --amb: oklch(0.55 0.16 80);
+  --blu: oklch(0.55 0.16 250);
+  --grn: oklch(0.52 0.14 155);
+}
+
+body[data-theme="dark"] {
+  --bg: #171512;
+  --ink: #ece7dd;
+  --mut: #a39b8c;
+  --faint: #6e6759;
+  --line: rgba(236, 231, 221, .2);
+  --line2: rgba(236, 231, 221, .09);
+  --panel: rgba(236, 231, 221, .04);
+  --red: oklch(0.72 0.15 25);
+  --amb: oklch(0.78 0.13 85);
+  --blu: oklch(0.72 0.13 250);
+  --grn: oklch(0.72 0.13 155);
+}
+
+a { color: inherit; text-decoration: none; }
+button { font-family: inherit; }
+
+/* --- layout ---------------------------------------------------------------- */
+
+.app-shell { min-height: 100vh; background: var(--bg); color: var(--ink); }
+.page { max-width: 1100px; margin: 0 auto; padding: clamp(16px, 4vw, 36px) clamp(16px, 4vw, 36px) 80px; }
+
+.header {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  gap: 16px; flex-wrap: wrap;
+  padding-bottom: 18px; border-bottom: 2px solid var(--ink);
+}
+.brand { font-size: 28px; font-weight: 700; letter-spacing: -.01em; }
+.header-right { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+.refreshed { font-size: 12px; color: var(--mut); }
+.refreshed.is-stale { color: var(--red); }
+.theme-toggle {
+  font-size: 12px; color: var(--ink); background: none;
+  border: 1px solid var(--line); border-radius: 99px;
+  padding: 6px 14px; cursor: pointer; min-height: 32px;
+}
+.signout-form { margin: 0; }
+
+.flash {
+  margin-top: 16px; padding: 10px 14px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.flash-ok { border-color: var(--grn); color: var(--grn); }
+.flash-error { border-color: var(--red); color: var(--red); }
+
+/* --- tabs ------------------------------------------------------------------ */
+
+.tabs { display: flex; gap: 26px; border-bottom: 1px solid var(--line); margin-top: 4px; }
+.tab {
+  padding: 12px 2px; margin: 0 0 -1px;
+  border-bottom: 2px solid transparent;
+  font-size: 13px; font-weight: 600; letter-spacing: .02em;
+  color: var(--mut);
+  display: flex; gap: 7px; align-items: baseline; min-height: 44px;
+}
+.tab.active { border-bottom: 2px solid var(--ink); color: var(--ink); }
+.tab:hover { text-decoration: none; }
+.tab-count { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--faint); }
+.tab-issue { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--red); font-weight: 600; }
+
+/* --- shared type / color --------------------------------------------------- */
+
+.mono { font-family: 'IBM Plex Mono', monospace; }
+.w6 { font-weight: 600; }
+.nowrap { white-space: nowrap; }
+.c-red { color: var(--red); }
+.c-amb { color: var(--amb); }
+.c-blu { color: var(--blu); }
+.c-grn { color: var(--grn); }
+.c-mut { color: var(--mut); }
+.c-faint { color: var(--faint); }
+.c-ink { color: var(--ink); }
+
+.sec-label { font-size: 11px; letter-spacing: .14em; font-weight: 600; color: var(--mut); text-transform: uppercase; }
+
+.dot { width: 8px; height: 8px; border-radius: 99px; flex: none; display: inline-block; position: relative; top: -1px; }
+.dot-grn { background: var(--grn); }
+.dot-red { background: var(--red); }
+.dot-amb { background: var(--amb); }
+.dot-cur { background: currentColor; width: 7px; height: 7px; }
+
+.micro-inline { font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: .12em; color: var(--faint); text-transform: uppercase; }
+
+.hash { text-decoration: underline dotted var(--faint); text-underline-offset: 3px; color: inherit; }
+.hash:hover { text-decoration: underline solid var(--faint); text-underline-offset: 3px; }
+.app-name { font-weight: 600; color: var(--ink); }
+.app-name:hover, .build-link:hover, .jobs-link:hover, .ext:hover, .clear-filter:hover { text-decoration: underline; }
+.ext { color: var(--faint); font-size: 12px; }
+
+/* --- pills / buttons ------------------------------------------------------- */
+
+.pill {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; line-height: 1;
+  border-radius: 99px; padding: 6px 13px; cursor: pointer;
+  border: 1px solid transparent;
+}
+.pill-primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.pill-secondary { background: none; color: var(--ink); border-color: var(--ink); padding: 5px 13px; }
+.pill-ghost { background: none; color: var(--mut); border-color: var(--line); }
+.pill:disabled { opacity: .4; cursor: not-allowed; }
+
+.ghost-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: 99px;
+  border: 1px solid var(--line); color: var(--faint);
+  font-size: 13px; background: none; line-height: 1; cursor: pointer;
+}
+
+.pill-block {
+  flex: 1; min-height: 44px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 13.5px; font-weight: 600;
+  border-radius: 10px; padding: 10px 16px;
+  border: 1px solid transparent; cursor: pointer;
+}
+
+/* --- overview -------------------------------------------------------------- */
+
+.intro { font-size: 13.5px; line-height: 1.55; color: var(--mut); max-width: 62ch; margin: 20px 0 0; text-wrap: pretty; }
+.band { display: flex; gap: 36px; flex-wrap: wrap; padding-top: 20px; border-top: 1px solid var(--line); }
+.band-attn { margin-top: 24px; }
+.band-cols { margin-top: 26px; }
+
+.attn-col { flex: 2; min-width: 300px; }
+.attn-empty { display: flex; gap: 10px; align-items: baseline; margin-top: 12px; font-size: 13.5px; color: var(--mut); }
+.attn-list { display: grid; gap: 10px; margin-top: 12px; }
+.attn-item { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+.attn-text { display: flex; gap: 10px; align-items: baseline; font-size: 13.5px; min-width: 0; }
+.attn-text strong { font-weight: 600; }
+.attn-action { padding: 5px 14px; min-height: 30px; white-space: nowrap; flex: none; margin-left: auto; }
+
+.fleet { flex: 1; min-width: 210px; display: grid; gap: 7px; align-content: start; font-size: 12.5px; color: var(--mut); }
+.fleet .sec-label { margin-bottom: 3px; }
+.fleet-row { display: flex; justify-content: space-between; }
+.fleet-row .mono { font-family: 'IBM Plex Mono', monospace; }
+.fleet-rule { padding-bottom: 8px; border-bottom: 1px solid var(--line2); }
+
+.col { flex: 1; min-width: 230px; }
+.col-list { display: grid; gap: 8px; margin-top: 12px; font-size: 12.5px; }
+.col-meta { color: var(--mut); margin-top: 2px; }
+.nextrun { display: flex; justify-content: space-between; gap: 12px; }
+
+/* --- apps: desktop table --------------------------------------------------- */
+
+.apps-mobile { display: none; }
+
+.apps-grid { display: grid; grid-template-columns: 170px 1fr 1fr 140px 165px 110px; gap: 0 18px; align-items: center; }
+.apps-head { padding: 16px 0 8px; font-size: 10.5px; letter-spacing: .14em; color: var(--mut); border-bottom: 1px solid var(--line); }
+.app-row { border-bottom: 1px solid var(--line2); }
+.app-line { padding: 13px 0; font-size: 13px; }
+
+.cell-app { display: flex; gap: 7px; align-items: baseline; min-width: 0; }
+.cell-env { font-size: 13px; min-width: 0; }
+.env-hash { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+.env-status { font-size: 11px; }
+.cell-build { font-size: 12px; white-space: nowrap; }
+.build-link { font-size: 12px; }
+.cell-jobs { font-size: 12px; }
+.jobs-link { font-size: 12px; text-decoration: underline dotted var(--faint); text-underline-offset: 3px; }
+.cell-actions { justify-self: end; display: flex; gap: 8px; align-items: center; }
+.sync-text { font-size: 12px; }
+
+.chev { cursor: pointer; color: var(--faint); font-size: 11px; padding: 2px 5px; user-select: none; }
+.chev::after { content: "\25B8"; } /* ▸ */
+.exp-toggle:checked ~ .app-line .chev::after,
+.exp-toggle:checked ~ .card-head .chev::after { content: "\25BE"; } /* ▾ */
+
+.job-subtable { display: none; }
+.exp-toggle:checked ~ .job-subtable { display: block; }
+
+.app-row .job-subtable { margin: 0 0 14px 170px; border-left: 1px solid var(--line); padding-left: 20px; }
+.jobsub-grid { display: grid; grid-template-columns: 170px 130px 1fr 150px; gap: 16px; align-items: baseline; }
+.jobsub-head { color: var(--mut); font-size: 10.5px; letter-spacing: .12em; margin: 8px 0; }
+.jobsub-row { font-size: 12px; padding: 4px 0; }
+
+/* --- apps: mobile cards ---------------------------------------------------- */
+
+.app-card { border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.card-name { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.card-name .app-name { font-size: 15px; }
+.card-badge { display: flex; gap: 6px; align-items: baseline; font-size: 10.5px; letter-spacing: .1em; font-weight: 600; flex: none; }
+.env-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.env-tile { background: var(--panel); border-radius: 9px; padding: 10px 12px; }
+.tile-label { color: var(--mut); font-size: 10px; letter-spacing: .1em; }
+.tile-hash { font-size: 12.5px; margin-top: 4px; }
+.tile-status { font-size: 11px; margin-top: 2px; }
+.card-meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; margin-top: 12px; }
+.card-jobs { display: none; border-top: 1px solid var(--line2); margin-top: 12px; padding-top: 12px; }
+.exp-toggle:checked ~ .card-jobs { display: grid; gap: 10px; font-size: 12px; }
+.card-job-top { display: flex; justify-content: space-between; gap: 10px; }
+.card-job-meta { margin-top: 3px; }
+.card-actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.card-actions:empty { display: none; }
+
+/* --- jobs tab -------------------------------------------------------------- */
+
+.jobs-mobile { display: none; }
+
+.jobs-filter { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-top: 18px; }
+.jobs-summary { font-size: 12.5px; }
+.filter-right { display: flex; gap: 8px; align-items: center; }
+.clear-filter { font-size: 12px; color: var(--mut); padding: 6px 4px; cursor: pointer; }
+.select-wrap { position: relative; display: inline-flex; align-items: center; }
+.filter-select {
+  appearance: none; -webkit-appearance: none;
+  font-family: 'Space Grotesk', sans-serif; font-size: 12.5px; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 99px;
+  padding: 7px 32px 7px 14px; cursor: pointer; min-height: 36px;
+}
+.select-caret { position: absolute; right: 13px; color: var(--mut); font-size: 10px; pointer-events: none; line-height: 1; }
+
+.jobs-grid { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(140px, 1.2fr) 95px 120px 170px 130px; gap: 0 18px; align-items: baseline; }
+.jobs-head { padding: 16px 0 8px; font-size: 10.5px; letter-spacing: .14em; color: var(--mut); border-bottom: 1px solid var(--line); }
+.jobs-row { padding: 11px 0; border-bottom: 1px solid var(--line2); font-size: 12.5px; }
+.job-app { font-size: 13px; }
+.jobs-empty { padding: 24px 0; font-size: 13px; }
+
+.job-card { border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+.job-card-top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; font-size: 13px; }
+.job-card-meta { font-size: 12px; margin-top: 6px; }
+
+/* --- modals ---------------------------------------------------------------- */
+
+.modal { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; padding: 16px; }
+.modal:target { display: flex; }
+.modal-backdrop { position: absolute; inset: 0; background: rgba(20, 18, 15, .45); backdrop-filter: blur(2px); }
+.modal-panel {
+  position: relative; z-index: 1;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); width: min(460px, 94vw);
+  padding: 26px 28px; box-shadow: 0 24px 60px rgba(0, 0, 0, .25);
+}
+.modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.modal-title { font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+.modal-x { color: var(--mut); font-size: 16px; padding: 4px; cursor: pointer; }
+.modal-sub { font-size: 12.5px; color: var(--mut); margin-top: 4px; }
+.modal-rows { display: grid; gap: 14px; margin-top: 20px; }
+.modal-row { border: 1px solid var(--line); padding: 14px 16px; }
+.micro { font-size: 10.5px; letter-spacing: .14em; color: var(--mut); font-weight: 600; }
+.hash-diff { font-family: 'IBM Plex Mono', monospace; font-size: 14px; margin-top: 8px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.hash-diff .from { color: var(--faint); text-decoration: line-through; }
+.hash-diff .arrow { color: var(--mut); }
+.hash-diff .to { font-weight: 600; }
+.modal-note { font-size: 11.5px; color: var(--mut); margin-top: 6px; }
+.modal-row .pill, .modal-row button.pill { margin-top: 12px; font-size: 13px; padding: 8px 18px; min-height: 36px; }
+.modal-cancel { color: var(--mut); font-size: 13px; margin-top: 18px; display: block; cursor: pointer; }
+
+/* --- auth pages ------------------------------------------------------------ */
+
+.auth-page { max-width: 460px; margin: 0 auto; padding: clamp(48px, 12vh, 120px) 20px; text-align: center; }
+.auth-card { display: grid; gap: 14px; justify-items: center; }
+.auth-title { font-size: 28px; font-weight: 700; letter-spacing: -.01em; }
+.auth-sub { font-size: 13.5px; color: var(--mut); }
+.auth-flash { width: 100%; text-align: left; }
+
+/* --- responsive ------------------------------------------------------------ */
+
+@media (max-width: 760px) {
+  .apps-desktop { display: none; }
+  .apps-mobile { display: grid; gap: 12px; margin-top: 16px; }
+  .jobs-desktop { display: none; }
+  .jobs-mobile { display: grid; gap: 10px; margin-top: 16px; }
+}

@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/coreos/go-oidc/v3 v3.20.0
+	github.com/robfig/cron/v3 v3.0.1
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.288.0
 	k8s.io/api v0.36.2

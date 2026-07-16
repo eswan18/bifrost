@@ -149,7 +149,7 @@ func TestListArgoApps(t *testing.T) {
 	}
 }
 
-func TestPatchProdImage(t *testing.T) {
+func TestPatchAppImage(t *testing.T) {
 	gvr := schema.GroupVersionResource{
 		Group: "argoproj.io", Version: "v1alpha1", Resource: "applications",
 	}
@@ -168,7 +168,7 @@ func TestPatchProdImage(t *testing.T) {
 	)
 	c := &client{dyn: dyn, argoNS: "argocd"}
 
-	err := c.PatchProdImage(context.Background(), "foo",
+	err := c.PatchAppImage(context.Background(), "foo", "prod",
 		"reg/foo:abc1234-prod")
 	if err != nil {
 		t.Fatal(err)

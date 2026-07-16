@@ -17,8 +17,8 @@ type Renderer struct {
 }
 
 // LoadTemplates parses every template under dir as a child of base.html.
-// Each non-base file becomes its own named template, e.g. status.html →
-// "status".
+// Each non-base file becomes its own named template, e.g. overview.html →
+// "overview".
 func LoadTemplates(dir string) (*Renderer, error) {
 	base := filepath.Join(dir, "base.html")
 	matches, err := filepath.Glob(filepath.Join(dir, "*.html"))
@@ -33,6 +33,22 @@ func LoadTemplates(dir string) (*Renderer, error) {
 		// label stays fresh across the page's background re-renders.
 		"reltime": func(t time.Time) string { return relativeTime(t, time.Now()) },
 		"abstime": absTime,
+		// dict builds a map inline so a shared block (e.g. the rollback modal
+		// row) can be handed several named values at once.
+		"dict": func(pairs ...any) (map[string]any, error) {
+			if len(pairs)%2 != 0 {
+				return nil, fmt.Errorf("dict: odd number of arguments")
+			}
+			m := make(map[string]any, len(pairs)/2)
+			for i := 0; i < len(pairs); i += 2 {
+				key, ok := pairs[i].(string)
+				if !ok {
+					return nil, fmt.Errorf("dict: key %d is not a string", i)
+				}
+				m[key] = pairs[i+1]
+			}
+			return m, nil
+		},
 	}
 	for _, m := range matches {
 		if m == base {
