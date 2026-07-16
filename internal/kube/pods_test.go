@@ -78,3 +78,56 @@ func TestListPodsAndImages(t *testing.T) {
 		t.Errorf("Images = %v, want %v", got, want)
 	}
 }
+
+// A completed CronJob pod keeps the image it ran with; it must not make the
+// namespace look mid-deploy after the deployment moves to a newer image.
+func TestImagesExcludesJobPods(t *testing.T) {
+	ctrl := true
+	cs := fake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "foo", Name: "app-6858d77994-9s6c5",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "app-6858d77994", Controller: &ctrl,
+				}},
+			},
+			Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "reg/foo:new"}}},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "foo", Name: "app-purge-29735100-8wrsp",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: "app-purge-29735100", Controller: &ctrl,
+				}},
+			},
+			Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "reg/foo:old"}}},
+			Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+		},
+	)
+	c := &client{typed: cs}
+	pods, err := c.ListPods(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 2 {
+		t.Fatalf("got %d pods, want 2 (job pods stay visible in ListPods)", len(pods))
+	}
+	for _, p := range pods {
+		switch p.Name {
+		case "app-6858d77994-9s6c5":
+			if p.OwnerKind != "ReplicaSet" {
+				t.Errorf("%s OwnerKind = %q, want ReplicaSet", p.Name, p.OwnerKind)
+			}
+		case "app-purge-29735100-8wrsp":
+			if p.OwnerKind != "Job" {
+				t.Errorf("%s OwnerKind = %q, want Job", p.Name, p.OwnerKind)
+			}
+		}
+	}
+
+	got := Images(pods)
+	if len(got) != 1 || got[0] != "reg/foo:new" {
+		t.Errorf("Images = %v, want [reg/foo:new] (job pod image excluded)", got)
+	}
+}

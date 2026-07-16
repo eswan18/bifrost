@@ -25,7 +25,11 @@ type ContainerInfo struct {
 }
 
 type PodInfo struct {
-	Name       string
+	Name string
+	// OwnerKind is the pod's controller kind ("ReplicaSet", "Job", ...), ""
+	// for bare pods. Job-owned pods run to completion on whatever image the
+	// Job was created with, so they don't reflect what's deployed.
+	OwnerKind  string
 	Phase      string
 	Containers []ContainerInfo
 }
@@ -38,6 +42,9 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 	out := make([]PodInfo, 0, len(pods.Items))
 	for _, p := range pods.Items {
 		info := PodInfo{Name: p.Name, Phase: string(p.Status.Phase)}
+		if ref := metav1.GetControllerOf(&p); ref != nil {
+			info.OwnerKind = ref.Kind
+		}
 		for _, ctr := range p.Spec.Containers {
 			ci := ContainerInfo{Image: ctr.Image}
 			for _, cs := range p.Status.ContainerStatuses {
@@ -58,13 +65,19 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 	return out, nil
 }
 
-// Images returns the deduped container images across all pods, including
-// completed ones — promote.StatusOf depends on seeing every image present in
-// the namespace, so this must not filter by phase or health.
+// Images returns the deduped container images across the namespace's
+// long-running pods. Job-owned pods (cron/one-off jobs) are excluded: a
+// completed job keeps the image it ran with, which would read as a permanent
+// mid-deploy once the deployment moves past it. Everything else must be
+// included regardless of phase or health — promote.StatusOf detects
+// mid-deploy by seeing old+new (or pending/backoff) pods side by side.
 func Images(pods []PodInfo) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	for _, p := range pods {
+		if p.OwnerKind == "Job" {
+			continue
+		}
 		for _, ctr := range p.Containers {
 			if _, ok := seen[ctr.Image]; !ok {
 				seen[ctr.Image] = struct{}{}
