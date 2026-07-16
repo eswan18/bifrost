@@ -119,9 +119,15 @@ func TestImagesExcludesJobPods(t *testing.T) {
 			if p.OwnerKind != "ReplicaSet" {
 				t.Errorf("%s OwnerKind = %q, want ReplicaSet", p.Name, p.OwnerKind)
 			}
+			if p.OwnerName != "app-6858d77994" {
+				t.Errorf("%s OwnerName = %q, want app-6858d77994", p.Name, p.OwnerName)
+			}
 		case "app-purge-29735100-8wrsp":
 			if p.OwnerKind != "Job" {
 				t.Errorf("%s OwnerKind = %q, want Job", p.Name, p.OwnerKind)
+			}
+			if p.OwnerName != "app-purge-29735100" {
+				t.Errorf("%s OwnerName = %q, want app-purge-29735100", p.Name, p.OwnerName)
 			}
 		}
 	}
@@ -129,5 +135,100 @@ func TestImagesExcludesJobPods(t *testing.T) {
 	got := Images(pods)
 	if len(got) != 1 || got[0] != "reg/foo:new" {
 		t.Errorf("Images = %v, want [reg/foo:new] (job pod image excluded)", got)
+	}
+}
+
+// TestListPodsExitCodes: a failed job pod's exit code comes from the current
+// terminated state; a crashlooping (currently waiting) pod's exit code comes
+// from its last termination state; a healthy running container has no exit
+// code at all.
+func TestListPodsExitCodes(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "foo", Name: "failed-job-pod"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "reg/foo:abc"}}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodFailed,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "app",
+						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 137,
+							Reason:   "OOMKilled",
+						}},
+					},
+				},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "foo", Name: "crashlooping-pod"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "reg/foo:abc"}}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name: "app",
+						State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+							Reason: "CrashLoopBackOff",
+						}},
+						LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+							Reason:   "Error",
+						}},
+					},
+				},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "foo", Name: "healthy-pod"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "reg/foo:abc"}}},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name:  "app",
+						Ready: true,
+						State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+					},
+				},
+			},
+		},
+	)
+	c := &client{typed: cs}
+	pods, err := c.ListPods(context.Background(), "foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byName := map[string]PodInfo{}
+	for _, p := range pods {
+		byName[p.Name] = p
+	}
+
+	failed := byName["failed-job-pod"].Containers[0]
+	if failed.ExitCode == nil || *failed.ExitCode != 137 {
+		t.Errorf("failed-job-pod ExitCode = %v, want 137", failed.ExitCode)
+	}
+	if failed.TerminatedReason != "OOMKilled" {
+		t.Errorf("failed-job-pod TerminatedReason = %q, want OOMKilled", failed.TerminatedReason)
+	}
+
+	crashlooping := byName["crashlooping-pod"].Containers[0]
+	if crashlooping.ExitCode == nil || *crashlooping.ExitCode != 1 {
+		t.Errorf("crashlooping-pod ExitCode = %v, want 1 (from LastTerminationState)", crashlooping.ExitCode)
+	}
+	if crashlooping.TerminatedReason != "Error" {
+		t.Errorf("crashlooping-pod TerminatedReason = %q, want Error", crashlooping.TerminatedReason)
+	}
+	if crashlooping.WaitingReason != "CrashLoopBackOff" {
+		t.Errorf("crashlooping-pod WaitingReason = %q, want CrashLoopBackOff", crashlooping.WaitingReason)
+	}
+
+	healthy := byName["healthy-pod"].Containers[0]
+	if healthy.ExitCode != nil {
+		t.Errorf("healthy-pod ExitCode = %v, want nil", healthy.ExitCode)
+	}
+	if healthy.TerminatedReason != "" {
+		t.Errorf("healthy-pod TerminatedReason = %q, want \"\"", healthy.TerminatedReason)
 	}
 }

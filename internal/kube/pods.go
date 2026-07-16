@@ -53,6 +53,7 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 		info := PodInfo{Name: p.Name, Phase: string(p.Status.Phase)}
 		if ref := metav1.GetControllerOf(&p); ref != nil {
 			info.OwnerKind = ref.Kind
+			info.OwnerName = ref.Name
 		}
 		for _, ctr := range p.Spec.Containers {
 			ci := ContainerInfo{Image: ctr.Image}
@@ -64,6 +65,13 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 				ci.RestartCount = cs.RestartCount
 				if cs.State.Waiting != nil {
 					ci.WaitingReason = cs.State.Waiting.Reason
+				}
+				if t := cs.State.Terminated; t != nil {
+					ci.ExitCode = &t.ExitCode
+					ci.TerminatedReason = t.Reason
+				} else if t := cs.LastTerminationState.Terminated; t != nil {
+					ci.ExitCode = &t.ExitCode
+					ci.TerminatedReason = t.Reason
 				}
 				break
 			}
