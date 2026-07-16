@@ -4,6 +4,7 @@ package gcb
 
 import (
 	"context"
+	"time"
 
 	cloudbuild "google.golang.org/api/cloudbuild/v1"
 )
@@ -15,6 +16,10 @@ type BuildStatus struct {
 	Status string
 	SHA    string // short commit SHA the build is building
 	LogURL string // console link to the build log
+	// StartTime is when the build began executing (zero while queued);
+	// FinishTime is when it completed (zero while in progress).
+	StartTime  time.Time
+	FinishTime time.Time
 }
 
 // InProgress reports whether the build is still running.
@@ -91,6 +96,16 @@ func (c *client) LatestBuilds(ctx context.Context) (map[string]BuildStatus, erro
 	return latestByRepo(resp.Builds), nil
 }
 
+// parseTime parses Cloud Build's RFC3339 timestamps; zero time on empty or
+// malformed input.
+func parseTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // latestByRepo maps repo name → newest build. Builds must be ordered newest
 // first (the API's default ordering); the first build seen per repo wins.
 func latestByRepo(builds []*cloudbuild.Build) map[string]BuildStatus {
@@ -104,9 +119,11 @@ func latestByRepo(builds []*cloudbuild.Build) map[string]BuildStatus {
 			continue
 		}
 		out[repo] = BuildStatus{
-			Status: b.Status,
-			SHA:    b.Substitutions["SHORT_SHA"],
-			LogURL: b.LogUrl,
+			Status:     b.Status,
+			SHA:        b.Substitutions["SHORT_SHA"],
+			LogURL:     b.LogUrl,
+			StartTime:  parseTime(b.StartTime),
+			FinishTime: parseTime(b.FinishTime),
 		}
 	}
 	return out

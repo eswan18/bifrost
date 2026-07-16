@@ -312,7 +312,7 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	}
 	newImage := imageBase + ":" + s.NewProdTag
 
-	if err := h.Kube.PatchProdImage(r.Context(), app, newImage); err != nil {
+	if err := h.Kube.PatchAppImage(r.Context(), app, "prod", newImage); err != nil {
 		slog.Error("promote failed", "user", sess.Email, "service", app,
 			"from", s.ProdTag, "to", s.NewProdTag, "error", err)
 		h.respondPromote(w, r, http.StatusBadGateway, false, fmt.Sprintf("patch failed: %v", err), "")

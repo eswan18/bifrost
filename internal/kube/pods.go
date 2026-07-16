@@ -22,6 +22,12 @@ type ContainerInfo struct {
 	Ready         bool
 	RestartCount  int32
 	WaitingReason string // e.g. "CrashLoopBackOff", "ImagePullBackOff"; "" when not waiting
+	// ExitCode is the container's most recent termination exit code (current
+	// state if terminated, else last termination); nil when it has never
+	// terminated. Lets failed job pods surface "exit 137".
+	ExitCode *int32
+	// TerminatedReason accompanies ExitCode, e.g. "OOMKilled", "Error".
+	TerminatedReason string
 }
 
 type PodInfo struct {
@@ -29,7 +35,10 @@ type PodInfo struct {
 	// OwnerKind is the pod's controller kind ("ReplicaSet", "Job", ...), ""
 	// for bare pods. Job-owned pods run to completion on whatever image the
 	// Job was created with, so they don't reflect what's deployed.
-	OwnerKind  string
+	OwnerKind string
+	// OwnerName is the controller's name — for Job-owned pods, the Job name,
+	// which joins a pod's exit code back to its JobInfo.
+	OwnerName  string
 	Phase      string
 	Containers []ContainerInfo
 }

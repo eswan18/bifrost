@@ -52,7 +52,7 @@ func (f *fakeKube) ListArgoApps(_ context.Context) (map[string]kube.AppStatus, e
 	return f.argoApps, nil
 }
 
-func (f *fakeKube) PatchProdImage(_ context.Context, app, image string) error {
+func (f *fakeKube) PatchAppImage(_ context.Context, app, env, image string) error {
 	if f.patchErr != nil {
 		return f.patchErr
 	}
@@ -61,8 +61,20 @@ func (f *fakeKube) PatchProdImage(_ context.Context, app, image string) error {
 	if f.patched == nil {
 		f.patched = map[string]string{}
 	}
-	f.patched[app] = image
+	f.patched[app+"-"+env] = image
 	return nil
+}
+
+func (f *fakeKube) ListCronJobs(_ context.Context, ns string) ([]kube.CronJobInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeKube) ListJobs(_ context.Context, ns string) ([]kube.JobInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeKube) ListReplicaSets(_ context.Context, ns string) ([]kube.ReplicaSetInfo, error) {
+	return nil, nil
 }
 
 func newTestHandlers(t *testing.T, k *fakeKube) (*Handlers, *auth.SessionManager, *auth.Session) {
@@ -104,7 +116,7 @@ func TestPromoteHappyPath(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if got := k.patched["foo"]; got != "reg/foo:abc1234" {
+	if got := k.patched["foo-prod"]; got != "reg/foo:abc1234" {
 		t.Errorf("patched = %q", got)
 	}
 }
@@ -152,7 +164,7 @@ func TestPromoteRefusesStaleExpectedSHA(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("code = %d, want %d", rec.Code, http.StatusSeeOther)
 	}
-	if got, ok := k.patched["foo"]; ok {
+	if got, ok := k.patched["foo-prod"]; ok {
 		t.Fatalf("patched prod to %q despite stale expected_sha", got)
 	}
 
@@ -413,8 +425,8 @@ func TestPromoteJSONSuccess(t *testing.T) {
 	if got["newTag"] != "abc1234" {
 		t.Errorf("newTag = %v, want abc1234", got["newTag"])
 	}
-	if k.patched["foo"] != "reg/foo:abc1234" {
-		t.Errorf("patched = %q, want reg/foo:abc1234", k.patched["foo"])
+	if k.patched["foo-prod"] != "reg/foo:abc1234" {
+		t.Errorf("patched = %q, want reg/foo:abc1234", k.patched["foo-prod"])
 	}
 }
 
@@ -447,7 +459,7 @@ func TestPromoteJSONStaleExpectedSHA(t *testing.T) {
 	if got["ok"] != false {
 		t.Errorf("ok = %v, want false", got["ok"])
 	}
-	if _, ok := k.patched["foo"]; ok {
+	if _, ok := k.patched["foo-prod"]; ok {
 		t.Error("should not have patched on stale expected_sha")
 	}
 	if msg, _ := got["error"].(string); !strings.Contains(msg, "staging changed") {
@@ -860,7 +872,7 @@ func TestPromoteNothingToPromote(t *testing.T) {
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if _, ok := k.patched["foo"]; ok {
+	if _, ok := k.patched["foo-prod"]; ok {
 		t.Error("should not have patched")
 	}
 }

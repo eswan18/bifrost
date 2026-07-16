@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -23,6 +24,9 @@ type Config struct {
 	StagingURLs        map[string]string // service name → public staging URL, for "open" links
 	ProdURLs           map[string]string // service name → public prod URL, for "open" links
 	GCPProject         string            // for Cloud Build status; "" disables it
+	// DisplayLocation renders timestamps ("today 09:58", next job runs) in the
+	// operator's local time; the cluster and cron schedules run in UTC.
+	DisplayLocation *time.Location
 }
 
 // RepoFor returns the GitHub repo name for a service. Most repos are named
@@ -43,7 +47,7 @@ func Load() (*Config, error) {
 		"OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
 		"SESSION_SECRET", "ARGOCD_NAMESPACE",
 		"GITHUB_ORG", "REPO_OVERRIDES", "GCP_PROJECT",
-		"STAGING_URLS", "PROD_URLS",
+		"STAGING_URLS", "PROD_URLS", "DISPLAY_TIMEZONE",
 	} {
 		m[k] = os.Getenv(k)
 	}
@@ -107,6 +111,15 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		return nil, err
 	}
 
+	tz := m["DISPLAY_TIMEZONE"]
+	if tz == "" {
+		tz = "America/New_York"
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("DISPLAY_TIMEZONE %q: %w", tz, err)
+	}
+
 	return &Config{
 		HTTPAddress:        addr,
 		BaseURL:            strings.TrimRight(m["BASE_URL"], "/"),
@@ -124,6 +137,7 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		StagingURLs:        stagingURLs,
 		ProdURLs:           prodURLs,
 		GCPProject:         m["GCP_PROJECT"],
+		DisplayLocation:    loc,
 	}, nil
 }
 

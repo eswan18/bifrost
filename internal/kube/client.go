@@ -13,7 +13,13 @@ import (
 type Client interface {
 	ListPods(ctx context.Context, namespace string) ([]PodInfo, error)
 	ListArgoApps(ctx context.Context) (map[string]AppStatus, error)
-	PatchProdImage(ctx context.Context, app, image string) error
+	// PatchAppImage pins the ArgoCD Application <app>-<env> to a full image
+	// ref via its kustomize images override. Promote patches prod; rollback
+	// patches either env.
+	PatchAppImage(ctx context.Context, app, env, image string) error
+	ListCronJobs(ctx context.Context, namespace string) ([]CronJobInfo, error)
+	ListJobs(ctx context.Context, namespace string) ([]JobInfo, error)
+	ListReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetInfo, error)
 }
 
 // New returns an in-cluster Client. Falls back to KUBECONFIG / ~/.kube/config
