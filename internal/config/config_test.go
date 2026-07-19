@@ -34,12 +34,12 @@ func TestLoadFromEnv(t *testing.T) {
 
 func TestLoadSkipsEmptyServiceEntries(t *testing.T) {
 	env := minimalValidEnv()
-	env["SERVICES"] = " fitness-api, ,identity,"
+	env["SERVICES"] = " footstrike-api, ,identity,"
 	cfg, err := loadFromMap(env)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	want := []string{"fitness-api", "identity"}
+	want := []string{"footstrike-api", "identity"}
 	if !reflect.DeepEqual(cfg.Services, want) {
 		t.Errorf("Services = %v, want %v", cfg.Services, want)
 	}

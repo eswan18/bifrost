@@ -51,7 +51,7 @@ Requires these env vars to run (see `internal/config/config.go`):
 
     BASE_URL=http://localhost:8080
     ENV=local
-    SERVICES=fitness-api,identity
+    SERVICES=footstrike-api,identity
     ALLOWED_EMAIL=you@example.com
     OIDC_ISSUER_EXTERNAL=...
     OIDC_ISSUER_INTERNAL=...

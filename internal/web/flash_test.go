@@ -27,7 +27,7 @@ func TestFlashRoundTripPreservesMessage(t *testing.T) {
 	}{
 		// The promote success message: "→" is non-ASCII and net/http would
 		// silently strip it from a raw cookie value.
-		{"promote arrow", FlashSuccess, "Promoted fitness-api prod → abc1234"},
+		{"promote arrow", FlashSuccess, "Promoted footstrike-api prod → abc1234"},
 		// Kube error strings carry spaces, quotes, and punctuation.
 		{"kube error", FlashError, `read staging: pods is forbidden: User "system:serviceaccount:x" cannot list resource "pods"`},
 		{"semicolons and commas", FlashError, "a;b,c=d"},

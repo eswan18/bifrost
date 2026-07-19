@@ -30,7 +30,7 @@ type AppStatus struct {
 }
 
 // ListArgoApps returns the status of every Application in the argocd
-// namespace, keyed by name (e.g. "fitness-api-prod"). One List call covers
+// namespace, keyed by name (e.g. "footstrike-api-prod"). One List call covers
 // all services and both environments.
 func (c *client) ListArgoApps(ctx context.Context) (map[string]AppStatus, error) {
 	list, err := c.dyn.Resource(argocdAppGVR).Namespace(c.argoNS).
