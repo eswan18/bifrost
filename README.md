@@ -75,12 +75,13 @@ the thing that's broken.
 ### First deployment
 
 `bifrost-prod` initially runs `:latest` — no `kustomize.images` override
-exists on the Application until the first promotion writes one. Bifrost
-refuses to promote a service whose prod tag is unparseable, so the FIRST
-promotion of bifrost itself must be done manually:
-
-    kubectl patch application bifrost-prod -n argocd --type merge \
-      -p '{"spec":{"source":{"kustomize":{"images":["us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:<sha>"]}}}}'
+exists on the Application until the first promotion writes one. An
+unparseable prod tag (`latest`, `prod`) reads as drift, so the first
+promotion works from the UI itself (or `ib promote bifrost`) and writes the
+pinning override. The same applies to any service whose Application gets
+recreated (a rename, a cluster rebuild): the pin lives only on the live
+Application object, so prod falls back to the repo manifests' mutable tag
+until the next promotion re-pins it.
 
 Also add `bifrost` to the `SERVICES` list in `infra/ib.py` so the laptop CLI
 stays a working fallback (that change lives in the infra repo, not here).
