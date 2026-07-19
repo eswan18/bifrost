@@ -12,7 +12,6 @@ steps:
           --cache-from type=registry,ref=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:buildcache \
           --cache-to type=registry,ref=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:buildcache,mode=max \
           -t us-central1-docker.pkg.dev/ethans-services/containers/bifrost:$SHORT_SHA \
-          -t us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest \
           --push \
           .
 
