@@ -199,6 +199,30 @@ func TestPromoteHappyPath(t *testing.T) {
 	}
 }
 
+// A recreated prod Application loses its kustomize image pin and falls back
+// to the mutable tag in the repo manifests (latest/prod). Promote must still
+// work from that state so bifrost can re-pin prod (Footstrike 5b cutover,
+// July 2026).
+func TestPromoteUnpinnedProd(t *testing.T) {
+	k := &fakeKube{imgs: map[string][]string{
+		"foo-staging": {"reg/foo:abc1234"},
+		"foo-prod":    {"reg/foo:latest"},
+	}}
+	h, sess := newTestHandlers(t, k)
+
+	req := authed(t, "POST", "/services/foo/promote", "csrf="+csrf(h, sess)+"&expected_sha=abc1234", sess)
+	req.SetPathValue("name", "foo")
+	rec := httptest.NewRecorder()
+	h.Promote(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if got := k.patched["foo-prod"]; got != "reg/foo:abc1234" {
+		t.Errorf("patched = %q", got)
+	}
+}
+
 func TestPromoteRejectsBadCSRF(t *testing.T) {
 	k := &fakeKube{imgs: map[string][]string{
 		"foo-staging": {"reg/foo:abc1234"},
