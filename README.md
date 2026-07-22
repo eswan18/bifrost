@@ -1,10 +1,8 @@
 # Bifrost
 
-A web UI for the `ib` CLI tool — lets me check deployment status and promote
-staging→prod on the ethans-services GKE cluster from a phone.
+An opinionated application state dashboard that supports promotion (staging -> prod) and rollback.
 
-**Mythology aside:** Bifrost is the rainbow bridge between Midgard (mortals →
-staging) and Asgard (gods → prod). Naming chose itself.
+Built atop Argo CD and Kubernetes.
 
 ## What it does
 
@@ -23,7 +21,7 @@ body in place):
 
 Promote and roll back are confirmed in a hash-diff modal. Both re-validate live
 cluster state server-side before patching (a stale hash is refused) and patch
-the ArgoCD `Application`, the same operation as `ib promote` / a manual image
+the ArgoCD `Application`, the same operation as setting a manual image
 override. The UI is server-rendered `html/template` with a single inline
 vanilla-JS block: plain form POSTs work without JS; JS upgrades to `fetch()`,
 background polling, a light/dark theme toggle, and a "refreshed Ns ago" ticker.
@@ -36,10 +34,18 @@ there is **no CSS build step** and no Node toolchain.
 A single Go binary in-cluster. Reads pod images across `<app>-{staging,prod}`
 namespaces via `client-go`. Patches `argoproj.io/v1alpha1 Application` objects
 in the `argocd` namespace via the dynamic client. Authenticates with OIDC
-against `identity`; one allowed email gates access.
+(code flow + PKCE); one allowed email gates access.
+
+Bifrost assumes conventions rather than configuring around them: each service
+deploys to `<app>-staging` and `<app>-prod` namespaces, its ArgoCD
+`Application`s are named `<app>-staging` / `<app>-prod` and pin images via
+`spec.source.kustomize.images`, images are tagged by commit SHA, and staging
+is auto-updated by ArgoCD Image Updater. The CI-build column is Google Cloud
+Build-specific and optional — leave `GCP_PROJECT` unset to disable it.
 
 Self-promotion is supported. If a bad version of bifrost ever lands in prod
-and bricks the UI, `ib promote bifrost` from a laptop is the fallback.
+and bricks the UI, the fallback is patching its `Application` by hand — the
+same `kubectl patch` shown under "First deployment" below.
 
 ## Development
 
@@ -51,13 +57,18 @@ Requires these env vars to run (see `internal/config/config.go`):
 
     BASE_URL=http://localhost:8080
     ENV=local
-    SERVICES=footstrike-api,identity
+    SERVICES=api,dashboard
     ALLOWED_EMAIL=you@example.com
     OIDC_ISSUER_EXTERNAL=...
     OIDC_ISSUER_INTERNAL=...
     OIDC_CLIENT_ID=...
     OIDC_CLIENT_SECRET=...
     SESSION_SECRET=$(openssl rand -base64 32)
+
+The two `OIDC_ISSUER_*` vars exist because in-cluster pods can't resolve the
+issuer's public hostname: discovery is fetched from the internal URL and the
+token/userinfo/JWKS endpoints are rewritten to it, while browser redirects use
+the external one. If that's not your problem, set both to the same URL.
 
 For local dev, `kube.New` falls back to `~/.kube/config`.
 
@@ -68,9 +79,8 @@ For local dev, `kube.New` falls back to `~/.kube/config`.
 ## Deployment
 
 Push to `main`. Cloud Build → Artifact Registry. ArgoCD Image Updater bumps
-the staging Application. To roll out prod, use the app itself
-(`https://bifrost.ethanswan.com`) — or `ib promote bifrost` if the app is
-the thing that's broken.
+the staging Application. To roll out prod, use the app itself — or patch the
+Application by hand if the app is the thing that's broken.
 
 ### First deployment
 
@@ -82,14 +92,11 @@ promotion of bifrost itself must be done manually:
     kubectl patch application bifrost-prod -n argocd --type merge \
       -p '{"spec":{"source":{"kustomize":{"images":["us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:<sha>"]}}}}'
 
-Also add `bifrost` to the `SERVICES` list in `infra/ib.py` so the laptop CLI
-stays a working fallback (that change lives in the infra repo, not here).
-
 ## Out-of-repo setup
 
 This repo doesn't manage:
 - GCP service accounts, workload identity bindings, Secret Manager secrets, or
-  the Cloud Build trigger — those live in `ethans-services-infra` (Pulumi).
-- OAuth client registration in `identity`'s database.
-- Cloudflare Tunnel hostname (`bifrost.ethanswan.com`).
+  the Cloud Build trigger — those live in a separate infra repo (Pulumi).
+- OAuth client registration with the identity provider.
+- The public hostname (a Cloudflare Tunnel, in this deployment).
 - The actual `kubectl apply -f k8s/argocd/...` to bootstrap ArgoCD.
