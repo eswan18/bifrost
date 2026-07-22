@@ -1,10 +1,8 @@
 # Bifrost
 
-A web UI for the `ib` CLI tool — lets me check deployment status and promote
-staging→prod on the ethans-services GKE cluster from a phone.
+An opinionated application state dashboard that supports promotion (staging -> prod) and rollback.
 
-**Mythology aside:** Bifrost is the rainbow bridge between Midgard (mortals →
-staging) and Asgard (gods → prod). Naming chose itself.
+Built atop Argo CD and Kubernetes.
 
 ## What it does
 
