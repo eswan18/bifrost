@@ -34,11 +34,16 @@ func StatusOf(stagingImages, prodImages []string) Status {
 	stagingSHA := ExtractSHA(stagingTag)
 	prodSHA := ExtractSHA(prodTag)
 
-	if stagingSHA == "" || prodSHA == "" {
+	// Only the staging SHA is required — it's the artifact being promoted.
+	// An unparseable prod tag (latest/prod) means prod lost its image pin,
+	// e.g. the Application was recreated and fell back to the mutable tag in
+	// the repo manifests; that state must stay promotable so bifrost can
+	// re-pin it. ib.py's promote() accepts it for the same reason.
+	if stagingSHA == "" {
 		return Status{State: Unknown, StagingTag: stagingTag, ProdTag: prodTag}
 	}
 
-	if stagingSHA == prodSHA {
+	if prodSHA != "" && stagingSHA == prodSHA {
 		return Status{State: InSync, StagingTag: stagingTag, ProdTag: prodTag}
 	}
 	return Status{

@@ -45,7 +45,7 @@ Build-specific and optional — leave `GCP_PROJECT` unset to disable it.
 
 Self-promotion is supported. If a bad version of bifrost ever lands in prod
 and bricks the UI, the fallback is patching its `Application` by hand — the
-same `kubectl patch` shown under "First deployment" below.
+same `kubectl patch` shown under "Manual fallback" below.
 
 ## Development
 
@@ -82,12 +82,19 @@ Push to `main`. Cloud Build → Artifact Registry. ArgoCD Image Updater bumps
 the staging Application. To roll out prod, use the app itself — or patch the
 Application by hand if the app is the thing that's broken.
 
-### First deployment
+### Unpinned prod
 
 `bifrost-prod` initially runs `:latest` — no `kustomize.images` override
-exists on the Application until the first promotion writes one. Bifrost
-refuses to promote a service whose prod tag is unparseable, so the FIRST
-promotion of bifrost itself must be done manually:
+exists on the Application until the first promotion writes one. An
+unparseable prod tag (`latest`, `prod`) reads as drift, so the first
+promotion works from the UI and writes the pinning override. The same
+applies to any service whose Application is recreated (a rename, a cluster
+rebuild): the pin lives only on the live Application object, so prod falls
+back to the repo manifests' mutable tag until a promotion re-pins it.
+
+### Manual fallback
+
+If the UI itself is what's broken, the equivalent by hand:
 
     kubectl patch application bifrost-prod -n argocd --type merge \
       -p '{"spec":{"source":{"kustomize":{"images":["us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:<sha>"]}}}}'
