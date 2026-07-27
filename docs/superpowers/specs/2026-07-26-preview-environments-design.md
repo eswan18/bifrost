@@ -1,7 +1,7 @@
 # Preview Environments — Design
 
 **Date:** 2026-07-26
-**Status:** Approved (pending final spec review)
+**Status:** Approved; implemented through the build-pipeline plan (2026-07-27)
 **Owner repos touched:** bifrost (primary), infra (`ib.py`, Pulumi), identity, footstrike-api, footstrike-dashboard (small per-repo additions)
 
 ## Problem
@@ -71,7 +71,10 @@ is recovered by re-running `up`.
    vars) are set later via the preview overlay's env vars, not as build substitutions.
 3. Create Neon branches for stateful member apps (Neon REST API).
 4. Fetch each member repo's `k8s/base` at the branch (GitHub tarball API), render with embedded
-   kustomize + a generated preview overlay, apply via client-go server-side apply.
+   kustomize + a generated preview overlay, apply via client-go server-side apply. For dashboard
+   previews, the overlay generator MUST set all three `APP_API_URL` / `APP_IDENTITY_URL` /
+   `APP_OAUTH_CLIENT_ID` env vars and fail preview creation if any is unresolvable — preview
+   images carry no baked fallbacks, so a partial set fails only at runtime in the browser.
 5. Copy staging secrets (with `DATABASE_URL` override) and the wildcard TLS cert secret into
    the namespace; create the per-preview Ingress.
 
@@ -92,8 +95,9 @@ Each previewable repo gets `cloudbuild-preview.yaml` + a `{name}-preview-build` 
 
 - Tags `preview-{SHORT_SHA}` only — env-agnostic and branch-content-addressed (no per-preview
   suffix; the same branch content always produces the same tag). **Never `latest`, never a bare
-  SHA** — staging's image-updater (`newest-build` + `allowTags: regexp:^[a-f0-9]{7,}$`) would
-  otherwise scoop a branch build straight into staging.
+  SHA** — staging's image-updaters (`newest-build` + `allowTags: regexp:^[a-f0-9]{7,}$` for
+  footstrike-api/identity, `regexp:^[a-f0-9]+-staging$` for footstrike-dashboard) would otherwise
+  scoop a branch build straight into staging; both patterns reject `preview-*` tags.
 - The dashboard preview image is env-agnostic; per-preview URLs are supplied at deploy time as
   `APP_API_URL` / `APP_IDENTITY_URL` / `APP_OAUTH_CLIENT_ID` env vars on the container,
   materialized as `/config.js` by the nginx entrypoint (runtime config with per-key fallback to
@@ -134,6 +138,10 @@ ready and prints the preview URLs.
   config (now that preview builds are substitution-free, the same could apply to staging/prod,
   but that's a separate migration — deferred)
 - Pub/Sub isolation (preview apps would share staging topics if publishing ever lands)
+- Two dashboard hardenings deliberately deferred to the control-plane plan (they only matter
+  once previews deploy): a container-start warning when some-but-not-all `APP_*` vars are set,
+  and a `Cache-Control: no-cache` nginx override for `/config.js` so in-place preview updates
+  aren't served stale config
 
 ## Testing
 
