@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -24,6 +25,18 @@ type Client interface {
 	ListNamespaces(ctx context.Context, labelSelector string) ([]NamespaceInfo, error)
 	// GetNamespace fetches one namespace; found=false (no error) when absent.
 	GetNamespace(ctx context.Context, name string) (NamespaceInfo, bool, error)
+	// EnsureNamespace creates or updates the namespace with exactly these
+	// labels/annotations merged onto whatever exists.
+	EnsureNamespace(ctx context.Context, name string, labels, annotations map[string]string) error
+	// AnnotateNamespace merges annotations onto an existing namespace.
+	AnnotateNamespace(ctx context.Context, name string, annotations map[string]string) error
+	// ApplyObjects server-side-applies rendered objects (fieldManager "bifrost-preview").
+	ApplyObjects(ctx context.Context, objs []*unstructured.Unstructured) error
+	// CopySecret reads srcNS/srcName and creates/updates dstNS/dstName with
+	// its data, applying overrides (nil value = keep source).
+	CopySecret(ctx context.Context, srcNS, srcName, dstNS, dstName string, overrides map[string][]byte) error
+	// DeleteNamespace deletes; absent namespace is not an error.
+	DeleteNamespace(ctx context.Context, name string) error
 }
 
 // New returns an in-cluster Client. Falls back to KUBECONFIG / ~/.kube/config

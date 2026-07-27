@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
@@ -154,6 +156,30 @@ func (f *fakeKube) GetNamespace(_ context.Context, name string) (kube.NamespaceI
 		}
 	}
 	return kube.NamespaceInfo{}, false, f.namespacesErr
+}
+
+// The write primitives below (EnsureNamespace/AnnotateNamespace/ApplyObjects/
+// CopySecret/DeleteNamespace) aren't exercised by this package's handler
+// tests yet — the preview orchestrator that will call them lands in a later
+// task. No-op stubs here just keep fakeKube satisfying kube.Client.
+func (f *fakeKube) EnsureNamespace(_ context.Context, _ string, _, _ map[string]string) error {
+	return nil
+}
+
+func (f *fakeKube) AnnotateNamespace(_ context.Context, _ string, _ map[string]string) error {
+	return nil
+}
+
+func (f *fakeKube) ApplyObjects(_ context.Context, _ []*unstructured.Unstructured) error {
+	return nil
+}
+
+func (f *fakeKube) CopySecret(_ context.Context, _, _, _, _ string, _ map[string][]byte) error {
+	return nil
+}
+
+func (f *fakeKube) DeleteNamespace(_ context.Context, _ string) error {
+	return nil
 }
 
 func i32(v int32) *int32 { return &v }
