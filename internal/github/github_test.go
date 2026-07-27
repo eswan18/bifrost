@@ -220,3 +220,59 @@ func TestFetchK8sExceedsExtractionCap(t *testing.T) {
 		t.Errorf("expected non-ErrNoBranch error, got %v", err)
 	}
 }
+
+func TestFetchK8sRejectsNonCanonicalPaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{"path escapes the k8s subtree via ..", "repo-sha1234/k8s/../../etc/passwd"},
+		{"decoy would collapse onto a sibling entry", "repo-sha1234/k8s/base/sub/../x.yaml"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tarball := buildTarGz(t, map[string]string{
+				tt.entry: "malicious\n",
+			})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(tarball)
+			}))
+			defer srv.Close()
+			c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+			_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+			if err == nil {
+				t.Fatalf("expected an error for entry %q, got nil", tt.entry)
+			}
+			if !strings.Contains(err.Error(), tt.entry) {
+				t.Errorf("error = %q, want it to mention the offending path %q", err.Error(), tt.entry)
+			}
+		})
+	}
+}
+
+func TestFetchK8sAggregateCapAcrossEntries(t *testing.T) {
+	// Three files, each under the 5MB single-file cap, whose combined size
+	// exceeds it — the budget must be shared across entries, not reset per
+	// entry.
+	const perFileBytes = 2 * 1024 * 1024
+	content := strings.Repeat("y", perFileBytes)
+	tarball := buildTarGz(t, map[string]string{
+		"repo-sha1234/k8s/a.yaml": content,
+		"repo-sha1234/k8s/b.yaml": content,
+		"repo-sha1234/k8s/c.yaml": content,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarball)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	if err == nil {
+		t.Fatalf("expected an error when combined entry sizes exceed the extraction cap, got nil")
+	}
+	if errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected non-ErrNoBranch error, got %v", err)
+	}
+}

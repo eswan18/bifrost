@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -34,8 +35,12 @@ type Client interface {
 
 	// FetchK8s downloads repo's tarball at ref and returns the k8s/ subtree
 	// as path→content, with paths relative to k8s/ (e.g.
-	// "base/deployment.yaml"). A missing ref is ErrNoBranch; other failures
-	// are opaque errors.
+	// "base/deployment.yaml"). Every returned path is guaranteed
+	// path.Clean-canonical and confined under k8s/ — a tarball entry whose
+	// path would escape it (e.g. via "..") or is otherwise non-canonical
+	// fails the whole fetch rather than being normalized or silently
+	// dropped. A missing ref is ErrNoBranch; other failures are opaque
+	// errors.
 	FetchK8s(ctx context.Context, repo, ref string) (map[string][]byte, error)
 }
 
@@ -91,7 +96,9 @@ func (c *client) BranchSHA(ctx context.Context, repo, branch string) (string, er
 }
 
 // FetchK8s downloads repo's tarball at ref and returns the k8s/ subtree as
-// path→content, with paths relative to k8s/.
+// path→content, with paths relative to k8s/. Every returned path is
+// path.Clean-canonical and confined under k8s/; see the Client interface
+// doc for the enforced invariant.
 func (c *client) FetchK8s(ctx context.Context, repo, ref string) (map[string][]byte, error) {
 	reqURL := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", c.baseURL, c.org, url.PathEscape(repo), url.PathEscape(ref))
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -148,6 +155,18 @@ func (c *client) FetchK8s(ctx context.Context, repo, ref string) (map[string][]b
 		relToK8s, ok := strings.CutPrefix(rel, "k8s/")
 		if !ok {
 			continue
+		}
+		// Reject rather than normalize: an entry is only safe to extract if
+		// its path is already in path.Clean's canonical form, non-empty,
+		// relative, and doesn't start with "../". Anything else — a literal
+		// escape like "../../etc/passwd", or a decoy like "base/sub/../x.yaml"
+		// that would silently collapse onto (and overwrite) a real
+		// "base/x.yaml" entry — fails the whole fetch loudly rather than
+		// being sanitized, since these keys feed straight into an in-memory
+		// filesystem downstream.
+		cleaned := path.Clean(relToK8s)
+		if cleaned != relToK8s || cleaned == "." || cleaned == "" || strings.HasPrefix(cleaned, "../") || path.IsAbs(cleaned) {
+			return nil, fmt.Errorf("k8s tarball entry %q has an unsafe or non-canonical path", hdr.Name)
 		}
 		data, err := io.ReadAll(io.LimitReader(tr, budget+1))
 		if err != nil {
