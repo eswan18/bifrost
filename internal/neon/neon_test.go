@@ -147,18 +147,32 @@ func TestErrorStatusSurfaces(t *testing.T) {
 	}
 }
 
-// TestPathSegmentsEscaped guards against project/branch IDs (or any
-// unexpected characters within them) breaking the URL path structure.
+// TestPathSegmentsEscaped guards against project/branch IDs containing
+// characters that are structurally significant in a URL path (like "/")
+// corrupting the path. It deliberately uses a projectID and branchID that
+// REQUIRE percent-encoding, so an implementation missing url.PathEscape
+// would produce a different (and wrong) wire path than the one asserted
+// here — see the fix report for a before/after demonstration.
+//
+// This uses a bare handler rather than newTestServer's ServeMux, because
+// ServeMux pattern matching operates on the decoded path and an encoded
+// "/" (%2F) within a single path segment would otherwise be indistinguishable
+// from a literal path separator at the routing layer, defeating the point
+// of the assertion.
 func TestPathSegmentsEscaped(t *testing.T) {
-	srv, mux := newTestServer(t)
-	mux.HandleFunc("GET /projects/proj-abc/connection_uri", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.EscapedPath(); got != "/projects/proj-abc/connection_uri" {
-			t.Errorf("path = %q", got)
-		}
-		w.Write([]byte(`{"uri":"postgresql://x"}`))
-	})
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
 	c := NewWithBaseURL("neon-key", srv.URL)
-	if _, err := c.ConnectionURI(context.Background(), "proj-abc", "br-1", "db", "role"); err != nil {
+	if err := c.DeleteBranch(context.Background(), "proj/abc", "br 1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	const want = "/projects/proj%2Fabc/branches/br%201"
+	if gotPath != want {
+		t.Errorf("wire path = %q, want %q", gotPath, want)
 	}
 }
