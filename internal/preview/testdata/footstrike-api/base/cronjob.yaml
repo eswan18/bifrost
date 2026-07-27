@@ -1,0 +1,47 @@
+# Nightly retention purge: hard-deletes rows soft-deleted more than the
+# retention window ago (fitapi-purge, default 30 days). Env-specific config
+# (envFrom + DATABASE_URL secret ref) is added by the overlay cronjob-patch.
+# The image ref matches the Deployment's; the ArgoCD Image Updater's kustomize
+# image override rewrites both to the same pinned sha.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: footstrike-api-purge
+spec:
+  schedule: "0 9 * * *" # 09:00 UTC — overnight in the US, off-peak
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: footstrike-api-purge
+        spec:
+          restartPolicy: Never
+          tolerations:
+            - key: cloud.google.com/gke-spot
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: purge
+              image: us-central1-docker.pkg.dev/ethans-services/containers/footstrike-api:latest
+              command: ["fitapi-purge"]
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  memory: "64Mi"
+                  cpu: "50m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "200m"

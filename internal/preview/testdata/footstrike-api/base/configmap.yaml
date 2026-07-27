@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: footstrike-api-config
+data:
+  LOG_LEVEL: "INFO"
+  GOOGLE_CALENDAR_ID: "t5pjvqpna5k9pm0sn6tf0125pg@group.calendar.google.com"

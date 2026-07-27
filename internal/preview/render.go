@@ -1,0 +1,382 @@
+package preview
+
+import (
+	"errors"
+	"fmt"
+	"path"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/kustomize/api/krusty"
+	"sigs.k8s.io/kustomize/api/resmap"
+	"sigs.k8s.io/kustomize/api/resource"
+	ktypes "sigs.k8s.io/kustomize/api/types"
+	"sigs.k8s.io/kustomize/kyaml/filesys"
+	"sigs.k8s.io/kustomize/kyaml/resid"
+	sigsyaml "sigs.k8s.io/yaml"
+)
+
+// imageRepoBase is the Artifact Registry path every member service's image
+// lives under; only the trailing service-name segment varies.
+const imageRepoBase = "us-central1-docker.pkg.dev/ethans-services/containers"
+
+// previewDomain is the wildcard host suffix every preview Ingress is issued
+// under, and previewTLSSecret is the wildcard cert bifrost provisions once
+// for the whole preview domain (see the 3c plan).
+const (
+	previewDomain    = "preview.footstrike.run"
+	previewTLSSecret = "preview-footstrike-run-tls"
+)
+
+// RenderInput is one member service's render request: its fetched k8s/ base
+// plus the environment-specific values the generated overlay needs to wire
+// up.
+type RenderInput struct {
+	Service  string // e.g. "footstrike-api"; also the Deployment/container/Service name by convention
+	Tag      string // preview slug, e.g. from preview.TagForBranch; drives the namespace and Ingress host
+	ShortSHA string // preview image tag suffix
+
+	// K8sFiles is the service's whole k8s/ subtree as returned by
+	// github.FetchK8s (path relative to k8s/ -> content). Only the base/
+	// subtree is used; other directories (staging/, prod/, argocd/, ...)
+	// are ignored.
+	K8sFiles map[string][]byte
+
+	// EnvConfig is the final preview ConfigMap data, computed by the
+	// caller (Task 4) and carried into the generated <svc>-preview-env
+	// ConfigMap verbatim.
+	EnvConfig map[string]string
+
+	// SecretName is the preview Secret to wire into envFrom, or "" if the
+	// service has no secret (e.g. the dashboard).
+	SecretName string
+}
+
+// Render builds a generated kustomize overlay atop the service's fetched
+// k8s/base and returns the fully-resolved objects, ready to apply into the
+// preview namespace.
+func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
+	if in.Service == "" {
+		return nil, errors.New("preview: render: Service is required")
+	}
+	if in.Tag == "" {
+		return nil, errors.New("preview: render: Tag is required")
+	}
+	if in.ShortSHA == "" {
+		return nil, errors.New("preview: render: ShortSHA is required")
+	}
+
+	fs := filesys.MakeFsInMemory()
+	if err := writeBase(fs, in.K8sFiles); err != nil {
+		return nil, err
+	}
+
+	base, err := kustomizeBuild(fs, "/base")
+	if err != nil {
+		return nil, fmt.Errorf("preview: render %s: building fetched base: %w", in.Service, err)
+	}
+	facts, err := detectBase(base)
+	if err != nil {
+		return nil, fmt.Errorf("preview: render %s: inspecting fetched base: %w", in.Service, err)
+	}
+
+	if err := writeOverlay(fs, in, facts); err != nil {
+		return nil, fmt.Errorf("preview: render %s: generating overlay: %w", in.Service, err)
+	}
+
+	overlay, err := kustomizeBuild(fs, "/overlay")
+	if err != nil {
+		return nil, fmt.Errorf("preview: render %s: building generated overlay: %w", in.Service, err)
+	}
+
+	resources := overlay.Resources()
+	objs := make([]*unstructured.Unstructured, 0, len(resources))
+	for _, res := range resources {
+		u, err := toUnstructured(res)
+		if err != nil {
+			return nil, fmt.Errorf("preview: render %s: converting %s: %w", in.Service, res.CurId(), err)
+		}
+		objs = append(objs, u)
+	}
+	return objs, nil
+}
+
+// writeBase writes every k8sFiles entry rooted under "base/" into fs at
+// /base/<relative path>, stripping the "base/" prefix. Everything else
+// (staging/, prod/, argocd/, ...) is ignored — the generated overlay only
+// ever builds atop the fetched base.
+func writeBase(fs filesys.FileSystem, k8sFiles map[string][]byte) error {
+	const prefix = "base/"
+	wrote := false
+	for p, content := range k8sFiles {
+		rel, ok := strings.CutPrefix(p, prefix)
+		if !ok || rel == "" {
+			continue
+		}
+		dest := path.Join("/base", rel)
+		if err := fs.MkdirAll(path.Dir(dest)); err != nil {
+			return fmt.Errorf("preview: render: creating directory for %s: %w", dest, err)
+		}
+		if err := fs.WriteFile(dest, content); err != nil {
+			return fmt.Errorf("preview: render: writing %s: %w", dest, err)
+		}
+		wrote = true
+	}
+	if !wrote {
+		return errors.New("preview: render: no base/ files found in K8sFiles")
+	}
+	return nil
+}
+
+// baseFacts records what the fetched base declares, so the generated
+// overlay only patches around things that actually exist.
+type baseFacts struct {
+	hasCronJob    bool
+	cronJobName   string
+	configMapName string // "" if the base has no ConfigMap
+	hasVolumes    bool   // the Deployment's pod spec declares any volumes
+}
+
+// detectBase builds base (without the generated overlay) and scans its
+// resources for the facts the overlay's shape depends on: whether a CronJob
+// exists (and its name, which isn't derivable from the service name alone),
+// whether a base ConfigMap exists (and its name, wired first into envFrom),
+// and whether the Deployment declares volumes (the incomplete CSI
+// secrets-store mount every previews must strip).
+func detectBase(base resmap.ResMap) (baseFacts, error) {
+	var f baseFacts
+	for _, res := range base.Resources() {
+		id := res.CurId()
+		switch id.Kind {
+		case "ConfigMap":
+			if f.configMapName == "" {
+				f.configMapName = id.Name
+			}
+		case "CronJob":
+			f.hasCronJob = true
+			f.cronJobName = id.Name
+		case "Deployment":
+			u, err := toUnstructured(res)
+			if err != nil {
+				return baseFacts{}, err
+			}
+			volumes, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes")
+			if err != nil {
+				return baseFacts{}, err
+			}
+			f.hasVolumes = found && len(volumes) > 0
+		}
+	}
+	return f, nil
+}
+
+// writeOverlay generates /overlay: the kustomization.yaml tying the fetched
+// base to the preview-specific patches and generated resources, the
+// strategic-merge deployment patch (replicas, envFrom), the conditional
+// cronjob suspend patch, the conditional JSON6902 volume-deletion patch, the
+// generated preview-env ConfigMap, and the preview Ingress.
+func writeOverlay(fs filesys.FileSystem, in RenderInput, facts baseFacts) error {
+	if err := fs.MkdirAll("/overlay"); err != nil {
+		return err
+	}
+
+	patches := []ktypes.Patch{{Path: "deployment-patch.yaml"}}
+	if facts.hasCronJob {
+		patches = append(patches, ktypes.Patch{Path: "cronjob-patch.yaml"})
+	}
+	if facts.hasVolumes {
+		patches = append(patches, ktypes.Patch{
+			Path: "volumes-patch.yaml",
+			Target: &ktypes.Selector{
+				ResId: resid.ResId{Gvk: resid.Gvk{Kind: "Deployment"}, Name: in.Service},
+			},
+		})
+	}
+
+	kustomization := ktypes.Kustomization{
+		TypeMeta:  ktypes.TypeMeta{APIVersion: "kustomize.config.k8s.io/v1beta1", Kind: "Kustomization"},
+		Namespace: previewNamespace(in.Tag),
+		Resources: []string{"../base", "configmap.yaml", "ingress.yaml"},
+		Images: []ktypes.Image{{
+			Name:   imageRepoBase + "/" + in.Service,
+			NewTag: "preview-" + in.ShortSHA,
+		}},
+		Patches: patches,
+	}
+	if err := writeYAML(fs, "/overlay/kustomization.yaml", kustomization); err != nil {
+		return err
+	}
+	if err := writeYAML(fs, "/overlay/deployment-patch.yaml", deploymentPatch(in, facts)); err != nil {
+		return err
+	}
+	if facts.hasCronJob {
+		if err := writeYAML(fs, "/overlay/cronjob-patch.yaml", cronJobPatch(facts.cronJobName)); err != nil {
+			return err
+		}
+	}
+	if facts.hasVolumes {
+		if err := writeYAML(fs, "/overlay/volumes-patch.yaml", volumesDeletePatch()); err != nil {
+			return err
+		}
+	}
+	if err := writeYAML(fs, "/overlay/configmap.yaml", previewConfigMap(in)); err != nil {
+		return err
+	}
+	return writeYAML(fs, "/overlay/ingress.yaml", previewIngress(in))
+}
+
+// deploymentPatch is the strategic-merge patch pinning the Deployment to
+// one preview replica and replacing its envFrom wholesale (envFrom has no
+// strategic-merge key, so a submitted list replaces the base's rather than
+// appending to it) with, in order: the base ConfigMap (if the base has
+// one), the generated preview-env ConfigMap, and the preview Secret (if the
+// service has one). No explicit target is needed: kustomize infers it from
+// this patch's own apiVersion/kind/metadata.name.
+func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
+	var envFrom []map[string]any
+	if facts.configMapName != "" {
+		envFrom = append(envFrom, map[string]any{
+			"configMapRef": map[string]any{"name": facts.configMapName},
+		})
+	}
+	envFrom = append(envFrom, map[string]any{
+		"configMapRef": map[string]any{"name": previewEnvConfigMapName(in.Service)},
+	})
+	if in.SecretName != "" {
+		envFrom = append(envFrom, map[string]any{
+			"secretRef": map[string]any{"name": in.SecretName},
+		})
+	}
+
+	return map[string]any{
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+		"metadata":   map[string]any{"name": in.Service},
+		"spec": map[string]any{
+			"replicas": 1,
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []map[string]any{
+						{"name": in.Service, "envFrom": envFrom},
+					},
+				},
+			},
+		},
+	}
+}
+
+// cronJobPatch is the strategic-merge patch suspending the preview's copy
+// of the CronJob; previews don't run scheduled jobs.
+func cronJobPatch(name string) map[string]any {
+	return map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "CronJob",
+		"metadata":   map[string]any{"name": name},
+		"spec":       map[string]any{"suspend": true},
+	}
+}
+
+// volumesDeletePatch is the JSON6902 patch stripping the base Deployment's
+// incomplete CSI secrets-store volume (previews have no SecretProviderClass
+// to satisfy it) and its matching volumeMount on the first container.
+func volumesDeletePatch() []map[string]any {
+	return []map[string]any{
+		{"op": "remove", "path": "/spec/template/spec/volumes"},
+		{"op": "remove", "path": "/spec/template/spec/containers/0/volumeMounts"},
+	}
+}
+
+// previewConfigMap is the generated <svc>-preview-env ConfigMap carrying
+// EnvConfig verbatim.
+func previewConfigMap(in RenderInput) map[string]any {
+	m := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": previewEnvConfigMapName(in.Service)},
+	}
+	if in.EnvConfig != nil {
+		m["data"] = in.EnvConfig
+	}
+	return m
+}
+
+// previewIngress is the generated Ingress routing the preview host to the
+// service's ClusterIP Service on port 80.
+func previewIngress(in RenderInput) map[string]any {
+	host := previewHost(in.Service, in.Tag)
+	return map[string]any{
+		"apiVersion": "networking.k8s.io/v1",
+		"kind":       "Ingress",
+		"metadata":   map[string]any{"name": in.Service + "-preview"},
+		"spec": map[string]any{
+			"ingressClassName": "nginx",
+			"tls": []map[string]any{
+				{"hosts": []string{host}, "secretName": previewTLSSecret},
+			},
+			"rules": []map[string]any{
+				{
+					"host": host,
+					"http": map[string]any{
+						"paths": []map[string]any{
+							{
+								"path":     "/",
+								"pathType": "Prefix",
+								"backend": map[string]any{
+									"service": map[string]any{
+										"name": in.Service,
+										"port": map[string]any{"number": 80},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func previewNamespace(tag string) string            { return "preview-" + tag }
+func previewEnvConfigMapName(service string) string { return service + "-preview-env" }
+func previewHost(service, tag string) string {
+	return fmt.Sprintf("%s-%s.%s", service, tag, previewDomain)
+}
+
+// kustomizeBuild runs the kustomizer with default options against dir in fs.
+func kustomizeBuild(fs filesys.FileSystem, dir string) (resmap.ResMap, error) {
+	return krusty.MakeKustomizer(krusty.MakeDefaultOptions()).Run(fs, dir)
+}
+
+// writeYAML marshals v to YAML and writes it to dest in fs.
+func writeYAML(fs filesys.FileSystem, dest string, v any) error {
+	b, err := sigsyaml.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("preview: render: marshaling %s: %w", dest, err)
+	}
+	return fs.WriteFile(dest, b)
+}
+
+// toUnstructured converts a built kustomize resource to an
+// unstructured.Unstructured via its YAML form — resource.Resource has no
+// direct Map()-style accessor, only AsYAML/String (see task report for the
+// API-shape delta from the plan's sketch). It goes through
+// Unstructured.UnmarshalJSON rather than a plain sigsyaml.Unmarshal into a
+// map so whole numbers land as int64 (matching what every other Kubernetes
+// client produces) instead of encoding/json's default float64 — callers
+// using unstructured.NestedInt64 on the result (replicas, port numbers, ...)
+// depend on this.
+func toUnstructured(res *resource.Resource) (*unstructured.Unstructured, error) {
+	b, err := res.AsYAML()
+	if err != nil {
+		return nil, err
+	}
+	j, err := sigsyaml.YAMLToJSON(b)
+	if err != nil {
+		return nil, err
+	}
+	u := &unstructured.Unstructured{}
+	if err := u.UnmarshalJSON(j); err != nil {
+		return nil, err
+	}
+	return u, nil
+}

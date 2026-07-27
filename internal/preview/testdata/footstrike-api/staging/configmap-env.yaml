@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: footstrike-api-staging-env-config
+data:
+  ENV: "staging"
+  IDENTITY_PROVIDER_URL: "http://identity.identity-staging.svc.cluster.local"
+  JWT_ISSUER: "https://identity-staging.tailc06f30.ts.net"
+  PUBLIC_API_BASE_URL: "https://api.staging.footstrike.run"
+  PUBLIC_DASHBOARD_BASE_URL: "https://staging.footstrike.run"
+  JWT_AUDIENCE: "ethanswan:fitness"
+  R2_ACCOUNT_ID: "8f74e735ece73e939bbe9e4c7e791e4a"
+  R2_BUCKET: "fitness-hae-raw-staging"
