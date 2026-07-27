@@ -4,6 +4,8 @@ package gcb
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"time"
 
 	cloudbuild "google.golang.org/api/cloudbuild/v1"
@@ -44,6 +46,10 @@ func (b BuildStatus) Failed() bool {
 // Client provides the latest build per GitHub repo name.
 type Client interface {
 	LatestBuilds(ctx context.Context) (map[string]BuildStatus, error)
+	// RunTrigger starts the named trigger against branch; returns the build ID.
+	RunTrigger(ctx context.Context, triggerID, branch string) (string, error)
+	// GetBuild fetches one build's current status by ID.
+	GetBuild(ctx context.Context, buildID string) (BuildStatus, error)
 }
 
 type client struct {
@@ -127,4 +133,44 @@ func latestByRepo(builds []*cloudbuild.Build) map[string]BuildStatus {
 		}
 	}
 	return out
+}
+
+// buildIDFromOperation extracts the created build's ID from a trigger-run
+// Operation's metadata (a cloudbuild.BuildOperationMetadata JSON blob).
+func buildIDFromOperation(meta []byte) (string, error) {
+	var m struct {
+		Build struct {
+			Id string `json:"id"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal(meta, &m); err != nil {
+		return "", err
+	}
+	if m.Build.Id == "" {
+		return "", errors.New("operation metadata has no build id")
+	}
+	return m.Build.Id, nil
+}
+
+func (c *client) RunTrigger(ctx context.Context, triggerID, branch string) (string, error) {
+	op, err := c.svc.Projects.Triggers.Run(c.project, triggerID,
+		&cloudbuild.RepoSource{BranchName: branch}).Context(ctx).Do()
+	if err != nil {
+		return "", err
+	}
+	return buildIDFromOperation(op.Metadata)
+}
+
+func (c *client) GetBuild(ctx context.Context, buildID string) (BuildStatus, error) {
+	b, err := c.svc.Projects.Builds.Get(c.project, buildID).Context(ctx).Do()
+	if err != nil {
+		return BuildStatus{}, err
+	}
+	return BuildStatus{
+		Status:     b.Status,
+		SHA:        b.Substitutions["SHORT_SHA"],
+		LogURL:     b.LogUrl,
+		StartTime:  parseTime(b.StartTime),
+		FinishTime: parseTime(b.FinishTime),
+	}, nil
 }

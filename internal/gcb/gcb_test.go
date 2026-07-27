@@ -61,3 +61,28 @@ func TestStatePredicates(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildIDFromOperation(t *testing.T) {
+	cases := []struct {
+		name    string
+		meta    string
+		want    string
+		wantErr bool
+	}{
+		{"normal", `{"build":{"id":"abc-123"}}`, "abc-123", false},
+		{"missing build", `{}`, "", true},
+		{"empty id", `{"build":{"id":""}}`, "", true},
+		{"malformed", `not-json`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := buildIDFromOperation([]byte(tc.meta))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("id = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
