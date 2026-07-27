@@ -75,7 +75,7 @@ func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
 	if err != nil {
 		return nil, fmt.Errorf("preview: render %s: building fetched base: %w", in.Service, err)
 	}
-	facts, err := detectBase(base)
+	facts, err := detectBase(base, in.Service)
 	if err != nil {
 		return nil, fmt.Errorf("preview: render %s: inspecting fetched base: %w", in.Service, err)
 	}
@@ -143,7 +143,18 @@ type baseFacts struct {
 // whether a base ConfigMap exists (and its name, wired first into envFrom),
 // and whether the Deployment declares volumes (the incomplete CSI
 // secrets-store mount every previews must strip).
-func detectBase(base resmap.ResMap) (baseFacts, error) {
+//
+// It also guards a failure mode that does NOT surface as a build error: the
+// generated deployment-patch's implicit target matches the base Deployment
+// by resource name (service), which kustomize enforces (a missing Deployment
+// name errors loudly at Run time) — but the patch's container list is
+// merged into the base's *containers* by container name, which kustomize
+// does not cross-check against anything. If the base Deployment's container
+// isn't actually named service, the patch's {name, envFrom}-only container
+// silently lands as a second, incomplete container alongside the untouched
+// original, instead of patching it. So detectBase checks this explicitly
+// and fails fast with a clear error rather than letting it render silently.
+func detectBase(base resmap.ResMap, service string) (baseFacts, error) {
 	var f baseFacts
 	for _, res := range base.Resources() {
 		id := res.CurId()
@@ -165,9 +176,38 @@ func detectBase(base resmap.ResMap) (baseFacts, error) {
 				return baseFacts{}, err
 			}
 			f.hasVolumes = found && len(volumes) > 0
+
+			containers, _, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "containers")
+			if err != nil {
+				return baseFacts{}, err
+			}
+			if !hasContainerNamed(containers, service) {
+				return baseFacts{}, fmt.Errorf(
+					"preview: render: base Deployment %s has no container named %q; "+
+						"the generated deployment-patch merges its container by that name, "+
+						"so a mismatch would silently add a second, incomplete container "+
+						"instead of patching the real one",
+					id.Name, service,
+				)
+			}
 		}
 	}
 	return f, nil
+}
+
+// hasContainerNamed reports whether containers (a spec.template.spec.containers
+// slice from an unstructured object) includes one named name.
+func hasContainerNamed(containers []any, name string) bool {
+	for _, c := range containers {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, _ := m["name"].(string); n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // writeOverlay generates /overlay: the kustomization.yaml tying the fetched
@@ -279,6 +319,14 @@ func cronJobPatch(name string) map[string]any {
 // volumesDeletePatch is the JSON6902 patch stripping the base Deployment's
 // incomplete CSI secrets-store volume (previews have no SecretProviderClass
 // to satisfy it) and its matching volumeMount on the first container.
+// Hardcoding containers/0 is safe because it always runs after
+// deployment-patch.yaml (both are ordered entries in the same overlay
+// kustomization.yaml): strategic-merge patching a containers list keyed by
+// name promotes the patched/matched container to the front of the merged
+// list regardless of its original position in the base, so the container
+// deployment-patch.yaml targets (in.Service, guarded by detectBase) is
+// always at index 0 by the time this JSON6902 patch runs — verified against
+// a synthetic multi-container base, not assumed.
 func volumesDeletePatch() []map[string]any {
 	return []map[string]any{
 		{"op": "remove", "path": "/spec/template/spec/volumes"},

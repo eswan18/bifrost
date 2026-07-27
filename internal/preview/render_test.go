@@ -3,6 +3,7 @@ package preview
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -371,5 +372,70 @@ func TestRenderRejectsMissingBaseFiles(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected an error when K8sFiles has no base/ entries, got nil")
+	}
+}
+
+// TestRenderRejectsContainerNameMismatch covers a failure mode that does NOT
+// surface as a kustomize build error: a base Deployment named exactly
+// Service (so the deployment-patch's implicit resource-level target matches
+// fine) whose pod spec's container is named something else entirely. Without
+// the detectBase guard, kustomize's strategic merge would silently add a
+// second, incomplete {name, envFrom}-only container alongside the untouched
+// original instead of patching it — Render must reject this up front with a
+// clear error instead of returning a broken Deployment.
+func TestRenderRejectsContainerNameMismatch(t *testing.T) {
+	const service = "mismatched-service"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+`),
+		"base/deployment.yaml": []byte(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mismatched-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mismatched-service
+  template:
+    metadata:
+      labels:
+        app: mismatched-service
+    spec:
+      containers:
+        - name: totally-different-container-name
+          image: example.com/mismatched-service:latest
+`),
+		"base/service.yaml": []byte(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: mismatched-service
+spec:
+  selector:
+    app: mismatched-service
+  ports:
+    - port: 80
+      targetPort: 8080
+`),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  service,
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a Deployment whose container name doesn't match Service, got nil")
+	}
+	if !strings.Contains(err.Error(), service) {
+		t.Errorf("error = %q, want it to mention the mismatched service/container name %q", err.Error(), service)
 	}
 }
