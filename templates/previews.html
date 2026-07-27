@@ -1,0 +1,43 @@
+{{/* previews.html reuses the jobs tab's grid/card idiom (jobs-grid/jobs-head/
+     jobs-row/jobs-desktop/jobs-mobile/job-card/jobs-empty): previews are a
+     flat list with the same six-column shape jobs already has, and no new
+     CSS is allowed for this tab. */}}
+{{define "tab-body"}}
+<div class="previews"{{if .AnyActive}} data-active{{end}}>
+
+  <div class="jobs-desktop">
+    <div class="jobs-grid jobs-head">
+      <span>PREVIEW</span><span>BRANCH</span><span>APPS</span><span>PHASE</span><span>HEALTH</span><span>AGE</span>
+    </div>
+    {{range .Previews}}
+    <div class="jobs-grid jobs-row">
+      <span class="mono w6">{{.Tag}}</span>
+      <span class="mono">{{or .Branch "—"}}</span>
+      <span>{{template "preview-apps" .}}</span>
+      <span class="c-mut">{{.Phase}}</span>
+      <span class="c-mut">{{.Health}}</span>
+      <span class="c-mut" title="{{abstime .CreatedAt}}">{{reltime .CreatedAt}}</span>
+    </div>
+    {{else}}
+    <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
+    {{end}}
+  </div>
+
+  <div class="jobs-mobile">
+    {{range .Previews}}
+    <div class="job-card">
+      <div class="job-card-top"><span class="mono w6">{{.Tag}}</span><span class="c-mut">{{.Phase}}</span></div>
+      <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}</div>
+      <div class="c-mut job-card-meta">{{template "preview-apps" .}}</div>
+    </div>
+    {{else}}
+    <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
+    {{end}}
+  </div>
+
+</div>
+{{end}}
+
+{{/* preview-apps renders one preview's app links (name → its preview URL),
+     shared by the desktop APPS column and the mobile card meta line. */}}
+{{define "preview-apps"}}{{if .URLs}}{{range $app, $url := .URLs}}<a href="{{$url}}" target="_blank" class="jobs-link">{{$app}}</a> {{end}}{{else}}<span class="c-faint">—</span>{{end}}{{end}}

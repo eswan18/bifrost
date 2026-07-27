@@ -106,6 +106,7 @@ func main() {
 	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
+	requirePreviewAuth := auth.RequireSessionOrBearer(sm, cfg.AllowedEmail, "/auth/login", cfg.PreviewAPIToken)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -128,12 +129,16 @@ func main() {
 	mux.Handle("GET /", requireAuth(http.HandlerFunc(webH.Overview)))
 	mux.Handle("GET /apps", requireAuth(http.HandlerFunc(webH.Apps)))
 	mux.Handle("GET /jobs", requireAuth(http.HandlerFunc(webH.Jobs)))
+	mux.Handle("GET /previews", requireAuth(http.HandlerFunc(webH.Previews)))
 	mux.Handle("GET /partial/overview", requireAuth(http.HandlerFunc(webH.OverviewFragment)))
 	mux.Handle("GET /partial/apps", requireAuth(http.HandlerFunc(webH.AppsFragment)))
 	mux.Handle("GET /partial/jobs", requireAuth(http.HandlerFunc(webH.JobsFragment)))
+	mux.Handle("GET /partial/previews", requireAuth(http.HandlerFunc(webH.PreviewsFragment)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 	mux.Handle("POST /services/{name}/rollback", requireAuth(http.HandlerFunc(webH.Rollback)))
+	mux.Handle("GET /api/previews", requirePreviewAuth(http.HandlerFunc(webH.PreviewsListJSON)))
+	mux.Handle("GET /api/previews/{tag}", requirePreviewAuth(http.HandlerFunc(webH.PreviewJSON)))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddress,

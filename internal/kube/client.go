@@ -20,6 +20,10 @@ type Client interface {
 	ListCronJobs(ctx context.Context, namespace string) ([]CronJobInfo, error)
 	ListJobs(ctx context.Context, namespace string) ([]JobInfo, error)
 	ListReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetInfo, error)
+	// ListNamespaces returns namespaces matching labelSelector ("" = all).
+	ListNamespaces(ctx context.Context, labelSelector string) ([]NamespaceInfo, error)
+	// GetNamespace fetches one namespace; found=false (no error) when absent.
+	GetNamespace(ctx context.Context, name string) (NamespaceInfo, bool, error)
 }
 
 // New returns an in-cluster Client. Falls back to KUBECONFIG / ~/.kube/config

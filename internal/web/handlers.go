@@ -36,7 +36,7 @@ type pageVM struct {
 	Flash      *Flash
 	CSRF       string
 	Dashboard  bool
-	Tab        string // "overview" | "apps" | "jobs"
+	Tab        string // "overview" | "apps" | "jobs" | "previews"
 	RefreshURL string // polling fragment endpoint for this page
 	AnyActive  bool   // something in flight → fast poll cadence
 
@@ -44,10 +44,16 @@ type pageVM struct {
 	AppIssues int
 	JobCount  int
 	JobIssues int
+	// PreviewCount is only ever populated on the previews page itself (see
+	// previewsPage) — computing it fleet-wide would cost a namespace list on
+	// every dashboard render just to feed a nav badge. base.html's tabs block
+	// renders the count span conditionally so other tabs simply show no badge.
+	PreviewCount int
 
 	Apps     []appView
 	Overview *overviewData
 	Jobs     *jobsPage
+	Previews []previewRecord
 
 	Message string // error page
 }
@@ -95,6 +101,32 @@ func (h *Handlers) Jobs(w http.ResponseWriter, r *http.Request) {
 	vm.Jobs = buildJobsPage(f, filter)
 	vm.Flash = TakeFlash(w, r)
 	h.render(w, "jobs", vm)
+}
+
+func (h *Handlers) Previews(w http.ResponseWriter, r *http.Request) {
+	h.previewsPage(w, r, true)
+}
+
+func (h *Handlers) PreviewsFragment(w http.ResponseWriter, r *http.Request) {
+	h.previewsPage(w, r, false)
+}
+
+func (h *Handlers) previewsPage(w http.ResponseWriter, r *http.Request, full bool) {
+	records, err := h.assemblePreviews(r.Context())
+	if err != nil {
+		slog.Error("assemble previews failed", "err", err)
+		records = nil
+	}
+	f := h.assembleFleet(r.Context())
+	vm := h.dashboardVM(r, "previews", "/partial/previews", f)
+	vm.Previews = records
+	vm.PreviewCount = len(records)
+	if full {
+		vm.Flash = TakeFlash(w, r)
+		h.render(w, "previews", vm)
+		return
+	}
+	h.renderNamed(w, "previews", "tab-body", vm)
 }
 
 // --- polling fragments -------------------------------------------------------

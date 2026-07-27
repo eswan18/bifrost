@@ -45,12 +45,12 @@ type envView struct {
 	// e.g. ImagePullBackOff on a bad image ref. It renders as an amber
 	// "stuck · <reason>" label and stops counting toward the fast poll
 	// cadence; Status stays "deploying" (the design's 3-state vocabulary).
-	Stuck bool
-	Bold       bool
-	HashClass  string // "c-red" when this env crashes, else ""
-	Restarts   int32
-	Progress   string // "N/M" while deploying
-	Detail     string // health detail, for a tooltip
+	Stuck     bool
+	Bold      bool
+	HashClass string // "c-red" when this env crashes, else ""
+	Restarts  int32
+	Progress  string // "N/M" while deploying
+	Detail    string // health detail, for a tooltip
 
 	PrevImage string // rollback target image; "" → none known
 	PrevSHA   string

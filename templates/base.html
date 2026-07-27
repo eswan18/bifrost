@@ -53,6 +53,7 @@
   <a href="/" class="tab{{if eq .Tab "overview"}} active{{end}}">Overview</a>
   <a href="/apps" class="tab{{if eq .Tab "apps"}} active{{end}}">Apps<span class="tab-count">{{.AppCount}}</span>{{if .AppIssues}}<span class="tab-issue">{{.AppIssues}}</span>{{end}}</a>
   <a href="/jobs" class="tab{{if eq .Tab "jobs"}} active{{end}}">Jobs<span class="tab-count">{{.JobCount}}</span>{{if .JobIssues}}<span class="tab-issue">{{.JobIssues}}</span>{{end}}</a>
+  <a href="/previews" class="tab{{if eq .Tab "previews"}} active{{end}}">Previews{{if .PreviewCount}}<span class="tab-count">{{.PreviewCount}}</span>{{end}}</a>
 </div>
 {{end}}
 

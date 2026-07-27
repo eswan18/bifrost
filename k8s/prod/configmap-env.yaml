@@ -8,3 +8,5 @@ data:
   BASE_URL: "https://bifrost.ethanswan.com"
   OIDC_ISSUER_EXTERNAL: "https://identity.ethanswan.com"
   OIDC_ISSUER_INTERNAL: "http://identity.identity-prod.svc.cluster.local"
+  PREVIEW_SERVICES: "footstrike-api,footstrike-dashboard,identity"
+  NEON_PROJECTS: "footstrike-api=aged-river-81935268/neondb/neondb_owner,identity=plain-heart-27630935/neondb/app"
