@@ -17,6 +17,9 @@ import (
 // the preview's record (labels/annotations written by the 3c orchestrator).
 const previewLabelSelector = "bifrost/preview=true"
 
+// previewNSPrefix is prepended to a preview's tag to form its namespace name.
+const previewNSPrefix = "preview-"
+
 type previewRecord struct {
 	Tag       string            `json:"tag"`
 	Branch    string            `json:"branch"`
@@ -30,16 +33,19 @@ type previewRecord struct {
 // recordFromNamespace derives everything derivable without extra cluster
 // calls; Health is filled separately by the assemblers.
 func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
-	tag := strings.TrimPrefix(ns.Name, "preview-")
+	tag := strings.TrimPrefix(ns.Name, previewNSPrefix)
 	rec := previewRecord{
 		Tag:       tag,
 		Branch:    ns.Annotations["bifrost/branch"],
+		Apps:      []string{},
 		Phase:     ns.Annotations["bifrost/phase"],
 		CreatedAt: ns.CreatedAt,
 		URLs:      map[string]string{},
 	}
-	if apps := ns.Annotations["bifrost/apps"]; apps != "" {
-		rec.Apps = strings.Split(apps, ",")
+	for _, app := range strings.Split(ns.Annotations["bifrost/apps"], ",") {
+		if app = strings.TrimSpace(app); app != "" {
+			rec.Apps = append(rec.Apps, app)
+		}
 	}
 	if rec.Phase == "" {
 		rec.Phase = "unknown"
@@ -69,7 +75,7 @@ func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error
 }
 
 func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewRecord, bool, error) {
-	ns, found, err := h.Kube.GetNamespace(ctx, "preview-"+tag)
+	ns, found, err := h.Kube.GetNamespace(ctx, previewNSPrefix+tag)
 	if err != nil || !found {
 		return previewRecord{}, false, err
 	}
@@ -95,7 +101,9 @@ func (h *Handlers) PreviewsListJSON(w http.ResponseWriter, r *http.Request) {
 	records, err := h.assemblePreviews(r.Context())
 	if err != nil {
 		slog.Error("list previews failed", "err", err)
-		http.Error(w, "list previews failed", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "list previews failed"})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -107,7 +115,9 @@ func (h *Handlers) PreviewJSON(w http.ResponseWriter, r *http.Request) {
 	rec, found, err := h.previewByTag(r.Context(), r.PathValue("tag"))
 	if err != nil {
 		slog.Error("get preview failed", "err", err)
-		http.Error(w, "get preview failed", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "get preview failed"})
 		return
 	}
 	if !found {

@@ -43,6 +43,16 @@ func TestRecordFromNamespace(t *testing.T) {
 	}
 }
 
+func TestRecordFromNamespaceTrailingComma(t *testing.T) {
+	r := recordFromNamespace(nsInfo("preview-x", "x", "footstrike-api,", "ready"))
+	if len(r.Apps) != 1 || r.Apps[0] != "footstrike-api" {
+		t.Fatalf("trailing comma must not produce a phantom app, got apps=%v", r.Apps)
+	}
+	if len(r.URLs) != 1 || r.URLs["footstrike-api"] != "https://footstrike-api-x.preview.footstrike.run" {
+		t.Errorf("trailing comma must not produce a bogus URL, got urls=%v", r.URLs)
+	}
+}
+
 func TestRecordFromNamespaceDefaults(t *testing.T) {
 	r := recordFromNamespace(nsInfo("preview-x", "", "", ""))
 	if r.Phase != "unknown" {
@@ -125,6 +135,29 @@ func TestPreviewsListJSONKubeError(t *testing.T) {
 	h.PreviewsListJSON(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"error"`) {
+		t.Errorf("body = %q, want it to contain \"error\"", body)
+	}
+}
+
+// TestPreviewsListJSONEmpty pins the JSON contract for an empty previews
+// list: the field must marshal as [] (via the non-nil make() slice in
+// assemblePreviews), never null.
+func TestPreviewsListJSONEmpty(t *testing.T) {
+	h := &Handlers{Kube: &fakeKube{}}
+	req := httptest.NewRequest("GET", "/api/previews", nil)
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"previews":[]`) {
+		t.Errorf("body = %q, want it to contain \"previews\":[]", body)
 	}
 }
 
