@@ -15,7 +15,7 @@ func TestBranchSHA(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/repos/eswan18/footstrike-api/branches/hae-cadence":
-			w.Write([]byte(`{"name":"hae-cadence","commit":{"sha":"49a402ab12cd"}}`))
+			_, _ = w.Write([]byte(`{"name":"hae-cadence","commit":{"sha":"49a402ab12cd"}}`))
 		case "/repos/eswan18/footstrike-api/branches/missing":
 			w.WriteHeader(http.StatusNotFound)
 		default:
@@ -58,7 +58,7 @@ func TestBranchSHAWithSlash(t *testing.T) {
 		if escaped := r.URL.EscapedPath(); escaped != "/repos/eswan18/footstrike-api/branches/feat%2Fx" {
 			t.Errorf("EscapedPath = %q, want /repos/eswan18/footstrike-api/branches/feat%%2Fx", escaped)
 		}
-		w.Write([]byte(`{"name":"feat/x","commit":{"sha":"abc123def456"}}`))
+		_, _ = w.Write([]byte(`{"name":"feat/x","commit":{"sha":"abc123def456"}}`))
 	}))
 	defer srv.Close()
 	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
@@ -74,7 +74,7 @@ func TestBranchSHAWithSlash(t *testing.T) {
 
 func TestBranchSHAMissingSHA(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte(`{"name":"main","commit":{}}`))
+		_, _ = w.Write([]byte(`{"name":"main","commit":{}}`))
 	}))
 	defer srv.Close()
 	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)

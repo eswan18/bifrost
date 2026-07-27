@@ -24,7 +24,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *http.ServeMux) {
 func TestListBranches(t *testing.T) {
 	srv, mux := newTestServer(t)
 	mux.HandleFunc("GET /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte(`{"branches":[{"id":"br-main-123","name":"main"},{"id":"br-prev-456","name":"preview-hae-cadence"}]}`))
+		_, _ = w.Write([]byte(`{"branches":[{"id":"br-main-123","name":"main"},{"id":"br-prev-456","name":"preview-hae-cadence"}]}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	got, err := c.ListBranches(context.Background(), "proj-abc")
@@ -54,7 +54,7 @@ func TestCreateBranch(t *testing.T) {
 			t.Error("expected endpoints in create request (branch needs a compute to connect to)")
 		}
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence"}}`))
+		_, _ = w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence"}}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	got, err := c.CreateBranch(context.Background(), "proj-abc", "preview-hae-cadence", "")
@@ -78,7 +78,7 @@ func TestCreateBranchWithParent(t *testing.T) {
 			t.Errorf("branch.parent_id = %v, want br-main-123", branch["parent_id"])
 		}
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence"}}`))
+		_, _ = w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence"}}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	if _, err := c.CreateBranch(context.Background(), "proj-abc", "preview-hae-cadence", "br-main-123"); err != nil {
@@ -91,7 +91,7 @@ func TestDeleteBranch(t *testing.T) {
 	called := false
 	mux.HandleFunc("DELETE /projects/proj-abc/branches/br-prev-456", func(w http.ResponseWriter, _ *http.Request) {
 		called = true
-		w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	if err := c.DeleteBranch(context.Background(), "proj-abc", "br-prev-456"); err != nil {
@@ -124,7 +124,7 @@ func TestConnectionURI(t *testing.T) {
 		if q.Get("branch_id") != "br-prev-456" || q.Get("database_name") != "fitnessdb" || q.Get("role_name") != "fitness_owner" {
 			t.Errorf("query = %v", q)
 		}
-		w.Write([]byte(`{"uri":"postgresql://fitness_owner:pw@ep-x.neon.tech/fitnessdb"}`))
+		_, _ = w.Write([]byte(`{"uri":"postgresql://fitness_owner:pw@ep-x.neon.tech/fitnessdb"}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	uri, err := c.ConnectionURI(context.Background(), "proj-abc", "br-prev-456", "fitnessdb", "fitness_owner")
@@ -163,7 +163,7 @@ func TestPathSegmentsEscaped(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.EscapedPath()
-		w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(srv.Close)
 
