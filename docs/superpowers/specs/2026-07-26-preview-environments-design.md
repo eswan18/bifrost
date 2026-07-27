@@ -64,8 +64,8 @@ is recovered by re-running `up`.
 
 1. Resolve membership (GitHub API, PAT).
 2. For each member app: trigger its `{name}-preview-build` Cloud Build trigger against the branch
-   (substitutions carry preview URLs for the dashboard's `VITE_*` build-time vars). Wait for
-   green.
+   (RunBuildTrigger API, no substitutions). Wait for green. Per-preview URLs (dashboard `APP_*`
+   vars) are set later via the preview overlay's env vars, not as build substitutions.
 3. Create Neon branches for stateful member apps (Neon REST API).
 4. Fetch each member repo's `k8s/base` at the branch (GitHub tarball API), render with embedded
    kustomize + a generated preview overlay, apply via client-go server-side apply.
@@ -87,12 +87,14 @@ previews.
 
 Each previewable repo gets `cloudbuild-preview.yaml` + a `{name}-preview-build` trigger (Pulumi):
 
-- Tags `preview-<tag>-<shortsha>` only. **Never `latest`, never a bare SHA** — staging's
-  image-updater (`newest-build` + `allowTags: regexp:^[a-f0-9]{7,}$`) would otherwise scoop a
-  branch build straight into staging.
-- Dashboard variant takes preview URLs as substitutions (Vite bakes env at build time).
-  Per-preview dashboard builds are accepted; runtime `config.js` injection stays a possible
-  future improvement, not part of this work.
+- Tags `preview-{SHORT_SHA}` only — env-agnostic and branch-content-addressed (no per-preview
+  suffix; the same branch content always produces the same tag). **Never `latest`, never a bare
+  SHA** — staging's image-updater (`newest-build` + `allowTags: regexp:^[a-f0-9]{7,}$`) would
+  otherwise scoop a branch build straight into staging.
+- The dashboard preview image is env-agnostic; per-preview URLs are supplied at deploy time as
+  `APP_API_URL` / `APP_IDENTITY_URL` / `APP_OAUTH_CLIENT_ID` env vars on the container,
+  materialized as `/config.js` by the nginx entrypoint (runtime config with per-key fallback to
+  build-time values).
 
 ## Identity / auth
 
@@ -125,7 +127,9 @@ ready and prints the preview URLs.
 - Auto-teardown / TTL reaper (manual `down`; `list` shows age)
 - ArgoCD involvement in previews (imperative by design; GitOps stays for permanent envs)
 - Building from uncommitted local changes (pushed branches only)
-- Dashboard runtime config injection
+- Collapsing footstrike-dashboard's staging/prod `{sha}-{env}` dual builds onto the new runtime
+  config (now that preview builds are substitution-free, the same could apply to staging/prod,
+  but that's a separate migration — deferred)
 - Pub/Sub isolation (preview apps would share staging topics if publishing ever lands)
 
 ## Testing
