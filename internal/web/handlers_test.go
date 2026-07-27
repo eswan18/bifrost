@@ -24,17 +24,17 @@ import (
 // namespace lists across all namespaces, with Namespace stamped on each item
 // so the fleet's grouping works.
 type fakeKube struct {
-	mu           sync.Mutex
-	imgs         map[string][]string
-	pods         map[string][]kube.PodInfo
-	rsets        map[string][]kube.ReplicaSetInfo
-	cronjobs     map[string][]kube.CronJobInfo
-	jobs         map[string][]kube.JobInfo
-	argoApps     map[string]kube.AppStatus
-	argoErr      error
-	patched      map[string]string
-	patchErr     error
-	namespaces   []kube.NamespaceInfo
+	mu            sync.Mutex
+	imgs          map[string][]string
+	pods          map[string][]kube.PodInfo
+	rsets         map[string][]kube.ReplicaSetInfo
+	cronjobs      map[string][]kube.CronJobInfo
+	jobs          map[string][]kube.JobInfo
+	argoApps      map[string]kube.AppStatus
+	argoErr       error
+	patched       map[string]string
+	patchErr      error
+	namespaces    []kube.NamespaceInfo
 	namespacesErr error
 }
 
