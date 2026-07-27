@@ -2,7 +2,10 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -84,4 +87,35 @@ func (h *Handlers) previewHealth(ctx context.Context, namespace string) string {
 		return "unknown"
 	}
 	return strings.ToLower(string(kube.SummarizeHealth(pods).State))
+}
+
+// PreviewsListJSON serves GET /api/previews for both the UI's consumers and
+// the ib CLI (bearer-authed — may carry no session; no SessionFromContext).
+func (h *Handlers) PreviewsListJSON(w http.ResponseWriter, r *http.Request) {
+	records, err := h.assemblePreviews(r.Context())
+	if err != nil {
+		slog.Error("list previews failed", "err", err)
+		http.Error(w, "list previews failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"previews": records})
+}
+
+// PreviewJSON serves GET /api/previews/{tag}.
+func (h *Handlers) PreviewJSON(w http.ResponseWriter, r *http.Request) {
+	rec, found, err := h.previewByTag(r.Context(), r.PathValue("tag"))
+	if err != nil {
+		slog.Error("get preview failed", "err", err)
+		http.Error(w, "get preview failed", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "unknown preview"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rec)
 }

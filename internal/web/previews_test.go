@@ -2,6 +2,10 @@ package web
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -76,5 +80,49 @@ func TestPreviewByTagMissing(t *testing.T) {
 	_, found, err := h.previewByTag(context.Background(), "nope")
 	if err != nil || found {
 		t.Fatalf("want (zero,false,nil), got found=%v err=%v", found, err)
+	}
+}
+
+func TestPreviewsListJSON(t *testing.T) {
+	fk := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-a", "a", "footstrike-api", "ready")}}
+	h := &Handlers{Kube: fk}
+	req := httptest.NewRequest("GET", "/api/previews", nil)
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	var body struct {
+		Previews []previewRecord `json:"previews"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Previews) != 1 || body.Previews[0].Tag != "a" {
+		t.Errorf("body = %+v", body)
+	}
+}
+
+func TestPreviewJSONNotFound(t *testing.T) {
+	h := &Handlers{Kube: &fakeKube{}}
+	req := httptest.NewRequest("GET", "/api/previews/nope", nil)
+	req.SetPathValue("tag", "nope")
+	rec := httptest.NewRecorder()
+	h.PreviewJSON(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestPreviewsListJSONKubeError(t *testing.T) {
+	h := &Handlers{Kube: &fakeKube{namespacesErr: errors.New("boom")}}
+	req := httptest.NewRequest("GET", "/api/previews", nil)
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
 	}
 }
