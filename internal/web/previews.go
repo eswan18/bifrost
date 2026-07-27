@@ -1,0 +1,87 @@
+package web
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/eswan18/bifrost/internal/kube"
+)
+
+// previewLabelSelector selects preview namespaces — the namespace itself is
+// the preview's record (labels/annotations written by the 3c orchestrator).
+const previewLabelSelector = "bifrost/preview=true"
+
+type previewRecord struct {
+	Tag       string            `json:"tag"`
+	Branch    string            `json:"branch"`
+	Apps      []string          `json:"apps"`
+	Phase     string            `json:"phase"`
+	Health    string            `json:"health"`
+	CreatedAt time.Time         `json:"createdAt"`
+	URLs      map[string]string `json:"urls"`
+}
+
+// recordFromNamespace derives everything derivable without extra cluster
+// calls; Health is filled separately by the assemblers.
+func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
+	tag := strings.TrimPrefix(ns.Name, "preview-")
+	rec := previewRecord{
+		Tag:       tag,
+		Branch:    ns.Annotations["bifrost/branch"],
+		Phase:     ns.Annotations["bifrost/phase"],
+		CreatedAt: ns.CreatedAt,
+		URLs:      map[string]string{},
+	}
+	if apps := ns.Annotations["bifrost/apps"]; apps != "" {
+		rec.Apps = strings.Split(apps, ",")
+	}
+	if rec.Phase == "" {
+		rec.Phase = "unknown"
+	}
+	if ns.Phase == "Terminating" {
+		rec.Phase = "terminating"
+	}
+	for _, app := range rec.Apps {
+		rec.URLs[app] = fmt.Sprintf("https://%s-%s.preview.footstrike.run", app, tag)
+	}
+	return rec
+}
+
+func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error) {
+	namespaces, err := h.Kube.ListNamespaces(ctx, previewLabelSelector)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]previewRecord, 0, len(namespaces))
+	for _, ns := range namespaces {
+		rec := recordFromNamespace(ns)
+		rec.Health = h.previewHealth(ctx, ns.Name)
+		records = append(records, rec)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Tag < records[j].Tag })
+	return records, nil
+}
+
+func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewRecord, bool, error) {
+	ns, found, err := h.Kube.GetNamespace(ctx, "preview-"+tag)
+	if err != nil || !found {
+		return previewRecord{}, false, err
+	}
+	rec := recordFromNamespace(ns)
+	rec.Health = h.previewHealth(ctx, ns.Name)
+	return rec, true, nil
+}
+
+// previewHealth summarizes pod health namespace-wide; errors degrade to
+// "unknown" rather than failing the read (consistent with how the fleet
+// view tolerates partial reads).
+func (h *Handlers) previewHealth(ctx context.Context, namespace string) string {
+	pods, err := h.Kube.ListPods(ctx, namespace)
+	if err != nil {
+		return "unknown"
+	}
+	return strings.ToLower(string(kube.SummarizeHealth(pods).State))
+}
