@@ -51,3 +51,39 @@ func TestBranchSHAServerError(t *testing.T) {
 		t.Errorf("expected non-ErrNoBranch error, got %v", err)
 	}
 }
+
+func TestBranchSHAWithSlash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check that the path contains the percent-encoded slash
+		if escaped := r.URL.EscapedPath(); escaped != "/repos/eswan18/footstrike-api/branches/feat%2Fx" {
+			t.Errorf("EscapedPath = %q, want /repos/eswan18/footstrike-api/branches/feat%%2Fx", escaped)
+		}
+		w.Write([]byte(`{"name":"feat/x","commit":{"sha":"abc123def456"}}`))
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	sha, err := c.BranchSHA(context.Background(), "footstrike-api", "feat/x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sha != "abc123def456" {
+		t.Errorf("sha = %q, want abc123def456", sha)
+	}
+}
+
+func TestBranchSHAMissingSHA(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"name":"main","commit":{}}`))
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.BranchSHA(context.Background(), "footstrike-api", "main")
+	if err == nil {
+		t.Errorf("expected error for missing SHA, got nil")
+	}
+	if errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected non-ErrNoBranch error for missing SHA, got %v", err)
+	}
+}

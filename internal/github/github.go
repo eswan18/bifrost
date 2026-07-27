@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -41,7 +42,7 @@ func NewWithBaseURL(org, token, baseURL string) Client {
 }
 
 func (c *client) BranchSHA(ctx context.Context, repo, branch string) (string, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/branches/%s", c.baseURL, c.org, repo, branch)
+	url := fmt.Sprintf("%s/repos/%s/%s/branches/%s", c.baseURL, c.org, url.PathEscape(repo), url.PathEscape(branch))
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
