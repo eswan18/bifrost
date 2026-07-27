@@ -68,6 +68,9 @@ func TestPagesRenderRichScenario(t *testing.T) {
 			"billing-worker-staging": {{Name: "invoice-sync-9", OwnerCron: "invoice-sync", Image: "reg/billing-worker:4c7d9e2", StartTime: start, CompletionTime: start.Add(72 * time.Second), Succeeded: true}},
 			"search-indexer-staging": {{Name: "reindex-1", OwnerCron: "reindex-nightly", Image: "reg/search-indexer:7d2c5f8", StartTime: start, Failed: true, FailReason: "BackoffLimitExceeded"}},
 		},
+		namespaces: []kube.NamespaceInfo{
+			nsInfo("preview-hae-cadence", "hae-cadence", "api-gateway", "ready"),
+		},
 	}
 	h := &Handlers{Cfg: cfg, Kube: k, Renderer: rend, Builds: &fakeBuilds{builds: map[string]gcb.BuildStatus{
 		"api-gateway":    {Status: "SUCCESS", SHA: "b82e4d1", FinishTime: time.Now().Add(-2 * time.Hour), LogURL: "https://cb/1"},
@@ -80,6 +83,7 @@ func TestPagesRenderRichScenario(t *testing.T) {
 		"overview": func(w *httptest.ResponseRecorder) { h.Overview(w, authed(t, "GET", "/", "", sess)) },
 		"apps":     func(w *httptest.ResponseRecorder) { h.Apps(w, authed(t, "GET", "/apps", "", sess)) },
 		"jobs":     func(w *httptest.ResponseRecorder) { h.Jobs(w, authed(t, "GET", "/jobs", "", sess)) },
+		"previews": func(w *httptest.ResponseRecorder) { h.Previews(w, authed(t, "GET", "/previews", "", sess)) },
 	}
 	for name, fn := range pages {
 		t.Run(name, func(t *testing.T) {
@@ -90,6 +94,9 @@ func TestPagesRenderRichScenario(t *testing.T) {
 			}
 			if strings.Contains(rec.Body.String(), "<no value>") {
 				t.Error("template rendered '<no value>' (a nil field reference)")
+			}
+			if name == "previews" && !strings.Contains(rec.Body.String(), "hae-cadence") {
+				t.Error("previews page did not render the preview's tag")
 			}
 		})
 	}

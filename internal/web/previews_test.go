@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,5 +125,79 @@ func TestPreviewsListJSONKubeError(t *testing.T) {
 	h.PreviewsListJSON(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+// --- UI tab ------------------------------------------------------------------
+
+func TestPreviewsPage(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "foo", "ready"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "hae-cadence") {
+		t.Error("preview tag missing from page")
+	}
+	if !strings.Contains(body, `class="tab active"`) {
+		t.Error("previews tab not marked active")
+	}
+	// One preview: the nav badge should render its count.
+	if !strings.Contains(body, `Previews<span class="tab-count">1</span>`) {
+		t.Error("nav badge should show PreviewCount when non-zero")
+	}
+}
+
+func TestPreviewsFragment(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "foo", "ready"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/partial/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.PreviewsFragment(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "hae-cadence") {
+		t.Error("preview tag missing from fragment")
+	}
+	// No page chrome: a poll response is swapped into #tab-body verbatim.
+	if strings.Contains(body, "<!DOCTYPE") || strings.Contains(body, "Sign out") {
+		t.Error("fragment should not include full-page chrome")
+	}
+}
+
+// TestPreviewsNavBadgeConditional asserts the cheap path: other tabs never
+// call assemblePreviews (an extra namespace list) just to size the Previews
+// nav badge, so PreviewCount is the zero value there and the badge span must
+// not render at all (vs. AppCount/JobCount, which always render their span).
+func TestPreviewsNavBadgeConditional(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "foo", "ready"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/apps", "", sess)
+	rec := httptest.NewRecorder()
+	h.Apps(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/previews"`) {
+		t.Error("previews nav link missing")
+	}
+	if strings.Contains(body, `Previews<span class="tab-count">`) {
+		t.Error("previews nav badge should not render on other tabs (would require an extra namespace list)")
 	}
 }
