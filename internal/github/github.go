@@ -158,14 +158,14 @@ func (c *client) FetchK8s(ctx context.Context, repo, ref string) (map[string][]b
 		}
 		// Reject rather than normalize: an entry is only safe to extract if
 		// its path is already in path.Clean's canonical form, non-empty,
-		// relative, and doesn't start with "../". Anything else — a literal
-		// escape like "../../etc/passwd", or a decoy like "base/sub/../x.yaml"
-		// that would silently collapse onto (and overwrite) a real
-		// "base/x.yaml" entry — fails the whole fetch loudly rather than
-		// being sanitized, since these keys feed straight into an in-memory
-		// filesystem downstream.
+		// relative, and neither "../" nor a bare "..". Anything else — a
+		// literal escape like "../../etc/passwd" or "..", or a decoy like
+		// "base/sub/../x.yaml" that would silently collapse onto (and
+		// overwrite) a real "base/x.yaml" entry — fails the whole fetch
+		// loudly rather than being sanitized, since these keys feed straight
+		// into an in-memory filesystem downstream.
 		cleaned := path.Clean(relToK8s)
-		if cleaned != relToK8s || cleaned == "." || cleaned == "" || strings.HasPrefix(cleaned, "../") || path.IsAbs(cleaned) {
+		if cleaned != relToK8s || cleaned == "." || cleaned == ".." || cleaned == "" || strings.HasPrefix(cleaned, "../") || path.IsAbs(cleaned) {
 			return nil, fmt.Errorf("k8s tarball entry %q has an unsafe or non-canonical path", hdr.Name)
 		}
 		data, err := io.ReadAll(io.LimitReader(tr, budget+1))

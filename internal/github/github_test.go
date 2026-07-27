@@ -228,6 +228,7 @@ func TestFetchK8sRejectsNonCanonicalPaths(t *testing.T) {
 	}{
 		{"path escapes the k8s subtree via ..", "repo-sha1234/k8s/../../etc/passwd"},
 		{"decoy would collapse onto a sibling entry", "repo-sha1234/k8s/base/sub/../x.yaml"},
+		{"bare dot-dot escapes one level above k8s/", "repo-sha1234/k8s/.."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
