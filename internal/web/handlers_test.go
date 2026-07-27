@@ -24,16 +24,18 @@ import (
 // namespace lists across all namespaces, with Namespace stamped on each item
 // so the fleet's grouping works.
 type fakeKube struct {
-	mu       sync.Mutex
-	imgs     map[string][]string
-	pods     map[string][]kube.PodInfo
-	rsets    map[string][]kube.ReplicaSetInfo
-	cronjobs map[string][]kube.CronJobInfo
-	jobs     map[string][]kube.JobInfo
-	argoApps map[string]kube.AppStatus
-	argoErr  error
-	patched  map[string]string
-	patchErr error
+	mu           sync.Mutex
+	imgs         map[string][]string
+	pods         map[string][]kube.PodInfo
+	rsets        map[string][]kube.ReplicaSetInfo
+	cronjobs     map[string][]kube.CronJobInfo
+	jobs         map[string][]kube.JobInfo
+	argoApps     map[string]kube.AppStatus
+	argoErr      error
+	patched      map[string]string
+	patchErr     error
+	namespaces   []kube.NamespaceInfo
+	namespacesErr error
 }
 
 func (f *fakeKube) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
@@ -139,6 +141,19 @@ func (f *fakeKube) ListReplicaSets(_ context.Context, ns string) ([]kube.Replica
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeKube) ListNamespaces(_ context.Context, _ string) ([]kube.NamespaceInfo, error) {
+	return f.namespaces, f.namespacesErr
+}
+
+func (f *fakeKube) GetNamespace(_ context.Context, name string) (kube.NamespaceInfo, bool, error) {
+	for _, ns := range f.namespaces {
+		if ns.Name == name {
+			return ns, true, nil
+		}
+	}
+	return kube.NamespaceInfo{}, false, f.namespacesErr
 }
 
 func i32(v int32) *int32 { return &v }
