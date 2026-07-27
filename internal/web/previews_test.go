@@ -155,6 +155,30 @@ func TestPreviewsPage(t *testing.T) {
 	}
 }
 
+// TestPreviewsPageDegradesOnKubeError mirrors TestPreviewsListJSONKubeError
+// for the UI path: assemblePreviews failing must not 500 the whole dashboard
+// tab — it degrades to the empty-state UI (matching how AppsSurvives*
+// failures degrade elsewhere), and the raw error must never leak into the
+// rendered page.
+func TestPreviewsPageDegradesOnKubeError(t *testing.T) {
+	k := &fakeKube{namespacesErr: errors.New("boom")}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (degrade, not fail)", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No preview environments") {
+		t.Error("expected empty-state copy when assemblePreviews fails")
+	}
+	if strings.Contains(body, "boom") {
+		t.Error("raw kube error must not leak into the rendered page")
+	}
+}
+
 func TestPreviewsFragment(t *testing.T) {
 	k := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-hae-cadence", "hae-cadence", "foo", "ready"),

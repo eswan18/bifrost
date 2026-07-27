@@ -36,7 +36,7 @@ type pageVM struct {
 	Flash      *Flash
 	CSRF       string
 	Dashboard  bool
-	Tab        string // "overview" | "apps" | "jobs"
+	Tab        string // "overview" | "apps" | "jobs" | "previews"
 	RefreshURL string // polling fragment endpoint for this page
 	AnyActive  bool   // something in flight → fast poll cadence
 
