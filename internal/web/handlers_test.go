@@ -1098,6 +1098,14 @@ func (f *fakeBuilds) LatestBuilds(_ context.Context) (map[string]gcb.BuildStatus
 	return f.builds, f.err
 }
 
+func (f *fakeBuilds) RunTrigger(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeBuilds) GetBuild(_ context.Context, _ string) (gcb.BuildStatus, error) {
+	return gcb.BuildStatus{}, nil
+}
+
 func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var got map[string]any

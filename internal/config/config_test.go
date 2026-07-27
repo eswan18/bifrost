@@ -139,6 +139,56 @@ func TestGitHubOrgDefault(t *testing.T) {
 	}
 }
 
+func TestPreviewConfigDefaults(t *testing.T) {
+	cfg, err := loadFromMap(minimalValidEnv())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.PreviewServices) != 0 || len(cfg.NeonProjects) != 0 {
+		t.Errorf("expected empty preview config, got %v / %v", cfg.PreviewServices, cfg.NeonProjects)
+	}
+	if cfg.GitHubToken != "" || cfg.NeonAPIKey != "" || cfg.PreviewAPIToken != "" {
+		t.Errorf("expected empty tokens by default")
+	}
+}
+
+func TestPreviewServicesParsed(t *testing.T) {
+	m := minimalValidEnv()
+	m["PREVIEW_SERVICES"] = "footstrike-api, footstrike-dashboard,identity,"
+	cfg, err := loadFromMap(m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"footstrike-api", "footstrike-dashboard", "identity"}
+	if !reflect.DeepEqual(cfg.PreviewServices, want) {
+		t.Errorf("PreviewServices = %v, want %v", cfg.PreviewServices, want)
+	}
+}
+
+func TestNeonProjectsParsed(t *testing.T) {
+	m := minimalValidEnv()
+	m["NEON_PROJECTS"] = "footstrike-api=proj-abc/fitnessdb/fitness_owner,identity=proj-def/identitydb/identity_owner"
+	cfg, err := loadFromMap(m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]NeonProjectRef{
+		"footstrike-api": {ProjectID: "proj-abc", Database: "fitnessdb", Role: "fitness_owner"},
+		"identity":       {ProjectID: "proj-def", Database: "identitydb", Role: "identity_owner"},
+	}
+	if !reflect.DeepEqual(cfg.NeonProjects, want) {
+		t.Errorf("NeonProjects = %v, want %v", cfg.NeonProjects, want)
+	}
+}
+
+func TestNeonProjectsMalformedRef(t *testing.T) {
+	m := minimalValidEnv()
+	m["NEON_PROJECTS"] = "footstrike-api=proj-abc/fitnessdb"
+	if _, err := loadFromMap(m); err == nil {
+		t.Error("expected error for ref missing role segment")
+	}
+}
+
 func minimalValidEnv() map[string]string {
 	return map[string]string{
 		"BASE_URL":             "https://b",
