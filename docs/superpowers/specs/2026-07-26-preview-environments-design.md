@@ -34,7 +34,10 @@ feature branches) working together before merging to main.
   `*.preview.footstrike.run` covers only one level. Tailnet-only via the existing shared
   `staging-ingress` Tailscale LB + nginx ingress class.
 - **Env wiring (rendered into a per-preview configmap):**
-  - `VITE_API_URL` / `PUBLIC_API_BASE_URL` / `PUBLIC_DASHBOARD_BASE_URL` → preview URLs
+  - Dashboard: `APP_API_URL` / `APP_IDENTITY_URL` / `APP_OAUTH_CLIENT_ID` → preview URLs,
+    read by the nginx entrypoint at container start and written to `/config.js` — no rebuild
+  - API: `PUBLIC_API_BASE_URL` / `PUBLIC_DASHBOARD_BASE_URL` → preview URLs (genuine runtime
+    env vars, read directly by the app)
   - `EXTRA_CORS_ORIGINS` → preview dashboard URL
   - `IDENTITY_PROVIDER_URL` / `JWT_ISSUER` → staging identity, **unless** identity is in the
     preview, in which case they point at the preview's identity
