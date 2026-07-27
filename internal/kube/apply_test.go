@@ -170,6 +170,64 @@ func TestCopySecretCreatesWithOverridesAndKeepSource(t *testing.T) {
 	}
 }
 
+// The preview wildcard-cert copy (CopySecret("previews", "preview-footstrike-run-tls",
+// ns, "preview-footstrike-run-tls", nil)) depends on the destination staying
+// a real kubernetes.io/tls secret — an Ingress's tls.secretName won't work
+// against a plain Opaque secret. This pins that Type is carried from source
+// to destination, not dropped/defaulted.
+func TestCopySecretPreservesSourceType(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "previews", Name: "preview-footstrike-run-tls"},
+		Type:       corev1.SecretTypeTLS,
+		Data:       map[string][]byte{"tls.crt": []byte("cert"), "tls.key": []byte("key")},
+	})
+	c := &client{typed: cs}
+
+	err := c.CopySecret(context.Background(), "previews", "preview-footstrike-run-tls",
+		"preview-x", "preview-footstrike-run-tls", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dst, err := cs.CoreV1().Secrets("preview-x").Get(context.Background(), "preview-footstrike-run-tls", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("dest secret not created: %v", err)
+	}
+	if dst.Type != corev1.SecretTypeTLS {
+		t.Errorf("Type = %q, want %q", dst.Type, corev1.SecretTypeTLS)
+	}
+}
+
+// An override key that isn't present in the source must still land in the
+// destination — overrides aren't limited to replacing keys the source
+// already has (e.g. injecting a preview-only DATABASE_URL into a secret
+// whose staging source never had one).
+func TestCopySecretOverrideAddsKeyAbsentFromSource(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "foo-staging", Name: "foo-staging-secrets"},
+		Data:       map[string][]byte{"API_KEY": []byte("shared-key")},
+	})
+	c := &client{typed: cs}
+
+	err := c.CopySecret(context.Background(), "foo-staging", "foo-staging-secrets",
+		"preview-x", "foo-preview-secrets",
+		map[string][]byte{"DATABASE_URL": []byte("preview-uri")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dst, err := cs.CoreV1().Secrets("preview-x").Get(context.Background(), "foo-preview-secrets", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("dest secret not created: %v", err)
+	}
+	if string(dst.Data["DATABASE_URL"]) != "preview-uri" {
+		t.Errorf("DATABASE_URL = %q, want the override key added even though absent from source", dst.Data["DATABASE_URL"])
+	}
+	if string(dst.Data["API_KEY"]) != "shared-key" {
+		t.Errorf("API_KEY = %q, want source value kept", dst.Data["API_KEY"])
+	}
+}
+
 // CopySecret's destination data is a full copy-plus-overrides of the source,
 // not a merge with whatever the destination previously held — a stale key
 // left over from an old preview run must not survive a re-copy.
@@ -447,15 +505,53 @@ func TestApplyObjectsWrapsUnderlyingApplyError(t *testing.T) {
 	}
 }
 
-// restMapper resolution itself (the lazy discovery + caching) is covered via
-// the client's real constructor path (New) being exercised at the
-// integration level; here we confirm the cache is actually used — typed is
-// left nil, so if restMapper() ignored the cache and tried discovery it
-// would panic on a nil interface rather than returning cleanly.
+// TestRestMapperCachesAfterFirstResolution confirms the cache short-circuit
+// in restMapper: typed is deliberately left nil, so if restMapper() ignored
+// a non-nil c.mapper and fell through to discovery, it would panic on a nil
+// interface (c.typed.Discovery()) rather than returning cleanly. The
+// cache-miss path — the actual discovery round-trip via
+// restmapper.GetAPIGroupResources+NewDiscoveryRESTMapper — is exercised
+// against a real (if empty) discovery client in
+// TestRestMapperResolvesViaDiscovery below.
 func TestRestMapperCachesAfterFirstResolution(t *testing.T) {
 	c := &client{mapper: handBuiltMapper()}
 
 	if _, err := c.restMapper(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRestMapperResolvesViaDiscovery exercises restMapper's cache-miss path
+// for real: c.typed's fake Discovery() is seeded with a resource list, so
+// restmapper.GetAPIGroupResources actually walks it and
+// restmapper.NewDiscoveryRESTMapper builds a mapper from what it returns —
+// the same call sequence production uses, just against a fake discovery
+// client instead of a live API server.
+func TestRestMapperResolvesViaDiscovery(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.Resources = []*metav1.APIResourceList{
+		{
+			GroupVersion: "v1",
+			APIResources: []metav1.APIResource{
+				{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap"},
+			},
+		},
+	}
+	c := &client{typed: cs}
+
+	mapper, err := c.restMapper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mapping, err := mapper.RESTMapping(schema.GroupKind{Kind: "ConfigMap"}, "v1")
+	if err != nil {
+		t.Fatalf("RESTMapping: %v", err)
+	}
+	want := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
+	if mapping.Resource != want {
+		t.Errorf("Resource = %+v, want %+v", mapping.Resource, want)
+	}
+	if c.mapper == nil {
+		t.Error("restMapper should cache the resolved mapper on the client")
 	}
 }

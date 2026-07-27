@@ -67,11 +67,16 @@ func (c *client) DeleteNamespace(ctx context.Context, name string) error {
 
 // CopySecret reads srcNS/srcName and creates or updates dstNS/dstName with
 // its data, then applies overrides on top: a non-nil override value replaces
-// that key, a nil value means "keep whatever the source has for this key"
-// (lets callers build the overrides map uniformly without conditionally
-// omitting keys). The destination's data is otherwise a full copy of the
-// source, not a merge with whatever the destination previously held — a
-// stale key from a prior copy does not survive a re-copy.
+// or adds that key, a nil value means "keep whatever the source has for this
+// key" (lets callers build the overrides map uniformly without conditionally
+// omitting keys). The destination's Type is copied from the source (e.g. a
+// kubernetes.io/tls source produces a kubernetes.io/tls destination — the
+// preview TLS wildcard-cert copy depends on this). The destination is
+// otherwise a full copy of the source's Data, not a merge with whatever the
+// destination previously held: neither a stale key from a prior copy nor the
+// destination's own prior labels/annotations survive a re-copy — its
+// ObjectMeta is rebuilt from scratch each call, carrying only
+// Name/Namespace and, on update, ResourceVersion.
 func (c *client) CopySecret(ctx context.Context, srcNS, srcName, dstNS, dstName string, overrides map[string][]byte) error {
 	src, err := c.typed.CoreV1().Secrets(srcNS).Get(ctx, srcName, metav1.GetOptions{})
 	if err != nil {
