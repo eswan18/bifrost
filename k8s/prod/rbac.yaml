@@ -54,3 +54,65 @@ roleRef:
   kind: ClusterRole
   name: bifrost-prod-argocd-app-patcher
   apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped for the same kustomize-transformer reason as
+# argocd-app-patcher above, plus a reason specific to this role: previews
+# live in dynamically-named preview-<tag> namespaces, and the orchestrator
+# also reads shared secrets out of every <service>-staging namespace and the
+# previews namespace. RBAC has no way to pattern-match namespace names, so
+# there's no single namespaced Role that could cover the set of namespaces
+# this role actually touches. The grant below is therefore cluster-wide;
+# the real scoping (preview-* writes, *-staging/previews reads) happens in
+# application logic — see internal/preview/orchestrator.go and
+# internal/kube/apply.go — not in this role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bifrost-prod-preview-orchestrator
+rules:
+  # EnsureNamespace (Get, then Create-or-Update) and AnnotateNamespace (Get,
+  # then Update) manage the preview-<tag> namespace itself; DeleteNamespace
+  # (Delete) tears it down on preview teardown. See EnsureNamespace,
+  # AnnotateNamespace, DeleteNamespace in internal/kube/apply.go.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "update", "delete"]
+  # CopySecret (Get, then Create-or-Update) copies each app's
+  # <service>-staging secret and the shared previews wildcard-TLS secret
+  # into the preview namespace: reads span *-staging and previews
+  # namespaces, writes span preview-* namespaces. See CopySecret in
+  # internal/kube/apply.go.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+  # ApplyObjects server-side-applies every rendered preview manifest
+  # (fieldManager "bifrost-preview", Force: true) into the preview
+  # namespace. SSA is a PATCH under the hood and additionally needs
+  # "create" for objects that don't exist yet; "get" is included so this
+  # role stays self-contained for the only kinds it writes. These are
+  # exactly the kinds render.go produces — see internal/preview/render.go.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch", "create"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "patch", "create"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "patch", "create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "patch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bifrost-prod-preview-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: bifrost-prod-ksa
+    namespace: bifrost-prod
+roleRef:
+  kind: ClusterRole
+  name: bifrost-prod-preview-orchestrator
+  apiGroup: rbac.authorization.k8s.io
