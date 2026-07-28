@@ -4,7 +4,7 @@
 
 **Goal:** Make onboarding a new previewable app (forecasting, asset-manager, …) a declarative config edit plus per-repo build plumbing — no Go changes — by replacing the three hardcoded per-service env functions with an embedded registry file, and put the system's documentation where the system lives (bifrost + `ib`).
 
-**Architecture:** A single `internal/preview/registry.yaml`, `go:embed`-ed into bifrost, declares every previewable service: its Neon reference (if any) and its env wiring as templates. One primitive carries the relationships that made this app-specific in the first place — `{{ url X }}` resolves to X's *preview* URL when X is a member of this preview and its *staging* URL otherwise (today's `memberOrStagingURL`), plus `{{ internalUrl X }}` for in-cluster DNS and `{{ config KEY }}` for operator-supplied values. `envConfigFor` becomes a template evaluator over that data. The registry is bifrost-side and code-reviewed on purpose: it names which Neon project gets branched, which must never be influenced by the branch under test.
+**Architecture:** A single `internal/preview/registry.yaml`, `go:embed`-ed into bifrost, declares every previewable service: its Neon reference (if any) and its env wiring as templates. One primitive carries the relationships that made this app-specific in the first place — `{{ url X }}` resolves to X's *preview* URL when X is part of this preview, and otherwise **defers to the value the app's own staging ConfigMap already sets**, falling back to bifrost's `STAGING_URLS` only when there is no such baseline (see Task 2's cascade). That deferral is deliberate: it keeps bifrost from holding a second copy of a fact the app already owns. Plus `{{ internalUrl X }}` for in-cluster DNS and `{{ config KEY }}` for operator-supplied values. `envConfigFor` becomes a template evaluator over that data. The registry is bifrost-side and code-reviewed on purpose: it names which Neon project gets branched, which must never be influenced by the branch under test.
 
 **Tech Stack:** Go 1.26, `sigs.k8s.io/yaml` (already a direct dep — no new modules), `embed`.
 
@@ -56,8 +56,9 @@ The registry file's initial content must reproduce today's behavior exactly (Tas
 # Previewable services. Adding one here + a cloudbuild-preview.yaml and
 # {repo}-preview-build trigger in its repo is the whole onboarding path —
 # no Go changes. Templates: {{ url X }} is X's preview URL when X is part of
-# this preview, else X's staging URL; {{ internalUrl X }} is in-cluster DNS
-# (preview namespace when X is a member, else X's staging namespace);
+# this preview; otherwise the app's own staging ConfigMap value for that key
+# wins, and only if there is none does bifrost fall back to STAGING_URLS.
+# {{ internalUrl X }} is the same cascade over in-cluster DNS;
 # {{ config KEY }} is an operator-supplied value from bifrost's config.
 # Neon references live here and never come from the branch under test.
 footstrike-api:
@@ -88,7 +89,7 @@ identity:
     JWT_ISSUER: "{{ url self }}"
 ```
 
-**Behavioral note to encode in the loader:** today, footstrike-api and identity only override `IDENTITY_PROVIDER_URL`/`JWT_ISSUER` *when identity is a member* — otherwise the staging configmap's values pass through untouched. `{{ url identity }}`/`{{ internalUrl identity }}` reproduce that by resolving to identity's staging values when it isn't a member. Verify that claim against `envconfig.go` before writing the templates; if staging's configmap value and the computed staging URL differ for any key, say so in your report — that difference is the one real risk in this migration.
+**Behavioral note:** today footstrike-api and identity override `IDENTITY_PROVIDER_URL`/`JWT_ISSUER` only *when identity is a member*, otherwise the staging ConfigMap's values pass through untouched. Task 2's cascade reproduces that exactly by deferring to the baseline rather than looking up a staging URL — which is why no drift between bifrost's `STAGING_URLS` and the app's own config can affect these keys.
 
 - [ ] **Step 1:** Failing tests — registry parses; `Names()` returns the three sorted; a service with no `neon` yields nil; malformed YAML and an unknown top-level field error; every `required` key also appears in `env`.
 - [ ] **Step 2:** Verify failure. **Step 3:** Implement with `//go:embed registry.yaml`.
@@ -110,21 +111,36 @@ type EvalContext struct {
 	Tag     string
 	Members []string
 	Cfg     *config.Config    // StagingURLs, PreviewOAuthClientID
+	// Baseline is the app's staging ConfigMap data. Step 2 of the cascade
+	// defers to it, so bifrost never restates a fact the app already owns.
+	Baseline map[string]string
+	Key      string            // the env key being rendered (for cascade step 2)
 }
 // Eval renders one template string. Unknown functions/services are errors,
 // never silent empties.
 func Eval(tmpl string, ctx EvalContext) (string, error)
 ```
 
+**Resolution cascade (the core design decision — read this before writing code).** A URL template does NOT simply look up a staging URL when the target isn't a member. It resolves in this order, and stops at the first hit:
+
+1. **Target is a preview member** (or is `self`) → its preview URL (`{{ url }}`) or in-cluster preview DNS (`{{ internalUrl }}`).
+2. **The key already has a value in the app's staging ConfigMap** (the `stagingData` baseline) → **keep that value untouched**.
+3. → `cfg.StagingURLs[X]` for `{{ url }}`, or the `http://X.X-staging.svc.cluster.local` convention for `{{ internalUrl }}`.
+4. → error naming the key and the unresolvable service.
+
+Step 2 is the point of the whole design. Today's code doesn't compute a staging URL when identity isn't a member — it leaves the staging ConfigMap's value alone. Resolving to `cfg.StagingURLs[X]` instead would make bifrost hold a second, independently-maintained copy of a fact the app already states, and the two would silently drift (Task 1's report flagged exactly this). Deferring to the baseline means bifrost has no opinion where the app already has one, and drift is structurally impossible.
+
+Step 3 still has to exist: footstrike-dashboard's preview image is environment-agnostic by design (no `VITE_*` baked in, no staging ConfigMap), so `APP_API_URL` has no baseline to inherit and must be computed.
+
 Supported forms (exactly these; anything else is an error naming the offending template):
-- `{{ url X }}` / `{{ url self }}` → `https://X-<tag>.preview.footstrike.run` if X ∈ members (or X == self), else `cfg.StagingURLs[X]`; error if neither.
-- `{{ internalUrl X }}` → `http://X.preview-<tag>.svc.cluster.local` if X ∈ members, else `http://X.X-staging.svc.cluster.local`.
+- `{{ url X }}` / `{{ url self }}` → preview URL `https://X-<tag>.preview.footstrike.run`, else the cascade above.
+- `{{ internalUrl X }}` → `http://X.preview-<tag>.svc.cluster.local`, else the cascade above.
 - `{{ config KEY }}` → currently only `previewOAuthClientID`; unknown key is an error.
 - A literal with no `{{ }}` passes through unchanged (e.g. `ENV: staging`).
 
 Whitespace inside the braces is flexible (`{{url X}}` and `{{ url  X }}` both work). Reuse the existing `previewURL`/`internalPreviewURL` helpers rather than re-deriving hostnames — they're the single source of truth shared with `render.go`.
 
-- [ ] **Step 1:** Failing table tests covering: each form; `self`; member vs non-member resolution for both `url` and `internalUrl`; literal passthrough; unknown function; unknown service with no staging URL; unknown config key; empty template; malformed braces. Assert error *messages* name the template.
+- [ ] **Step 1:** Failing table tests covering every cascade step explicitly, since the cascade IS the design: (1) member → preview URL, for both `url` and `internalUrl`, including `self`; (2) non-member WITH a baseline value → that exact baseline value returned, byte-for-byte, and specifically NOT `cfg.StagingURLs[X]` — set them to *different* strings in the fixture so a regression to the lookup fails loudly; (3) non-member with NO baseline → `StagingURLs` / DNS convention; (4) non-member, no baseline, no staging URL → error naming key and service. Plus: literal passthrough, unknown function, unknown config key, empty template, malformed braces. Assert error *messages* name the offending template.
 - [ ] **Step 2–3:** Verify failure, implement (hand-rolled parsing is fine and probably clearer than `text/template` for four forms — your call, justify it in the report).
 - [ ] **Step 4:** Gates + commit — "Add the preview env template evaluator".
 
