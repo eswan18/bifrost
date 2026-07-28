@@ -562,6 +562,51 @@ resources:
 	}
 }
 
+// TestRenderRejectsRemoteHTTPResourceViaBareKustomizationName is a
+// regression test: krusty recognizes three kustomization file names
+// (konfig.RecognizedKustomizationFileNames() — "kustomization.yaml",
+// "kustomization.yml", and the extensionless "Kustomization"), and an
+// earlier version of validateLocalKustomizeRefs only scanned the first two,
+// hardcoded. A hostile base/Kustomization (bare name, no extension) with a
+// remote http resource sailed straight through that version and restored
+// the exact SSRF TestRenderRejectsRemoteHTTPResource above closes for the
+// ".yaml"/".yml" names. Mirrors that test's shape and discriminating
+// zero-hits assertion, but for the bare name.
+func TestRenderRejectsRemoteHTTPResourceViaBareKustomizationName(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: hostile\n"))
+	}))
+	defer srv.Close()
+
+	ref := srv.URL + "/hostile-resource.yaml"
+	k8sFiles := map[string][]byte{
+		"base/Kustomization": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a remote http kustomize resource in a bare-named Kustomization file, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Errorf("hostile server received %d requests, want 0 — Render must reject before attempting any fetch", got)
+	}
+}
+
 // TestRenderRejectsGitHubStyleBase covers kustomize's one scheme-less
 // remote shorthand (see unsafeKustomizeRef): a bare "github.com/..." base,
 // which kustomize's git loader clones without needing an explicit scheme.

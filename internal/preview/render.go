@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/kustomize/api/konfig"
 	"sigs.k8s.io/kustomize/api/krusty"
 	"sigs.k8s.io/kustomize/api/resmap"
 	"sigs.k8s.io/kustomize/api/resource"
@@ -152,10 +154,15 @@ type minimalKustomizationRefs struct {
 	} `json:"patchesJson6902,omitempty"`
 }
 
-// validateLocalKustomizeRefs rejects any fetched base/ kustomization.yaml or
-// kustomization.yml (the only two file names krusty recognizes) that
-// references anything other than a plain, relative, local path from its
-// resources, bases, components, or patches.
+// validateLocalKustomizeRefs rejects any fetched base/ kustomization file —
+// any of konfig.RecognizedKustomizationFileNames() (currently
+// "kustomization.yaml", "kustomization.yml", and the extensionless
+// "Kustomization" — driven off krusty's own list rather than a hardcoded
+// subset of it, so this can never silently drift out of sync again; an
+// earlier version of this guard hardcoded just the first two and missed
+// "Kustomization", letting a hostile base/Kustomization file restore the
+// SSRF below) — that references anything other than a plain, relative,
+// local path from its resources, bases, components, or patches.
 //
 // This exists because krusty's default options (kustomizeBuild) permit two
 // classes of remote reference, and Render has no context to bound either
@@ -183,7 +190,7 @@ func validateLocalKustomizeRefs(k8sFiles map[string][]byte) error {
 			continue
 		}
 		name := path.Base(rel)
-		if name != "kustomization.yaml" && name != "kustomization.yml" {
+		if !slices.Contains(konfig.RecognizedKustomizationFileNames(), name) {
 			continue
 		}
 		var k minimalKustomizationRefs
