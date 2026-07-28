@@ -19,7 +19,10 @@ import (
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
+	"github.com/eswan18/bifrost/internal/github"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/neon"
+	"github.com/eswan18/bifrost/internal/preview"
 	"github.com/eswan18/bifrost/internal/web"
 )
 
@@ -80,6 +83,12 @@ func main() {
 	// starting.
 	var builds gcb.Client
 	var triggerIDs map[string]string
+	// previewTriggerIDs feeds the preview orchestrator: keyed by the FULL
+	// "{service}-preview-build" trigger name (matching
+	// preview.Orchestrator.TriggerIDs' own lookup key), not the bare service
+	// name triggerIDs above uses. Both are resolved from the same trigger
+	// list, just filtered differently.
+	var previewTriggerIDs map[string]string
 	if cfg.GCPProject != "" {
 		builds, err = gcb.New(context.Background(), cfg.GCPProject)
 		if err != nil {
@@ -98,12 +107,46 @@ func main() {
 					triggerIDs[svc] = id
 				}
 			}
+			previewTriggerIDs = make(map[string]string, len(cfg.PreviewServices))
+			for _, svc := range cfg.PreviewServices {
+				if id, ok := names[svc+"-preview-build"]; ok {
+					previewTriggerIDs[svc+"-preview-build"] = id
+				}
+			}
 		}
+	}
+
+	// GitHub/Neon clients back the preview orchestrator; each is optional
+	// per the "empty disables" contract already used for GCPProject above —
+	// an empty token means that dependency (and so the whole orchestrator)
+	// is off, not misconfigured.
+	var ghClient github.Client
+	if cfg.GitHubToken != "" {
+		ghClient = github.New(cfg.GitHubOrg, cfg.GitHubToken)
+	}
+	var neonClient neon.Client
+	if cfg.NeonAPIKey != "" {
+		neonClient = neon.New(cfg.NeonAPIKey)
 	}
 
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
 	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
+
+	// The preview orchestrator needs every one of its dependencies present —
+	// partial config (e.g. a GitHub token but no Neon key, or no preview
+	// services configured at all) leaves webH.Orch nil, and the mutating
+	// preview endpoints answer 503 rather than running a half-wired flow.
+	if kc != nil && builds != nil && ghClient != nil && neonClient != nil && len(cfg.PreviewServices) > 0 {
+		webH.Orch = &preview.Orchestrator{
+			Cfg:        cfg,
+			Kube:       kc,
+			GitHub:     ghClient,
+			Neon:       neonClient,
+			Builds:     builds,
+			TriggerIDs: previewTriggerIDs,
+		}
+	}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
 	requirePreviewAuth := auth.RequireSessionOrBearer(sm, cfg.AllowedEmail, "/auth/login", cfg.PreviewAPIToken)
@@ -139,6 +182,8 @@ func main() {
 	mux.Handle("POST /services/{name}/rollback", requireAuth(http.HandlerFunc(webH.Rollback)))
 	mux.Handle("GET /api/previews", requirePreviewAuth(http.HandlerFunc(webH.PreviewsListJSON)))
 	mux.Handle("GET /api/previews/{tag}", requirePreviewAuth(http.HandlerFunc(webH.PreviewJSON)))
+	mux.Handle("POST /api/previews", requirePreviewAuth(http.HandlerFunc(webH.CreatePreviewJSON)))
+	mux.Handle("DELETE /api/previews/{tag}", requirePreviewAuth(http.HandlerFunc(webH.DeletePreviewJSON)))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddress,
