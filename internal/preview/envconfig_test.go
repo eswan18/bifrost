@@ -79,8 +79,11 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got["ENV"] != "preview" {
-			t.Errorf("ENV = %q, want preview", got["ENV"])
+		// "staging", not "preview": the api validates ENV against a closed set
+		// and exits at import on anything else (caught by the first end-to-end
+		// preview smoke, which crash-looped the api pod).
+		if got["ENV"] != "staging" {
+			t.Errorf("ENV = %q, want staging", got["ENV"])
 		}
 		if got["PUBLIC_API_BASE_URL"] != "https://footstrike-api-hae-cadence.preview.footstrike.run" {
 			t.Errorf("PUBLIC_API_BASE_URL = %q", got["PUBLIC_API_BASE_URL"])
@@ -130,7 +133,7 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got["ENV"] != "preview" || got["PUBLIC_API_BASE_URL"] == "" || got["PUBLIC_DASHBOARD_BASE_URL"] == "" {
+		if got["ENV"] != "staging" || got["PUBLIC_API_BASE_URL"] == "" || got["PUBLIC_DASHBOARD_BASE_URL"] == "" {
 			t.Errorf("envConfigFor with empty staging data = %v, missing mandatory overrides", got)
 		}
 	})
