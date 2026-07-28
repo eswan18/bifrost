@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +37,11 @@ type Orchestrator struct {
 	Neon       neon.Client
 	Builds     gcb.Client
 	TriggerIDs map[string]string // {svc}-preview-build → Cloud Build trigger ID
+	// Registry is every previewable service's Neon reference and env
+	// wiring (see registry.yaml); Up and renderAndApply both thread it
+	// into envConfigFor. Normally populated once at startup via
+	// LoadRegistry() (main.go) rather than reloaded per-request.
+	Registry Registry
 
 	mu   sync.Mutex
 	busy map[string]bool
@@ -104,14 +108,22 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	if len(members) == 0 {
 		return fmt.Errorf("preview: Up: branch %q matches no preview-eligible service", branch)
 	}
-	// Mandatory-triple pre-flight: if the dashboard is going to be rendered
-	// at all, every one of its three APP_* vars must resolve before we touch
-	// the cluster. dashboardEnvConfig is the same function stage 6 uses to
-	// build the dashboard's actual ConfigMap data, so this pre-check and the
-	// real computation can never disagree.
-	if slices.Contains(members, svcDashboard) {
-		if _, err := dashboardEnvConfig(members, tag, o.Cfg); err != nil {
-			return fmt.Errorf("preview: Up: dashboard env config: %w", err)
+	// Mandatory required-key pre-flight: any member whose registry entry
+	// declares Required env keys (today, only footstrike-dashboard's
+	// mandatory APP_API_URL/APP_IDENTITY_URL/APP_OAUTH_CLIENT_ID triple) must
+	// have every one of them resolve to a non-empty value before we touch
+	// the cluster. envConfigFor is the same function stage 6 uses to build
+	// that service's actual ConfigMap data, so this pre-check and the real
+	// computation can never disagree. stagingData is passed empty here
+	// because it hasn't been fetched yet at this point in Up -- true for
+	// every Required-key service today anyway, since footstrike-dashboard
+	// (the only one) ships no staging/configmap-env.yaml of its own.
+	for _, svc := range members {
+		if len(o.Registry[svc].Required) == 0 {
+			continue
+		}
+		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry); err != nil {
+			return fmt.Errorf("preview: Up: env config for %s: %w", svc, err)
 		}
 	}
 
@@ -332,7 +344,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		if err != nil {
 			return fmt.Errorf("parse staging env for %s: %w", svc, err)
 		}
-		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg)
+		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry)
 		if err != nil {
 			return fmt.Errorf("env config for %s: %w", svc, err)
 		}

@@ -361,11 +361,12 @@ func newTwoMemberDeps(t *testing.T) *testDeps {
 	gc := &fakeGCB{}
 	kc := newFakeKube()
 	o := &Orchestrator{
-		Cfg:    cfg,
-		Kube:   kc,
-		GitHub: gh,
-		Neon:   nc,
-		Builds: gc,
+		Cfg:      cfg,
+		Kube:     kc,
+		GitHub:   gh,
+		Neon:     nc,
+		Builds:   gc,
+		Registry: testRegistry(t),
 		TriggerIDs: map[string]string{
 			"footstrike-api-preview-build":       "trig-api",
 			"footstrike-dashboard-preview-build": "trig-dash",
@@ -709,7 +710,7 @@ func TestUpDashboardWithoutClientIDErrors(t *testing.T) {
 	}
 	gh := &fakeGitHub{members: map[string]bool{"footstrike-dashboard": true}}
 	kc := newFakeKube()
-	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}}
+	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}, Registry: testRegistry(t)}
 
 	err := o.Up(context.Background(), "dash-only-branch")
 	if err == nil {

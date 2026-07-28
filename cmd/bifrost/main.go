@@ -138,6 +138,14 @@ func main() {
 	// services configured at all) leaves webH.Orch nil, and the mutating
 	// preview endpoints answer 503 rather than running a half-wired flow.
 	if kc != nil && builds != nil && ghClient != nil && neonClient != nil && len(cfg.PreviewServices) > 0 {
+		// registry.yaml is embedded, so a parse failure here is a build-time
+		// invariant violation (a bad commit to the registry itself), not a
+		// runtime/environment condition — fail loudly rather than silently
+		// disabling the preview control plane.
+		reg, err := preview.LoadRegistry()
+		if err != nil {
+			log.Fatalf("preview registry: %v", err)
+		}
 		webH.Orch = &preview.Orchestrator{
 			Cfg:        cfg,
 			Kube:       kc,
@@ -145,6 +153,7 @@ func main() {
 			Neon:       neonClient,
 			Builds:     builds,
 			TriggerIDs: previewTriggerIDs,
+			Registry:   reg,
 		}
 	}
 

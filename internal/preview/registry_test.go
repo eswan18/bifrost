@@ -5,6 +5,19 @@ import (
 	"testing"
 )
 
+// testRegistry loads the real embedded registry.yaml for tests that need an
+// actual Registry value (envConfigFor's callers, mainly) without every one
+// of them repeating the error-check boilerplate LoadRegistry() itself
+// already gets in TestLoadRegistry below.
+func testRegistry(t *testing.T) Registry {
+	t.Helper()
+	reg, err := LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry() error = %v", err)
+	}
+	return reg
+}
+
 func TestLoadRegistry(t *testing.T) {
 	reg, err := LoadRegistry()
 	if err != nil {
