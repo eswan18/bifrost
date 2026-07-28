@@ -151,13 +151,30 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	return nil
 }
 
+// failAnnotateTimeout bounds fail's detached compensating write — long
+// enough for a real AnnotateNamespace call, short enough not to hang a
+// failure path indefinitely if the API server is unreachable.
+const failAnnotateTimeout = 10 * time.Second
+
 // fail marks ns bifrost/phase=failed with a sanitized bifrost/error
 // annotation (cause's message only — never a secret value; callers are
 // responsible for never constructing cause with one embedded, see the Neon
 // helpers below) and returns cause. If the annotate call itself fails, that
 // failure is joined in rather than swallowed, so an operator sees both.
+//
+// The annotate call deliberately runs on a context detached from ctx's
+// cancellation (context.WithoutCancel), with its own short timeout: cause
+// itself is very often ctx dying (a build-poll wait hitting the caller's
+// deadline, e.g. the API layer's 30-minute goroutine budget), and every
+// other stage's failure races the same deadline. Annotating on the
+// already-dead ctx would make this compensating write fail right along
+// with it, leaving the namespace stuck at bifrost/phase=creating with no
+// bifrost/error — silently violating the "every post-namespace failure
+// lands on failed" contract this whole function exists to uphold.
 func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
-	if annErr := o.Kube.AnnotateNamespace(ctx, ns, map[string]string{
+	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failAnnotateTimeout)
+	defer cancel()
+	if annErr := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
 		"bifrost/phase": "failed",
 		"bifrost/error": cause.Error(),
 	}); annErr != nil {

@@ -232,9 +232,16 @@ func (f *fakeKube) EnsureNamespace(_ context.Context, name string, labels, annot
 	return nil
 }
 
-func (f *fakeKube) AnnotateNamespace(_ context.Context, name string, annotations map[string]string) error {
+func (f *fakeKube) AnnotateNamespace(ctx context.Context, name string, annotations map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Context-respecting, unlike the other fake methods: this is what makes
+	// TestUpFailDetachesAnnotateFromADeadRunContext meaningful — a real
+	// client-go call against an already-cancelled/expired context fails the
+	// same way, and fail()'s compensating write must survive that.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.annotateErr != nil {
 		return f.annotateErr
 	}
@@ -563,6 +570,44 @@ func TestUpFinalReadyAnnotateFailureIsReturned(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mark ready") {
 		t.Errorf("error = %q, want it to mention marking the namespace ready", err.Error())
+	}
+}
+
+// TestUpFailDetachesAnnotateFromADeadRunContext proves the fix for a
+// Critical review finding: fail()'s compensating AnnotateNamespace write
+// must land even when the run's own context is already
+// cancelled/expired by the time a post-namespace stage fails (the
+// realistic trigger is the API layer's future 30-minute goroutine deadline
+// firing right as, say, a build-poll wait gives up) — otherwise the
+// namespace is stuck at bifrost/phase=creating with no bifrost/error,
+// silently violating the "every post-namespace failure lands on failed"
+// contract. fakeKube.AnnotateNamespace is context-respecting specifically
+// so this test can catch a regression to the old "reuse ctx directly"
+// behavior.
+func TestUpFailDetachesAnnotateFromADeadRunContext(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the run context is already dead before the failure is even reached
+
+	err := d.orch.Up(ctx, "hae-cadence")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if strings.Contains(err.Error(), "annotate failure") {
+		t.Errorf("error = %q, want the compensating annotate write to have succeeded despite the dead context", err.Error())
+	}
+
+	ns, ok := d.kube.namespaces["preview-hae-cadence"]
+	if !ok {
+		t.Fatal("namespace should exist (EnsureNamespace ran before the failure)")
+	}
+	if ns.annotations["bifrost/phase"] != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed even though the run context was already cancelled", ns.annotations["bifrost/phase"])
+	}
+	if ns.annotations["bifrost/error"] == "" {
+		t.Error("bifrost/error is empty, want the build-failure message preserved despite the dead run context")
 	}
 }
 
