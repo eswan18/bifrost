@@ -40,6 +40,12 @@ type Config struct {
 	GitHubToken     string                    // PAT for branch lookups on private repos
 	NeonAPIKey      string                    // Neon API key for branch create/delete
 	PreviewAPIToken string                    // static bearer token for the preview API (CLI use)
+	// PreviewOAuthClientID is the OAuth client the preview dashboard's
+	// APP_OAUTH_CLIENT_ID resolves to (the wildcard-registered staging
+	// dashboard client — see the 3c orchestration plan). Optional; empty
+	// fails dashboard preview creation rather than disabling anything at
+	// load time.
+	PreviewOAuthClientID string
 }
 
 // RepoFor returns the GitHub repo name for a service. Most repos are named
@@ -62,6 +68,7 @@ func Load() (*Config, error) {
 		"GITHUB_ORG", "REPO_OVERRIDES", "GCP_PROJECT",
 		"STAGING_URLS", "PROD_URLS", "DISPLAY_TIMEZONE",
 		"PREVIEW_SERVICES", "NEON_PROJECTS", "GITHUB_TOKEN", "NEON_API_KEY", "PREVIEW_API_TOKEN",
+		"PREVIEW_OAUTH_CLIENT_ID",
 	} {
 		m[k] = os.Getenv(k)
 	}
@@ -157,28 +164,29 @@ func loadFromMap(m map[string]string) (*Config, error) {
 	}
 
 	return &Config{
-		HTTPAddress:        addr,
-		BaseURL:            strings.TrimRight(m["BASE_URL"], "/"),
-		Env:                m["ENV"],
-		Services:           svcs,
-		AllowedEmail:       m["ALLOWED_EMAIL"],
-		OIDCIssuerExternal: strings.TrimRight(m["OIDC_ISSUER_EXTERNAL"], "/"),
-		OIDCIssuerInternal: strings.TrimRight(m["OIDC_ISSUER_INTERNAL"], "/"),
-		OIDCClientID:       m["OIDC_CLIENT_ID"],
-		OIDCClientSecret:   m["OIDC_CLIENT_SECRET"],
-		SessionSecret:      []byte(m["SESSION_SECRET"]),
-		ArgoCDNamespace:    ns,
-		GitHubOrg:          org,
-		RepoOverrides:      overrides,
-		StagingURLs:        stagingURLs,
-		ProdURLs:           prodURLs,
-		GCPProject:         m["GCP_PROJECT"],
-		DisplayLocation:    loc,
-		PreviewServices:    previewServices,
-		NeonProjects:       neonProjects,
-		GitHubToken:        m["GITHUB_TOKEN"],
-		NeonAPIKey:         m["NEON_API_KEY"],
-		PreviewAPIToken:    m["PREVIEW_API_TOKEN"],
+		HTTPAddress:          addr,
+		BaseURL:              strings.TrimRight(m["BASE_URL"], "/"),
+		Env:                  m["ENV"],
+		Services:             svcs,
+		AllowedEmail:         m["ALLOWED_EMAIL"],
+		OIDCIssuerExternal:   strings.TrimRight(m["OIDC_ISSUER_EXTERNAL"], "/"),
+		OIDCIssuerInternal:   strings.TrimRight(m["OIDC_ISSUER_INTERNAL"], "/"),
+		OIDCClientID:         m["OIDC_CLIENT_ID"],
+		OIDCClientSecret:     m["OIDC_CLIENT_SECRET"],
+		SessionSecret:        []byte(m["SESSION_SECRET"]),
+		ArgoCDNamespace:      ns,
+		GitHubOrg:            org,
+		RepoOverrides:        overrides,
+		StagingURLs:          stagingURLs,
+		ProdURLs:             prodURLs,
+		GCPProject:           m["GCP_PROJECT"],
+		DisplayLocation:      loc,
+		PreviewServices:      previewServices,
+		NeonProjects:         neonProjects,
+		GitHubToken:          m["GITHUB_TOKEN"],
+		NeonAPIKey:           m["NEON_API_KEY"],
+		PreviewAPIToken:      m["PREVIEW_API_TOKEN"],
+		PreviewOAuthClientID: m["PREVIEW_OAUTH_CLIENT_ID"],
 	}, nil
 }
 

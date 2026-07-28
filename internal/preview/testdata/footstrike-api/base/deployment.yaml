@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: footstrike-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: footstrike-api
+  template:
+    metadata:
+      labels:
+        app: footstrike-api
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: footstrike-api
+      tolerations:
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: footstrike-api
+          image: us-central1-docker.pkg.dev/ethans-services/containers/footstrike-api:latest
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "40m"
+            limits:
+              # HAE ingestion parses multi-MB workout payloads (GPS route +
+              # per-sample arrays) into memory; each full-GPS workout is
+              # ~30-50MB once parsed, so a *bulk* upload OOM-killed the worker
+              # even at 512Mi (-> 502 at the proxy). 1Gi is interim headroom;
+              # the durable fix is streaming ingest (parse one workout at a
+              # time) so peak memory scales with a single workout, not the batch.
+              memory: "1Gi"
+              cpu: "400m"
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets"
+              readOnly: true
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true

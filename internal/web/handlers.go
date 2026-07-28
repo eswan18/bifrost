@@ -23,6 +23,13 @@ type Handlers struct {
 	Builds     gcb.Client        // nil → build badges disabled
 	TriggerIDs map[string]string // service → Cloud Build trigger ID, for pipeline links; nil → links omitted
 	Renderer   *Renderer
+	// Orch backs the mutating preview endpoints (previews_mutate.go). nil
+	// means the preview control plane's config is absent/incomplete — those
+	// endpoints answer 503 rather than running a half-wired flow. Typed as
+	// the small orchestration interface (not *preview.Orchestrator) so
+	// handler tests can supply a trivial fake instead of standing up five
+	// real clients.
+	Orch orchestration
 }
 
 // pageVM is the view model handed to every rendered template. The dashboard

@@ -1,12 +1,45 @@
 package github
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// buildTarGz builds a gzipped tar archive from name→content pairs, matching
+// the shape of a GitHub codeload tarball response.
+func buildTarGz(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for name, content := range files {
+		hdr := &tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(content)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("WriteHeader(%s): %v", name, err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("Write(%s): %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar Close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip Close: %v", err)
+	}
+	return buf.Bytes()
+}
 
 func TestBranchSHA(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,5 +118,162 @@ func TestBranchSHAMissingSHA(t *testing.T) {
 	}
 	if errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected non-ErrNoBranch error for missing SHA, got %v", err)
+	}
+}
+
+func TestFetchK8s(t *testing.T) {
+	tarball := buildTarGz(t, map[string]string{
+		"repo-sha1234/k8s/base/deployment.yaml": "kind: Deployment\n",
+		"repo-sha1234/README.md":                "hello\n",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-pat" {
+			t.Errorf("Authorization = %q, want Bearer test-pat", got)
+		}
+		if r.URL.Path != "/repos/eswan18/footstrike-api/tarball/hae-cadence" {
+			t.Errorf("path = %q, want /repos/eswan18/footstrike-api/tarball/hae-cadence", r.URL.Path)
+		}
+		_, _ = w.Write(tarball)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	files, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("len(files) = %d, want 1 (%v)", len(files), files)
+	}
+	got, ok := files["base/deployment.yaml"]
+	if !ok {
+		t.Fatalf("missing key base/deployment.yaml, got %v", files)
+	}
+	if string(got) != "kind: Deployment\n" {
+		t.Errorf("content = %q, want %q", got, "kind: Deployment\n")
+	}
+	if _, ok := files["README.md"]; ok {
+		t.Errorf("README.md should not have been extracted, got %v", files)
+	}
+}
+
+func TestFetchK8sNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.FetchK8s(context.Background(), "footstrike-api", "missing")
+	if !errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected ErrNoBranch, got %v", err)
+	}
+}
+
+func TestFetchK8sServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.FetchK8s(context.Background(), "footstrike-api", "main")
+	if err == nil || errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected non-ErrNoBranch error, got %v", err)
+	}
+}
+
+func TestFetchK8sRefWithSlash(t *testing.T) {
+	tarball := buildTarGz(t, map[string]string{
+		"repo-sha1234/k8s/a.yaml": "a: b\n",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if escaped := r.URL.EscapedPath(); escaped != "/repos/eswan18/footstrike-api/tarball/feat%2Fx" {
+			t.Errorf("EscapedPath = %q, want /repos/eswan18/footstrike-api/tarball/feat%%2Fx", escaped)
+		}
+		_, _ = w.Write(tarball)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	if _, err := c.FetchK8s(context.Background(), "footstrike-api", "feat/x"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFetchK8sExceedsExtractionCap(t *testing.T) {
+	big := strings.Repeat("x", 5*1024*1024+1)
+	tarball := buildTarGz(t, map[string]string{
+		"repo-sha1234/k8s/base/big.yaml": big,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarball)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	if err == nil {
+		t.Fatalf("expected an error for an oversized tarball, got nil")
+	}
+	if errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected non-ErrNoBranch error, got %v", err)
+	}
+}
+
+func TestFetchK8sRejectsNonCanonicalPaths(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{"path escapes the k8s subtree via ..", "repo-sha1234/k8s/../../etc/passwd"},
+		{"decoy would collapse onto a sibling entry", "repo-sha1234/k8s/base/sub/../x.yaml"},
+		{"bare dot-dot escapes one level above k8s/", "repo-sha1234/k8s/.."},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tarball := buildTarGz(t, map[string]string{
+				tt.entry: "malicious\n",
+			})
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(tarball)
+			}))
+			defer srv.Close()
+			c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+			_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+			if err == nil {
+				t.Fatalf("expected an error for entry %q, got nil", tt.entry)
+			}
+			if !strings.Contains(err.Error(), tt.entry) {
+				t.Errorf("error = %q, want it to mention the offending path %q", err.Error(), tt.entry)
+			}
+		})
+	}
+}
+
+func TestFetchK8sAggregateCapAcrossEntries(t *testing.T) {
+	// Three files, each under the 5MB single-file cap, whose combined size
+	// exceeds it — the budget must be shared across entries, not reset per
+	// entry.
+	const perFileBytes = 2 * 1024 * 1024
+	content := strings.Repeat("y", perFileBytes)
+	tarball := buildTarGz(t, map[string]string{
+		"repo-sha1234/k8s/a.yaml": content,
+		"repo-sha1234/k8s/b.yaml": content,
+		"repo-sha1234/k8s/c.yaml": content,
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(tarball)
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+
+	_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	if err == nil {
+		t.Fatalf("expected an error when combined entry sizes exceed the extraction cap, got nil")
+	}
+	if errors.Is(err, ErrNoBranch) {
+		t.Errorf("expected non-ErrNoBranch error, got %v", err)
 	}
 }

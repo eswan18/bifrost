@@ -2,7 +2,9 @@ package kube
 
 import (
 	"context"
+	"sync"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -12,6 +14,11 @@ type client struct {
 	typed  kubernetes.Interface
 	dyn    dynamic.Interface
 	argoNS string
+
+	// mapper is the RESTMapper ApplyObjects resolves lazily and caches here
+	// (see restMapper in apply.go).
+	mapperMu sync.Mutex
+	mapper   meta.RESTMapper
 }
 
 type ContainerInfo struct {
