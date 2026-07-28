@@ -22,7 +22,7 @@
     {{range .Jobs.Jobs}}
     <div class="jobs-grid jobs-row">
       <span class="w6 job-app">{{.App}}</span>
-      <span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span>
+      <span class="mono">{{.Name}} <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span></span>
       <span>{{template "job-sha" .}}</span>
       <span class="{{.StateClass}} w6">{{.StateLabel}}</span>
       <span class="c-mut"{{if not .LastRunTime.IsZero}} title="{{abstime .LastRunTime}}"{{end}}>{{.LastLabel}}</span>
@@ -36,7 +36,7 @@
   <div class="jobs-mobile">
     {{range .Jobs.Jobs}}
     <div class="job-card">
-      <div class="job-card-top"><span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
+      <div class="job-card-top"><span class="mono">{{.Name}} <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
       <div class="c-mut job-card-meta">{{.App}} · {{template "job-sha" .}} · last {{.LastLabel}} · next {{.Next}}</div>
     </div>
     {{else}}

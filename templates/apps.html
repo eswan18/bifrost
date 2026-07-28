@@ -24,7 +24,7 @@
         <div class="jobsub-grid jobsub-head"><span>JOB</span><span>STATE</span><span>LAST RUN</span><span>NEXT RUN</span></div>
         {{range .Jobs}}
         <div class="jobsub-grid jobsub-row">
-          <span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span>
+          <span class="mono">{{.Name}} <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span></span>
           <span class="{{.StateClass}} w6">{{.StateLabel}}</span>
           <span class="c-mut"{{if not .LastRunTime.IsZero}} title="{{abstime .LastRunTime}}"{{end}}>{{.LastLabel}}</span>
           <span class="c-mut">{{.Next}}</span>
@@ -67,7 +67,7 @@
       <div class="job-subtable card-jobs">
         {{range .Jobs}}
         <div class="card-job">
-          <div class="card-job-top"><span class="mono">{{.Name}} <span class="micro-inline">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
+          <div class="card-job-top"><span class="mono">{{.Name}} <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span></span><span class="{{.StateClass}} w6">{{.StateLabel}}</span></div>
           <div class="c-mut card-job-meta">last {{.LastLabel}} · next {{.Next}}</div>
         </div>
         {{end}}

@@ -73,8 +73,8 @@ func TestDeriveEnvArgoDoesNotOverrideCrash(t *testing.T) {
 func TestDeriveOverviewRecentFailuresWindow(t *testing.T) {
 	now := time.Now()
 	f := &fleet{Jobs: []jobView{
-		{App: "foo", Name: "old-fail", State: "failed", EnvLabel: "prod", LastRunTime: now.Add(-5 * 24 * time.Hour)},
-		{App: "foo", Name: "recent-fail", State: "failed", EnvLabel: "prod", LastRunTime: now.Add(-2 * time.Hour)},
+		{App: "foo", Name: "old-fail", State: "failed", EnvLabel: "prod", EnvClass: "env-prod", LastRunTime: now.Add(-5 * 24 * time.Hour)},
+		{App: "foo", Name: "recent-fail", State: "failed", EnvLabel: "prod", EnvClass: "env-prod", LastRunTime: now.Add(-2 * time.Hour)},
 	}}
 	f.deriveOverview(now)
 
@@ -84,9 +84,24 @@ func TestDeriveOverviewRecentFailuresWindow(t *testing.T) {
 	if f.Overview.Failed[0].Name != "recent-fail" {
 		t.Errorf("Failed[0] = %q, want recent-fail", f.Overview.Failed[0].Name)
 	}
+	if f.Overview.Failed[0].EnvClass != "env-prod" {
+		t.Errorf("Failed[0].EnvClass = %q, want env-prod", f.Overview.Failed[0].EnvClass)
+	}
 	// Fleet-wide counts stay unbounded: both failures still count.
 	if f.JobIssues != 2 {
 		t.Errorf("JobIssues = %d, want 2 (counts are unbounded, only the column is windowed)", f.JobIssues)
+	}
+}
+
+// --- env badge ---------------------------------------------------------------
+
+func TestBuildJobsEnvClass(t *testing.T) {
+	raw := envRaw{cronjobs: []kube.CronJobInfo{{Name: "j", Schedule: "0 0 * * *"}}}
+	if got := buildJobs("foo", "staging", raw, "eswan18", "foo", time.Now(), time.UTC)[0].EnvClass; got != "env-stg" {
+		t.Errorf("staging EnvClass = %q, want env-stg", got)
+	}
+	if got := buildJobs("foo", "prod", raw, "eswan18", "foo", time.Now(), time.UTC)[0].EnvClass; got != "env-prod" {
+		t.Errorf("prod EnvClass = %q, want env-prod", got)
 	}
 }
 
