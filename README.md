@@ -29,6 +29,31 @@ background polling, a light/dark theme toggle, and a "refreshed Ns ago" ticker.
 The "Blueprint" theme (`static/style.css`) is hand-written from design tokens —
 there is **no CSS build step** and no Node toolchain.
 
+## Preview environments
+
+Ephemeral, per-branch environments layered onto staging. `ib preview up
+<branch>` stands up namespace `preview-<tag>` (`<tag>` = a slug of the
+branch), containing only the services declared in
+`internal/preview/registry.yaml` whose repo has that branch pushed —
+everything else a preview app talks to resolves cross-namespace to shared
+staging.
+
+    ib preview list                     # table of preview environments
+    ib preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
+    ib preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
+
+Lifecycle: membership by branch name -> each member's `{repo}-preview-build`
+Cloud Build trigger runs (manual-only, no push trigger) -> a `preview-<tag>`
+Neon branch for any member the registry gives a database reference -> its
+manifests are rendered from the registry's env templates and applied -> the
+namespace's `bifrost/phase` annotation moves `creating` -> `ready` (or
+`failed`, with `bifrost/error` set to the cause).
+
+Preview apps are reachable at `https://{app}-<tag>.preview.footstrike.run`,
+tailnet-only via the same shared Tailscale LB + nginx ingress class staging
+uses. Full runbook — including how to onboard a new previewable app — is in
+`docs/preview-environments.md`.
+
 ## Architecture
 
 A single Go binary in-cluster. Reads pod images across `<app>-{staging,prod}`
