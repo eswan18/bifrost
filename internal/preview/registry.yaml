@@ -1,0 +1,33 @@
+# Previewable services. Adding one here + a cloudbuild-preview.yaml and
+# {repo}-preview-build trigger in its repo is the whole onboarding path —
+# no Go changes. Templates: {{ url X }} is X's preview URL when X is part of
+# this preview, else X's staging URL; {{ internalUrl X }} is in-cluster DNS
+# (preview namespace when X is a member, else X's staging namespace);
+# {{ config KEY }} is an operator-supplied value from bifrost's config.
+# Neon references live here and never come from the branch under test.
+footstrike-api:
+  neon:
+    project: aged-river-81935268
+    database: neondb
+    role: neondb_owner
+  env:
+    ENV: staging
+    PUBLIC_API_BASE_URL: "{{ url self }}"
+    PUBLIC_DASHBOARD_BASE_URL: "{{ url footstrike-dashboard }}"
+    IDENTITY_PROVIDER_URL: "{{ internalUrl identity }}"
+    JWT_ISSUER: "{{ url identity }}"
+
+footstrike-dashboard:
+  env:
+    APP_API_URL: "{{ url footstrike-api }}"
+    APP_IDENTITY_URL: "{{ url identity }}"
+    APP_OAUTH_CLIENT_ID: "{{ config previewOAuthClientID }}"
+  required: [APP_API_URL, APP_IDENTITY_URL, APP_OAUTH_CLIENT_ID]
+
+identity:
+  neon:
+    project: plain-heart-27630935
+    database: neondb
+    role: app
+  env:
+    JWT_ISSUER: "{{ url self }}"
