@@ -70,7 +70,8 @@ type buildView struct {
 type jobView struct {
 	App       string
 	Env       string // "staging" | "prod"
-	EnvLabel  string // "stg" | "prod" micro-label
+	EnvLabel  string // "stg" | "prod" badge text
+	EnvClass  string // "env-stg" | "env-prod" badge modifier class
 	Name      string
 	Image     string
 	SHA       string
@@ -178,6 +179,7 @@ type attentionItem struct {
 type overviewJob struct {
 	Name     string
 	EnvLabel string
+	EnvClass string
 	Meta     string
 }
 
@@ -608,6 +610,7 @@ func buildJobs(app, env string, raw envRaw, org, repo string, now time.Time, loc
 			App:       app,
 			Env:       env,
 			EnvLabel:  envMicro(env),
+			EnvClass:  envClass(env),
 			Name:      cj.Name,
 			Suspended: cj.Suspended,
 		}
@@ -704,6 +707,15 @@ func envMicro(env string) string {
 		return "stg"
 	}
 	return "prod"
+}
+
+// envClass picks the env badge's modifier class: staging stays muted, prod
+// stands out in amber.
+func envClass(env string) string {
+	if env == "staging" {
+		return "env-stg"
+	}
+	return "env-prod"
 }
 
 func latestJobFor(cron string, jobs []kube.JobInfo) *kube.JobInfo {
@@ -944,6 +956,7 @@ func (f *fleet) deriveOverview(now time.Time) {
 			o.Running = append(o.Running, overviewJob{
 				Name:     j.Name,
 				EnvLabel: j.EnvLabel,
+				EnvClass: j.EnvClass,
 				Meta:     j.App + " " + j.EnvLabel + " · running for " + j.RunningFor,
 			})
 		case "failed":
@@ -955,6 +968,7 @@ func (f *fleet) deriveOverview(now time.Time) {
 			o.Failed = append(o.Failed, overviewJob{
 				Name:     j.Name,
 				EnvLabel: j.EnvLabel,
+				EnvClass: j.EnvClass,
 				Meta:     j.App + " " + j.EnvLabel + " · " + j.LastRunLabel + " · " + orDash(j.Detail),
 			})
 		}
@@ -977,6 +991,7 @@ func (f *fleet) deriveOverview(now time.Time) {
 		o.NextRuns = append(o.NextRuns, overviewJob{
 			Name:     j.Name,
 			EnvLabel: j.EnvLabel,
+			EnvClass: j.EnvClass,
 			Meta:     j.App + " · " + stripToday(j.Next),
 		})
 	}

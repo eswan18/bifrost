@@ -1032,7 +1032,7 @@ func TestJobsAssembly(t *testing.T) {
 	body := rec.Body.String()
 	for _, want := range []string{
 		"nightly", "cleanup",
-		`class="micro-inline">stg`, `class="micro-inline">prod`, // env micro-labels
+		`class="env-badge env-stg">stg`, `class="env-badge env-prod">prod`, // env badges
 		"✗ Failed", "exit 137 (OOMKilled)", // failed job: exit code + terminated reason from its pod
 		"✓ Succeeded", "1m 30s", // completed duration
 		"Jan 1 14:00", // next run

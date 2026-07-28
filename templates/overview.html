@@ -39,7 +39,7 @@
       <div class="sec-label">RUNNING NOW</div>
       <div class="col-list">
         {{range .Overview.Running}}
-        <div><span class="mono c-blu">◌ {{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
+        <div><span class="mono c-blu">◌ {{.Name}}</span> <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
         {{else}}
         <span class="c-faint">none</span>
         {{end}}
@@ -49,7 +49,7 @@
       <div class="sec-label">RECENT FAILURES</div>
       <div class="col-list">
         {{range .Overview.Failed}}
-        <div><span class="mono c-red">✗ {{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
+        <div><span class="mono c-red">✗ {{.Name}}</span> <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span><div class="col-meta">{{.Meta}}</div></div>
         {{else}}
         <span class="c-faint">none in the last 24h</span>
         {{end}}
@@ -59,7 +59,7 @@
       <div class="sec-label">NEXT RUNS</div>
       <div class="col-list">
         {{range .Overview.NextRuns}}
-        <div class="nextrun"><span><span class="mono">{{.Name}}</span> <span class="micro-inline">{{.EnvLabel}}</span></span><span class="c-mut">{{.Meta}}</span></div>
+        <div class="nextrun"><span><span class="mono">{{.Name}}</span> <span class="env-badge {{.EnvClass}}">{{.EnvLabel}}</span></span><span class="c-mut">{{.Meta}}</span></div>
         {{else}}
         <span class="c-faint">none</span>
         {{end}}

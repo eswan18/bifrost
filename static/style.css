@@ -105,7 +105,13 @@ button { font-family: inherit; }
 .dot-amb { background: var(--amb); }
 .dot-cur { background: currentColor; width: 7px; height: 7px; }
 
-.micro-inline { font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: .12em; color: var(--faint); text-transform: uppercase; }
+.env-badge {
+  font-family: 'IBM Plex Mono', monospace; font-size: 9.5px; letter-spacing: .12em;
+  text-transform: uppercase; border: 1px solid; border-radius: 4px;
+  padding: 1px 5px; vertical-align: 1px; white-space: nowrap;
+}
+.env-stg { color: var(--mut); border-color: var(--line); }
+.env-prod { color: var(--amb); border-color: currentColor; }
 
 .hash { text-decoration: underline dotted var(--faint); text-underline-offset: 3px; color: inherit; }
 .hash:hover { text-decoration: underline solid var(--faint); text-underline-offset: 3px; }
