@@ -87,22 +87,23 @@ rules:
     verbs: ["get", "create", "update"]
   # ApplyObjects server-side-applies every rendered preview manifest
   # (fieldManager "bifrost-preview", Force: true) into the preview
-  # namespace. SSA is a PATCH under the hood and additionally needs
-  # "create" for objects that don't exist yet; "get" is included so this
-  # role stays self-contained for the only kinds it writes. These are
-  # exactly the kinds render.go produces — see internal/preview/render.go.
+  # namespace via a single PATCH per object (applyOne/ri.Apply) — it never
+  # Gets these kinds first, so no "get" is granted here. "patch" covers the
+  # SSA request itself; "create" covers first-apply on objects that don't
+  # exist yet. These are exactly the kinds render.go produces — see
+  # internal/preview/render.go and applyOne in internal/kube/apply.go.
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "patch", "create"]
+    verbs: ["patch", "create"]
   - apiGroups: [""]
     resources: ["services", "configmaps"]
-    verbs: ["get", "patch", "create"]
+    verbs: ["patch", "create"]
   - apiGroups: ["batch"]
     resources: ["cronjobs"]
-    verbs: ["get", "patch", "create"]
+    verbs: ["patch", "create"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
-    verbs: ["get", "patch", "create"]
+    verbs: ["patch", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
