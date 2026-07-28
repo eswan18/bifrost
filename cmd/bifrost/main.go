@@ -52,6 +52,17 @@ func main() {
 		log.Fatalf("kube: %v", err)
 	}
 
+	// registry.yaml is embedded, so a parse failure here is a build-time
+	// invariant violation (a bad commit to the registry itself), not a
+	// runtime/environment condition — fail loudly rather than silently
+	// disabling the preview control plane. Loaded unconditionally (not just
+	// when GCPProject/preview deps are present) since it's also the source
+	// of which services are previewable at all, used below.
+	reg, err := preview.LoadRegistry()
+	if err != nil {
+		log.Fatalf("preview registry: %v", err)
+	}
+
 	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	oidcClient, err := auth.NewOIDC(oidcCtx,
 		cfg.OIDCIssuerExternal, cfg.OIDCIssuerInternal,
@@ -107,8 +118,8 @@ func main() {
 					triggerIDs[svc] = id
 				}
 			}
-			previewTriggerIDs = make(map[string]string, len(cfg.PreviewServices))
-			for _, svc := range cfg.PreviewServices {
+			previewTriggerIDs = make(map[string]string, len(reg))
+			for _, svc := range reg.Names() {
 				if id, ok := names[svc+"-preview-build"]; ok {
 					previewTriggerIDs[svc+"-preview-build"] = id
 				}
@@ -134,18 +145,10 @@ func main() {
 	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
 	// The preview orchestrator needs every one of its dependencies present —
-	// partial config (e.g. a GitHub token but no Neon key, or no preview
-	// services configured at all) leaves webH.Orch nil, and the mutating
-	// preview endpoints answer 503 rather than running a half-wired flow.
-	if kc != nil && builds != nil && ghClient != nil && neonClient != nil && len(cfg.PreviewServices) > 0 {
-		// registry.yaml is embedded, so a parse failure here is a build-time
-		// invariant violation (a bad commit to the registry itself), not a
-		// runtime/environment condition — fail loudly rather than silently
-		// disabling the preview control plane.
-		reg, err := preview.LoadRegistry()
-		if err != nil {
-			log.Fatalf("preview registry: %v", err)
-		}
+	// partial config (e.g. a GitHub token but no Neon key, or an empty
+	// registry) leaves webH.Orch nil, and the mutating preview endpoints
+	// answer 503 rather than running a half-wired flow.
+	if kc != nil && builds != nil && ghClient != nil && neonClient != nil && len(reg) > 0 {
 		webH.Orch = &preview.Orchestrator{
 			Cfg:        cfg,
 			Kube:       kc,

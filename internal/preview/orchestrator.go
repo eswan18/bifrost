@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -204,12 +203,13 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 	return cause
 }
 
-// resolveMembers determines which of Cfg.PreviewServices have branch pushed
-// to their repo: ErrNoBranch means "not a member", any other error aborts
-// the whole run (we can't tell membership, so we can't safely proceed).
+// resolveMembers determines which of the registry's previewable services
+// have branch pushed to their repo: ErrNoBranch means "not a member", any
+// other error aborts the whole run (we can't tell membership, so we can't
+// safely proceed).
 func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]string, error) {
 	var members []string
-	for _, svc := range o.Cfg.PreviewServices {
+	for _, svc := range o.Registry.Names() {
 		_, err := o.GitHub.BranchSHA(ctx, o.Cfg.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
@@ -274,17 +274,18 @@ func (o *Orchestrator) awaitBuild(ctx context.Context, buildID string) (string, 
 }
 
 // branchNeonDatabases ensures a preview-<tag> Neon branch exists for every
-// member with a configured NeonProjectRef, returning each one's connection
-// URI. Errors are wrapped without ever including the URI itself (it's a
-// secret) — only service/project identifiers appear in the returned error.
+// member with a registry-declared Neon reference, returning each one's
+// connection URI. Errors are wrapped without ever including the URI itself
+// (it's a secret) — only service/project identifiers appear in the returned
+// error.
 func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, members []string) (map[string]string, error) {
 	dbURIs := make(map[string]string, len(members))
 	for _, svc := range members {
-		ref, ok := o.Cfg.NeonProjects[svc]
-		if !ok {
+		ref := o.Registry[svc].Neon
+		if ref == nil {
 			continue
 		}
-		uri, err := o.ensureNeonBranch(ctx, ref, tag)
+		uri, err := o.ensureNeonBranch(ctx, *ref, tag)
 		if err != nil {
 			return nil, fmt.Errorf("neon branch for %s: %w", svc, err)
 		}
@@ -293,11 +294,11 @@ func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, memb
 	return dbURIs, nil
 }
 
-// ensureNeonBranch finds (or creates) projectID's preview-<tag> branch and
-// returns its connection URI for ref's database/role.
-func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProjectRef, tag string) (string, error) {
+// ensureNeonBranch finds (or creates) ref's project's preview-<tag> branch
+// and returns its connection URI for ref's database/role.
+func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (string, error) {
 	branchName := "preview-" + tag
-	branches, err := o.Neon.ListBranches(ctx, ref.ProjectID)
+	branches, err := o.Neon.ListBranches(ctx, ref.Project)
 	if err != nil {
 		return "", fmt.Errorf("listing branches: %w", err)
 	}
@@ -309,13 +310,13 @@ func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProj
 		}
 	}
 	if branchID == "" {
-		created, err := o.Neon.CreateBranch(ctx, ref.ProjectID, branchName, "")
+		created, err := o.Neon.CreateBranch(ctx, ref.Project, branchName, "")
 		if err != nil {
 			return "", fmt.Errorf("creating branch: %w", err)
 		}
 		branchID = created.ID
 	}
-	uri, err := o.Neon.ConnectionURI(ctx, ref.ProjectID, branchID, ref.Database, ref.Role)
+	uri, err := o.Neon.ConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.Role)
 	if err != nil {
 		return "", fmt.Errorf("fetching connection uri: %w", err)
 	}
@@ -327,7 +328,7 @@ func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProj
 // plus the shared wildcard TLS cert every preview namespace needs.
 func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []string, dbURIs map[string]string) error {
 	for _, svc := range members {
-		if _, ok := o.Cfg.NeonProjects[svc]; !ok {
+		if o.Registry[svc].Neon == nil {
 			continue
 		}
 		overrides := map[string][]byte{"DATABASE_URL": []byte(dbURIs[svc])}
@@ -362,7 +363,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 			return err
 		}
 		secretName := ""
-		if _, ok := o.Cfg.NeonProjects[svc]; ok {
+		if o.Registry[svc].Neon != nil {
 			secretName = previewSecretName(svc)
 		}
 		objs, err := Render(RenderInput{
@@ -386,11 +387,12 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 func previewSecretName(svc string) string { return svc + "-preview-secrets" }
 
 // Down tears tag's preview down: delete its namespace, then best-effort
-// delete a preview-<tag> Neon branch from every *configured* NeonProjectRef —
-// not just the tag's current members, since a re-created preview may have
-// changed its membership since the branch was created, and Down has no other
-// way to know which projects to check. Every step is attempted regardless of
-// earlier failures; all errors are joined and returned.
+// delete a preview-<tag> Neon branch from every registry service that
+// declares a Neon reference — not just the tag's current members, since a
+// re-created preview may have changed its membership since the branch was
+// created, and Down has no other way to know which projects to check. Every
+// step is attempted regardless of earlier failures; all errors are joined
+// and returned.
 func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 	if !o.acquire(tag) {
 		return ErrBusy
@@ -402,16 +404,15 @@ func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 		errs = append(errs, fmt.Errorf("delete namespace: %w", err))
 	}
 
-	svcs := make([]string, 0, len(o.Cfg.NeonProjects))
-	for svc := range o.Cfg.NeonProjects {
-		svcs = append(svcs, svc)
-	}
-	sort.Strings(svcs) // deterministic order for logs/tests; map order is not
+	svcs := o.Registry.Names() // already sorted: deterministic order for logs/tests
 
 	branchName := "preview-" + tag
 	for _, svc := range svcs {
-		ref := o.Cfg.NeonProjects[svc]
-		branches, err := o.Neon.ListBranches(ctx, ref.ProjectID)
+		ref := o.Registry[svc].Neon
+		if ref == nil {
+			continue
+		}
+		branches, err := o.Neon.ListBranches(ctx, ref.Project)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("neon list branches for %s: %w", svc, err))
 			continue
@@ -420,7 +421,7 @@ func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 			if b.Name != branchName {
 				continue
 			}
-			if err := o.Neon.DeleteBranch(ctx, ref.ProjectID, b.ID); err != nil {
+			if err := o.Neon.DeleteBranch(ctx, ref.Project, b.ID); err != nil {
 				errs = append(errs, fmt.Errorf("neon delete branch for %s: %w", svc, err))
 			}
 			break

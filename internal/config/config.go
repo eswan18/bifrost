@@ -7,13 +7,6 @@ import (
 	"time"
 )
 
-// NeonProjectRef locates one service's database for preview branching.
-type NeonProjectRef struct {
-	ProjectID string
-	Database  string
-	Role      string
-}
-
 type Config struct {
 	HTTPAddress        string
 	BaseURL            string
@@ -35,11 +28,12 @@ type Config struct {
 	// operator's local time; the cluster and cron schedules run in UTC.
 	DisplayLocation *time.Location
 	// Preview control plane (all optional; empty disables preview features).
-	PreviewServices []string                  // services eligible for preview environments
-	NeonProjects    map[string]NeonProjectRef // service -> Neon project/db/role for DB branching
-	GitHubToken     string                    // PAT for branch lookups on private repos
-	NeonAPIKey      string                    // Neon API key for branch create/delete
-	PreviewAPIToken string                    // static bearer token for the preview API (CLI use)
+	// Which services are previewable, and their Neon references, live in the
+	// registry (see internal/preview/registry.go), not here — these are just
+	// the secrets/tokens the orchestrator needs to act on it.
+	GitHubToken     string // PAT for branch lookups on private repos
+	NeonAPIKey      string // Neon API key for branch create/delete
+	PreviewAPIToken string // static bearer token for the preview API (CLI use)
 	// PreviewOAuthClientID is the OAuth client the preview dashboard's
 	// APP_OAUTH_CLIENT_ID resolves to (the wildcard-registered staging
 	// dashboard client — see the 3c orchestration plan). Optional; empty
@@ -67,7 +61,7 @@ func Load() (*Config, error) {
 		"SESSION_SECRET", "ARGOCD_NAMESPACE",
 		"GITHUB_ORG", "REPO_OVERRIDES", "GCP_PROJECT",
 		"STAGING_URLS", "PROD_URLS", "DISPLAY_TIMEZONE",
-		"PREVIEW_SERVICES", "NEON_PROJECTS", "GITHUB_TOKEN", "NEON_API_KEY", "PREVIEW_API_TOKEN",
+		"GITHUB_TOKEN", "NEON_API_KEY", "PREVIEW_API_TOKEN",
 		"PREVIEW_OAUTH_CLIENT_ID",
 	} {
 		m[k] = os.Getenv(k)
@@ -132,28 +126,6 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		return nil, err
 	}
 
-	var previewServices []string
-	for _, s := range strings.Split(m["PREVIEW_SERVICES"], ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			previewServices = append(previewServices, s)
-		}
-	}
-	neonPairs, err := parsePairs(m["NEON_PROJECTS"], "NEON_PROJECTS")
-	if err != nil {
-		return nil, err
-	}
-	neonProjects := map[string]NeonProjectRef{}
-	if len(neonPairs) > 0 {
-		neonProjects = make(map[string]NeonProjectRef, len(neonPairs))
-		for svc, ref := range neonPairs {
-			parts := strings.Split(ref, "/")
-			if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-				return nil, fmt.Errorf("NEON_PROJECTS entry %q is not projectID/database/role", svc+"="+ref)
-			}
-			neonProjects[svc] = NeonProjectRef{ProjectID: parts[0], Database: parts[1], Role: parts[2]}
-		}
-	}
-
 	tz := m["DISPLAY_TIMEZONE"]
 	if tz == "" {
 		tz = "America/New_York"
@@ -181,8 +153,6 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		ProdURLs:             prodURLs,
 		GCPProject:           m["GCP_PROJECT"],
 		DisplayLocation:      loc,
-		PreviewServices:      previewServices,
-		NeonProjects:         neonProjects,
 		GitHubToken:          m["GITHUB_TOKEN"],
 		NeonAPIKey:           m["NEON_API_KEY"],
 		PreviewAPIToken:      m["PREVIEW_API_TOKEN"],

@@ -341,10 +341,6 @@ type testDeps struct {
 func newTwoMemberDeps(t *testing.T) *testDeps {
 	t.Helper()
 	cfg := &config.Config{
-		PreviewServices: []string{"footstrike-api", "footstrike-dashboard", "identity"},
-		NeonProjects: map[string]config.NeonProjectRef{
-			"footstrike-api": {ProjectID: "proj-api", Database: "fitnessdb", Role: "fitness_owner"},
-		},
 		PreviewOAuthClientID: "preview-client-id",
 		StagingURLs: map[string]string{
 			"identity": "https://identity-staging.tailc06f30.ts.net",
@@ -436,7 +432,7 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 		}
 	}
 
-	// footstrike-api (has a NeonProjectRef) gets its secret copied with a
+	// footstrike-api (has a registry Neon ref) gets its secret copied with a
 	// DATABASE_URL override; the dashboard (no ref) does not. Plus one
 	// wildcard TLS copy, always.
 	if len(d.kube.copySecretCalls) != 2 {
@@ -447,7 +443,8 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 		apiCall.dstNS != ns || apiCall.dstName != "footstrike-api-preview-secrets" {
 		t.Errorf("api secret copy = %+v, unexpected shape", apiCall)
 	}
-	wantURI := "postgres://preview:fakesecret@proj-api/fitnessdb"
+	// footstrike-api's Neon project/database in the real registry: see registry.yaml.
+	wantURI := "postgres://preview:fakesecret@aged-river-81935268/neondb"
 	if string(apiCall.overrides["DATABASE_URL"]) != wantURI {
 		t.Errorf("DATABASE_URL override = %q, want %q", apiCall.overrides["DATABASE_URL"], wantURI)
 	}
@@ -458,9 +455,9 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 	}
 
 	// The Neon branch was actually created for footstrike-api's project.
-	branches := d.neon.branches["proj-api"]
+	branches := d.neon.branches["aged-river-81935268"]
 	if len(branches) != 1 || branches[0].Name != "preview-hae-cadence" {
-		t.Errorf("proj-api branches = %+v, want exactly one named preview-hae-cadence", branches)
+		t.Errorf("aged-river-81935268 branches = %+v, want exactly one named preview-hae-cadence", branches)
 	}
 }
 
@@ -506,8 +503,8 @@ func TestUpIsIdempotentOnRerun(t *testing.T) {
 	if ns.annotations["bifrost/phase"] != "ready" {
 		t.Errorf("bifrost/phase after rerun = %q, want ready", ns.annotations["bifrost/phase"])
 	}
-	if len(d.neon.branches["proj-api"]) != 1 {
-		t.Errorf("proj-api branches after rerun = %+v, want still exactly one (scan-then-create, no duplicate)", d.neon.branches["proj-api"])
+	if len(d.neon.branches["aged-river-81935268"]) != 1 {
+		t.Errorf("aged-river-81935268 branches after rerun = %+v, want still exactly one (scan-then-create, no duplicate)", d.neon.branches["aged-river-81935268"])
 	}
 }
 
@@ -536,7 +533,7 @@ func TestUpRejectsBranchWithNoUsableTag(t *testing.T) {
 
 func TestUpNeonCreateBranchFailureFailsTheRun(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	d.neon.createErr = map[string]error{"proj-api": errors.New("neon: quota exceeded")}
+	d.neon.createErr = map[string]error{"aged-river-81935268": errors.New("neon: quota exceeded")}
 
 	err := d.orch.Up(context.Background(), "hae-cadence")
 	if err == nil {
@@ -641,8 +638,8 @@ func TestUpBuildFailureSetsPhaseFailed(t *testing.T) {
 	}
 
 	// Failure happened before the Neon/secrets stages — neither should have run.
-	if len(d.neon.branches["proj-api"]) != 0 {
-		t.Errorf("proj-api branches = %+v, want none created (build failed first)", d.neon.branches["proj-api"])
+	if len(d.neon.branches["aged-river-81935268"]) != 0 {
+		t.Errorf("aged-river-81935268 branches = %+v, want none created (build failed first)", d.neon.branches["aged-river-81935268"])
 	}
 	if len(d.kube.copySecretCalls) != 0 {
 		t.Errorf("CopySecret called %d times, want 0 (build failed first)", len(d.kube.copySecretCalls))
@@ -701,7 +698,6 @@ func TestUpPollsMultipleTimesBeforeSucceeding(t *testing.T) {
 
 func TestUpDashboardWithoutClientIDErrors(t *testing.T) {
 	cfg := &config.Config{
-		PreviewServices: []string{"footstrike-api", "footstrike-dashboard", "identity"},
 		StagingURLs: map[string]string{
 			"footstrike-api": "https://api.staging.footstrike.run",
 			"identity":       "https://identity-staging.tailc06f30.ts.net",
@@ -760,8 +756,8 @@ func TestUpAbortsOnNonNotFoundMembershipError(t *testing.T) {
 // contain any trace of it.
 func TestUpNeonSecretNeverLeaksIntoErrorAnnotation(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	const secretURI = "postgres://realuser:hunter2@proj-api.neon.tech/fitnessdb"
-	d.neon.connURI = map[string]string{"proj-api": secretURI}
+	const secretURI = "postgres://realuser:hunter2@aged-river-81935268.neon.tech/fitnessdb"
+	d.neon.connURI = map[string]string{"aged-river-81935268": secretURI}
 	d.kube.copySecretErr = errors.New("secret copy: connection refused")
 
 	err := d.orch.Up(context.Background(), "hae-cadence")
@@ -817,11 +813,9 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 // ---- Down -----------------------------------------------------------------
 
 func TestDownDeletesNamespaceAndBestEffortDeletesNeonBranches(t *testing.T) {
-	cfg := &config.Config{
-		NeonProjects: map[string]config.NeonProjectRef{
-			"footstrike-api": {ProjectID: "proj-api", Database: "fitnessdb", Role: "fitness_owner"},
-			"identity":       {ProjectID: "proj-identity", Database: "identitydb", Role: "identity_owner"},
-		},
+	reg := Registry{
+		"footstrike-api": {Neon: &NeonRef{Project: "proj-api", Database: "fitnessdb", Role: "fitness_owner"}},
+		"identity":       {Neon: &NeonRef{Project: "proj-identity", Database: "identitydb", Role: "identity_owner"}},
 	}
 	kc := newFakeKube()
 	kc.namespaces["preview-hae-cadence"] = &fakeNamespace{
@@ -837,7 +831,7 @@ func TestDownDeletesNamespaceAndBestEffortDeletesNeonBranches(t *testing.T) {
 		// attempted (best-effort, not fail-fast).
 		listErr: map[string]error{"proj-api": errors.New("neon: proj-api unavailable")},
 	}
-	o := &Orchestrator{Cfg: cfg, Kube: kc, Neon: nc}
+	o := &Orchestrator{Kube: kc, Neon: nc, Registry: reg}
 
 	err := o.Down(context.Background(), "hae-cadence")
 	if err == nil {
@@ -863,16 +857,14 @@ func TestDownChecksEveryConfiguredNeonProjectNotJustCurrentMembers(t *testing.T)
 	// scope itself to "current members" even if it wanted to, which is
 	// exactly the point: a re-created preview may have changed which
 	// services it includes since a stray branch was created for one of them.
-	cfg := &config.Config{
-		NeonProjects: map[string]config.NeonProjectRef{
-			"identity": {ProjectID: "proj-identity", Database: "identitydb", Role: "identity_owner"},
-		},
+	reg := Registry{
+		"identity": {Neon: &NeonRef{Project: "proj-identity", Database: "identitydb", Role: "identity_owner"}},
 	}
 	kc := newFakeKube()
 	nc := &fakeNeon{branches: map[string][]neon.Branch{
 		"proj-identity": {{ID: "br-1", Name: "preview-orphan"}},
 	}}
-	o := &Orchestrator{Cfg: cfg, Kube: kc, Neon: nc}
+	o := &Orchestrator{Kube: kc, Neon: nc, Registry: reg}
 
 	if err := o.Down(context.Background(), "orphan"); err != nil {
 		t.Fatalf("Down failed: %v", err)
@@ -883,15 +875,13 @@ func TestDownChecksEveryConfiguredNeonProjectNotJustCurrentMembers(t *testing.T)
 }
 
 func TestDownDeleteNamespaceFailureStillAttemptsNeonCleanup(t *testing.T) {
-	cfg := &config.Config{
-		NeonProjects: map[string]config.NeonProjectRef{
-			"footstrike-api": {ProjectID: "proj-api", Database: "fitnessdb", Role: "fitness_owner"},
-		},
+	reg := Registry{
+		"footstrike-api": {Neon: &NeonRef{Project: "proj-api", Database: "fitnessdb", Role: "fitness_owner"}},
 	}
 	kc := newFakeKube()
 	kc.deleteErr = errors.New("namespace delete: forbidden")
 	nc := &fakeNeon{branches: map[string][]neon.Branch{"proj-api": {{ID: "br-1", Name: "preview-hae-cadence"}}}}
-	o := &Orchestrator{Cfg: cfg, Kube: kc, Neon: nc}
+	o := &Orchestrator{Kube: kc, Neon: nc, Registry: reg}
 
 	err := o.Down(context.Background(), "hae-cadence")
 	if err == nil {
@@ -906,14 +896,12 @@ func TestDownDeleteNamespaceFailureStillAttemptsNeonCleanup(t *testing.T) {
 }
 
 func TestDownNoMatchingBranchIsNotAnError(t *testing.T) {
-	cfg := &config.Config{
-		NeonProjects: map[string]config.NeonProjectRef{
-			"footstrike-api": {ProjectID: "proj-api", Database: "fitnessdb", Role: "fitness_owner"},
-		},
+	reg := Registry{
+		"footstrike-api": {Neon: &NeonRef{Project: "proj-api", Database: "fitnessdb", Role: "fitness_owner"}},
 	}
 	kc := newFakeKube()
 	nc := &fakeNeon{branches: map[string][]neon.Branch{"proj-api": {{ID: "br-1", Name: "some-other-branch"}}}}
-	o := &Orchestrator{Cfg: cfg, Kube: kc, Neon: nc}
+	o := &Orchestrator{Kube: kc, Neon: nc, Registry: reg}
 
 	if err := o.Down(context.Background(), "hae-cadence"); err != nil {
 		t.Fatalf("Down failed: %v", err)
@@ -928,7 +916,6 @@ func TestDownNoMatchingBranchIsNotAnError(t *testing.T) {
 func TestBusyMutex(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.members = map[string]bool{"footstrike-api": true} // single member, simpler
-	d.orch.Cfg.PreviewServices = []string{"footstrike-api"}
 
 	started := make(chan struct{})
 	release := make(chan struct{})
