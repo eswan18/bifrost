@@ -55,6 +55,14 @@ func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
 // deploy. This complements parseRegistry's load-time check: that only proves
 // a required key has *a* template to render; this proves the rendered value
 // is actually usable.
+//
+// Callers must draw svc from members (as every real call site does — see
+// orchestrator.go's "for _, svc := range members" loops): Eval's "{{ url
+// self }}" resolves svc == ctx.Service to its own preview URL
+// unconditionally, regardless of whether svc actually appears in members
+// (see EvalContext.Members and resolveURL in template.go). Calling this with
+// svc absent from members would silently change that service's own "self"
+// URL semantics rather than erroring.
 func envConfigFor(svc, tag string, members []string, stagingData map[string]string, cfg *config.Config, reg Registry) (map[string]string, error) {
 	data := copyStringMap(stagingData)
 

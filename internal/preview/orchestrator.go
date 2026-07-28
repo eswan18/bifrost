@@ -114,16 +114,25 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	// have every one of them resolve to a non-empty value before we touch
 	// the cluster. envConfigFor is the same function stage 6 uses to build
 	// that service's actual ConfigMap data, so this pre-check and the real
-	// computation can never disagree. stagingData is passed empty here
-	// because it hasn't been fetched yet at this point in Up -- true for
-	// every Required-key service today anyway, since footstrike-dashboard
-	// (the only one) ships no staging/configmap-env.yaml of its own.
+	// computation can never disagree AS LONG AS the Required-bearing service
+	// also has no staging baseline of its own -- true of every one today
+	// (footstrike-dashboard ships no staging/configmap-env.yaml, so passing
+	// an empty stagingData here, before it's even been fetched, matches what
+	// the real render step will see too). A future Required-key service that
+	// DOES ship a staging baseline could disagree between this pre-check
+	// (which never sees it) and the real computation (which would) -- but
+	// only in the fail-closed direction: this pre-flight would reject a
+	// preview that the real render step, with the actual baseline available,
+	// would have gone on to render successfully.
 	for _, svc := range members {
 		if len(o.Registry[svc].Required) == 0 {
 			continue
 		}
+		// envConfigFor's own error already names both the service and that
+		// it's an env-config failure ("preview: env config for %s: ..."), so
+		// this only adds the missing "which stage of Up" context.
 		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry); err != nil {
-			return fmt.Errorf("preview: Up: env config for %s: %w", svc, err)
+			return fmt.Errorf("preview: Up: pre-flight: %w", err)
 		}
 	}
 
@@ -344,9 +353,13 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		if err != nil {
 			return fmt.Errorf("parse staging env for %s: %w", svc, err)
 		}
+		// No extra wrap here: envConfigFor's own error already names both the
+		// service and the stage ("preview: env config for %s: ..."); adding
+		// another "env config for %s: %w" around it would just duplicate
+		// that segment in the bifrost/error annotation a human reads.
 		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry)
 		if err != nil {
-			return fmt.Errorf("env config for %s: %w", svc, err)
+			return err
 		}
 		secretName := ""
 		if _, ok := o.Cfg.NeonProjects[svc]; ok {

@@ -136,14 +136,17 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 		}
 	})
 
-	t.Run("absent staging file (empty map) still yields the mandatory overrides", func(t *testing.T) {
-		// PUBLIC_DASHBOARD_BASE_URL and JWT_ISSUER have nowhere to fall back
-		// to without a staging fixture, so -- unlike the old hardcoded
-		// implementation, which could never fail here -- the cascade needs an
-		// operator-configured StagingURLs fallback (exactly the config field
-		// that exists for this purpose) to still resolve when the real
-		// staging configmap is unavailable and dashboard/identity aren't
-		// members.
+	// SANCTIONED DIVERGENCE (decided 2026-07-28): PUBLIC_DASHBOARD_BASE_URL
+	// and JWT_ISSUER have nowhere to fall back to without a staging fixture,
+	// so -- unlike the old hardcoded implementation, which had no error
+	// return path at all and could never fail here -- the cascade now needs
+	// an operator-configured StagingURLs fallback (exactly the config field
+	// that exists for this purpose) to still resolve when the real staging
+	// configmap is unavailable and dashboard/identity aren't members. See the
+	// sibling subtest below for the case with no such fallback configured,
+	// which is the divergence itself: old code always produced *something*;
+	// the cascade instead errors, naming the exact unresolvable key.
+	t.Run("absent staging file (empty map) still yields the mandatory overrides, given a StagingURLs fallback", func(t *testing.T) {
 		cfg := &config.Config{StagingURLs: map[string]string{
 			"footstrike-dashboard": "https://staging.footstrike.run",
 			"identity":             "https://identity-staging.tailc06f30.ts.net",
@@ -154,6 +157,29 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 		}
 		if got["ENV"] != "staging" || got["PUBLIC_API_BASE_URL"] == "" || got["PUBLIC_DASHBOARD_BASE_URL"] == "" {
 			t.Errorf("envConfigFor with empty staging data = %v, missing mandatory overrides", got)
+		}
+	})
+
+	// SANCTIONED DIVERGENCE (decided 2026-07-28): the actual divergence the
+	// subtest above works around by configuring a StagingURLs fallback. Old
+	// footstrikeAPIEnvConfig had no error return path whatsoever -- given a
+	// completely empty stagingData and an unconfigured cfg, it still
+	// hardcoded PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER to preview or staging
+	// URLs unconditionally. The registry-driven cascade instead exhausts
+	// (footstrike-dashboard/identity aren't members, there's no baseline
+	// entry to defer to, and no cfg.StagingURLs fallback) and errors, naming
+	// the unresolvable key. This is data-reachable in production: an api
+	// branch whose k8s/ ships no staging/configmap-env.yaml at all, previewed
+	// without an operator-configured StagingURLs fallback. Controller ruling:
+	// sanctioned as correct and better -- the old path would deploy a pod
+	// with a broken/dead PUBLIC_DASHBOARD_BASE_URL or JWT_ISSUER that
+	// crash-loops or fails silently at runtime; the new cascade fails loudly
+	// at preview-creation time, before the cluster is ever touched, naming
+	// exactly which key and service is unresolvable.
+	t.Run("SANCTIONED DIVERGENCE (decided 2026-07-28): no staging baseline and no StagingURLs fallback now errors, where old code never could", func(t *testing.T) {
+		_, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api"}, map[string]string{}, &config.Config{}, testRegistry(t))
+		if err == nil {
+			t.Fatal("expected an error when PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER have no member, baseline, or StagingURLs fallback, got nil")
 		}
 	})
 }
