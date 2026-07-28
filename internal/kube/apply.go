@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -129,7 +130,20 @@ func mergeStringMaps(base, overrides map[string]string) map[string]string {
 // REST mapping is resolved via the client's cached RESTMapper (see
 // restMapper). Objects are applied in the given order; the first failure
 // aborts the rest.
-func (c *client) ApplyObjects(ctx context.Context, objs []*unstructured.Unstructured) error {
+//
+// Before anything is applied, every object is checked against two
+// containment invariants — enforced here, in code, rather than relying
+// solely on the orchestrator's RBAC grants: its namespace must equal
+// expectedNS (the run's own preview namespace) exactly, and it must not map
+// to a cluster-scoped resource. Preview manifests are rendered from
+// arbitrary fetched branches (see preview.Render); these checks are the
+// last line of defense against a rendering bug — or a future caller that
+// forgets to scope its input — writing or deleting something outside the
+// namespace a preview run is supposed to be confined to.
+func (c *client) ApplyObjects(ctx context.Context, expectedNS string, objs []*unstructured.Unstructured) error {
+	if expectedNS == "" {
+		return errors.New("apply objects: expected namespace is required")
+	}
 	mapper, err := c.restMapper()
 	if err != nil {
 		return fmt.Errorf("resolve REST mapper: %w", err)
@@ -139,6 +153,12 @@ func (c *client) ApplyObjects(ctx context.Context, objs []*unstructured.Unstruct
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
 			return fmt.Errorf("map %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
+		}
+		if mapping.Scope.Name() != meta.RESTScopeNameNamespace {
+			return fmt.Errorf("apply %s %s: cluster-scoped objects are not allowed in a preview apply", gvk.Kind, obj.GetName())
+		}
+		if ns := obj.GetNamespace(); ns != expectedNS {
+			return fmt.Errorf("apply %s %s: namespace %q does not match the run's preview namespace %q", gvk.Kind, obj.GetName(), ns, expectedNS)
 		}
 		if err := c.applyOne(ctx, mapping, obj); err != nil {
 			return fmt.Errorf("apply %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)

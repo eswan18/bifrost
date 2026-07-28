@@ -1,9 +1,13 @@
 package preview
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -437,5 +441,237 @@ spec:
 	}
 	if !strings.Contains(err.Error(), service) {
 		t.Errorf("error = %q, want it to mention the mismatched service/container name %q", err.Error(), service)
+	}
+}
+
+// TestRenderRejectsImageNameMismatch covers detectBase's other pre-flight
+// guard: a base Deployment whose container is correctly named service (so
+// the container-name guard above passes) but whose image doesn't start with
+// imageRepoBase+"/"+service+":" must be rejected before rendering. Without
+// this guard, the overlay's images: transformer (which matches by
+// repository name only, see writeOverlay) would silently no-op for this
+// container, and the preview would run under whatever tag the base has
+// pinned instead of the branch's freshly built image.
+func TestRenderRejectsImageNameMismatch(t *testing.T) {
+	const service = "mismatched-image-service"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+`),
+		"base/deployment.yaml": []byte(fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      containers:
+        - name: %s
+          image: us-central1-docker.pkg.dev/ethans-services/containers/some-other-service:latest
+`, service, service, service, service)),
+		"base/service.yaml": []byte(fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+spec:
+  selector:
+    app: %s
+  ports:
+    - port: 80
+      targetPort: 8080
+`, service, service)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  service,
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a base Deployment image that doesn't match the service, got nil")
+	}
+	wantPrefix := imageRepoBase + "/" + service + ":"
+	if !strings.Contains(err.Error(), wantPrefix) {
+		t.Errorf("error = %q, want it to mention the expected image prefix %q", err.Error(), wantPrefix)
+	}
+}
+
+// --- F1: local-only kustomize refs --------------------------------------
+//
+// The four tests below each plant one hostile reference in a fetched
+// base/kustomization.yaml and assert Render rejects it, naming the
+// offending ref in the error. TestRenderRejectsRemoteHTTPResource is the
+// discriminating one: it proves the guard fires *before* krusty gets a
+// chance to dial out, not just that Render happens to return some error.
+
+// TestRenderRejectsRemoteHTTPResource is the discriminating revert-check
+// for the SSRF this guard exists to close: without validateLocalKustomizeRefs,
+// krusty's fileloader.Load fetches an http(s) resources: entry for real, via
+// a plain &http.Client{} with no timeout and no context (Render has none to
+// give it) — this exact fixture makes the httptest server *actually receive
+// a request* on an unpatched Render. The zero-hits assertion below is what
+// makes this test meaningfully different from "Render returned an error for
+// some reason": it fails (hits > 0) if the guard is removed, proving it's
+// the guard — not a coincidental build error — that stops the fetch.
+func TestRenderRejectsRemoteHTTPResource(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: hostile\n"))
+	}))
+	defer srv.Close()
+
+	ref := srv.URL + "/hostile-resource.yaml"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a remote http kustomize resource, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Errorf("hostile server received %d requests, want 0 — Render must reject before attempting any fetch", got)
+	}
+}
+
+// TestRenderRejectsGitHubStyleBase covers kustomize's one scheme-less
+// remote shorthand (see unsafeKustomizeRef): a bare "github.com/..." base,
+// which kustomize's git loader clones without needing an explicit scheme.
+func TestRenderRejectsGitHubStyleBase(t *testing.T) {
+	const ref = "github.com/eswan18/some-other-repo/base"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+bases:
+  - %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a git-style github.com base, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+}
+
+// TestRenderRejectsAbsolutePathComponent covers the absolute-path rejection,
+// via the components: field (resources/bases/patches are covered by the
+// other tests in this group).
+func TestRenderRejectsAbsolutePathComponent(t *testing.T) {
+	const ref = "/etc/passwd"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+components:
+  - %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for an absolute-path component, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+}
+
+// TestRenderRejectsPathTraversalPatch covers the ".." traversal rejection,
+// via patches:'s object-with-a-path-field shape (as opposed to
+// resources/bases/components' bare-string shape) — pinning that the guard
+// reaches into Patch.Path, not just the plain string lists.
+func TestRenderRejectsPathTraversalPatch(t *testing.T) {
+	const ref = "../../../etc/passwd"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+patches:
+  - path: %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a path-traversal patch, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+}
+
+// TestRenderRejectsRemoteHTTPPatchesStrategicMerge covers the legacy
+// patchesStrategicMerge field specifically (a bare string list, not
+// patches:'s {path: ...} object shape) with a remote http(s) ref, pinning
+// that the guard's legacy-field coverage isn't just patchesJson6902.
+func TestRenderRejectsRemoteHTTPPatchesStrategicMerge(t *testing.T) {
+	const ref = "https://attacker.example/patch.yaml"
+	k8sFiles := map[string][]byte{
+		"base/kustomization.yaml": []byte(fmt.Sprintf(`
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+patchesStrategicMerge:
+  - %s
+`, ref)),
+	}
+
+	_, err := Render(RenderInput{
+		Service:  "hostile-service",
+		Tag:      "test-tag",
+		ShortSHA: "abc1234",
+		K8sFiles: k8sFiles,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a remote patchesStrategicMerge entry, got nil")
+	}
+	if !strings.Contains(err.Error(), ref) {
+		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
 	}
 }

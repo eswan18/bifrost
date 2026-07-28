@@ -170,7 +170,7 @@ func (f *fakeKube) AnnotateNamespace(_ context.Context, _ string, _ map[string]s
 	return nil
 }
 
-func (f *fakeKube) ApplyObjects(_ context.Context, _ []*unstructured.Unstructured) error {
+func (f *fakeKube) ApplyObjects(_ context.Context, _ string, _ []*unstructured.Unstructured) error {
 	return nil
 }
 

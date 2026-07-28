@@ -293,6 +293,10 @@ func handBuiltMapper() meta.RESTMapper {
 				"v1": {
 					{Name: "services", SingularName: "service", Namespaced: true, Kind: "Service"},
 					{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap"},
+					// Namespaced: false -- the one cluster-scoped kind in this
+					// mapper, used to exercise ApplyObjects' cluster-scope
+					// rejection (TestApplyObjectsRejectsClusterScopedMapping).
+					{Name: "namespaces", SingularName: "namespace", Namespaced: false, Kind: "Namespace"},
 				},
 			},
 		},
@@ -472,9 +476,73 @@ func TestApplyObjectsUnknownKindErrors(t *testing.T) {
 		"kind":       "FrobnicatorWidget",
 		"metadata":   map[string]any{"namespace": "preview-x", "name": "thing"},
 	}}
-	err := c.ApplyObjects(context.Background(), []*unstructured.Unstructured{obj})
+	err := c.ApplyObjects(context.Background(), "preview-x", []*unstructured.Unstructured{obj})
 	if err == nil {
 		t.Fatal("expected an error for an unmappable kind")
+	}
+}
+
+// TestApplyObjectsRejectsNamespaceMismatch pins the containment invariant
+// added alongside the expectedNS parameter: ApplyObjects must refuse to
+// apply an object whose own namespace differs from the run's preview
+// namespace, rather than trusting whatever namespace the rendered object
+// happens to carry. This is a defense-in-depth backstop for a rendering bug
+// (or a future caller) producing an object scoped outside the run's own
+// namespace — RBAC alone wouldn't catch a mistake that still targets a
+// namespace the orchestrator's ServiceAccount is permitted to write to.
+func TestApplyObjectsRejectsNamespaceMismatch(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			{Group: "", Version: "v1", Resource: "configmaps"}: "ConfigMapList",
+		},
+	)
+	c := &client{dyn: dyn, mapper: handBuiltMapper()}
+
+	obj := newConfigMap("preview-y", "app-preview-env", map[string]string{"ENV": "v"})
+	err := c.ApplyObjects(context.Background(), "preview-x", []*unstructured.Unstructured{obj})
+	if err == nil {
+		t.Fatal("expected an error for an object namespaced outside the run's preview namespace")
+	}
+	for _, want := range []string{"preview-x", "preview-y"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing context %q", err, want)
+		}
+	}
+}
+
+// TestApplyObjectsRejectsClusterScopedMapping pins the other containment
+// invariant: even an object whose GetNamespace() happens to be empty (or,
+// worse, forged to equal expectedNS) must still be rejected once its REST
+// mapping resolves to a cluster-scoped resource — a preview apply has no
+// legitimate reason to touch anything cluster-scoped, and letting one
+// through would put a namespace-scoped run in a position to mutate
+// cluster-wide state.
+//
+// The object's name is deliberately something other than expectedNS or its
+// own Kind: dynamicfake's Apply is documented above (see
+// resourceInterfaceFor) to fail on *every* call regardless of guard, and
+// that failure's message happens to echo the object's kind/name/namespace —
+// so asserting on those alone wouldn't prove this guard fired rather than
+// merely tripping over the fake's own limitation. Asserting on the literal
+// "cluster-scoped" wording only this guard's error produces is what makes
+// the discriminating revert-check for this test actually discriminate.
+func TestApplyObjectsRejectsClusterScopedMapping(t *testing.T) {
+	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), nil)
+	c := &client{dyn: dyn, mapper: handBuiltMapper()}
+
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Namespace",
+		"metadata":   map[string]any{"name": "some-other-namespace-object"},
+	}}
+	err := c.ApplyObjects(context.Background(), "preview-x", []*unstructured.Unstructured{obj})
+	if err == nil {
+		t.Fatal("expected an error for a cluster-scoped object")
+	}
+	if !strings.Contains(err.Error(), "cluster-scoped") {
+		t.Errorf("error = %q, want it to explicitly reject the object as cluster-scoped, "+
+			"not merely surface some unrelated Apply failure", err)
 	}
 }
 
@@ -494,7 +562,7 @@ func TestApplyObjectsWrapsUnderlyingApplyError(t *testing.T) {
 	c := &client{dyn: dyn, mapper: handBuiltMapper()}
 
 	obj := newConfigMap("preview-x", "app-preview-env", map[string]string{"ENV": "v"})
-	err := c.ApplyObjects(context.Background(), []*unstructured.Unstructured{obj})
+	err := c.ApplyObjects(context.Background(), "preview-x", []*unstructured.Unstructured{obj})
 	if err == nil {
 		t.Fatal("expected the fake's Apply limitation to surface as an error")
 	}

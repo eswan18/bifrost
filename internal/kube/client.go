@@ -30,8 +30,12 @@ type Client interface {
 	EnsureNamespace(ctx context.Context, name string, labels, annotations map[string]string) error
 	// AnnotateNamespace merges annotations onto an existing namespace.
 	AnnotateNamespace(ctx context.Context, name string, annotations map[string]string) error
-	// ApplyObjects server-side-applies rendered objects (fieldManager "bifrost-preview").
-	ApplyObjects(ctx context.Context, objs []*unstructured.Unstructured) error
+	// ApplyObjects server-side-applies rendered objects (fieldManager
+	// "bifrost-preview") into expectedNS. This is a containment boundary
+	// enforced in code, independent of RBAC: every object's namespace must
+	// equal expectedNS exactly, and no object may map to a cluster-scoped
+	// resource — either violation is rejected before anything is applied.
+	ApplyObjects(ctx context.Context, expectedNS string, objs []*unstructured.Unstructured) error
 	// CopySecret reads srcNS/srcName and creates/updates dstNS/dstName with
 	// its data, applying overrides (nil value = keep source).
 	CopySecret(ctx context.Context, srcNS, srcName, dstNS, dstName string, overrides map[string][]byte) error

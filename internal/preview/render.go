@@ -70,6 +70,9 @@ func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
 	if err := writeBase(fs, in.K8sFiles); err != nil {
 		return nil, err
 	}
+	if err := validateLocalKustomizeRefs(in.K8sFiles); err != nil {
+		return nil, fmt.Errorf("preview: render %s: %w", in.Service, err)
+	}
 
 	base, err := kustomizeBuild(fs, "/base")
 	if err != nil {
@@ -128,6 +131,114 @@ func writeBase(fs filesys.FileSystem, k8sFiles map[string][]byte) error {
 	return nil
 }
 
+// minimalKustomizationRefs is the subset of a kustomization file's fields
+// that can name another location to load: the current resources/bases/
+// components/patches, plus the two deprecated-but-still-recognized legacy
+// patch lists (patchesStrategicMerge, patchesJson6902). It deliberately
+// doesn't cover the rest of ktypes.Kustomization (generators, replacements,
+// etc.) — sigs.k8s.io/yaml ignores unknown fields, so this parses cleanly
+// against any real kustomization.yaml while surfacing only the fields
+// validateLocalKustomizeRefs needs to inspect.
+type minimalKustomizationRefs struct {
+	Resources  []string `json:"resources,omitempty"`
+	Bases      []string `json:"bases,omitempty"`
+	Components []string `json:"components,omitempty"`
+	Patches    []struct {
+		Path string `json:"path,omitempty"`
+	} `json:"patches,omitempty"`
+	PatchesStrategicMerge []string `json:"patchesStrategicMerge,omitempty"`
+	PatchesJson6902       []struct {
+		Path string `json:"path,omitempty"`
+	} `json:"patchesJson6902,omitempty"`
+}
+
+// validateLocalKustomizeRefs rejects any fetched base/ kustomization.yaml or
+// kustomization.yml (the only two file names krusty recognizes) that
+// references anything other than a plain, relative, local path from its
+// resources, bases, components, or patches.
+//
+// This exists because krusty's default options (kustomizeBuild) permit two
+// classes of remote reference, and Render has no context to bound either
+// one: an http(s) URL (resources/patches path, or a legacy
+// patchesStrategicMerge/patchesJson6902 path) is fetched via a plain
+// &http.Client{} with no timeout, and a base/component path can be a
+// scheme-less "github.com/..." shorthand or an explicit scheme URL
+// (ssh://, https://, file://, ...), both of which kustomize's git loader
+// clones. A hostile fetched kustomization.yaml — e.g. from an attacker's
+// branch — can use either to make bifrost's orchestrator issue a
+// server-side request to an address of the attacker's choosing (verified
+// SSRF), or hang the goroutine indefinitely, which never releases the run's
+// busy-tag claim (see Orchestrator.acquire) since Render never returns.
+//
+// k8sFiles is the whole fetched k8s/ tree (RenderInput.K8sFiles); only
+// entries under the "base/" prefix are checked, matching the only subtree
+// writeBase copies into the build filesystem — kustomization files
+// elsewhere (staging/, prod/, argocd/) are never read by kustomizeBuild, so
+// scanning them would only produce irrelevant false rejections.
+func validateLocalKustomizeRefs(k8sFiles map[string][]byte) error {
+	const prefix = "base/"
+	for p, content := range k8sFiles {
+		rel, ok := strings.CutPrefix(p, prefix)
+		if !ok || rel == "" {
+			continue
+		}
+		name := path.Base(rel)
+		if name != "kustomization.yaml" && name != "kustomization.yml" {
+			continue
+		}
+		var k minimalKustomizationRefs
+		if err := sigsyaml.Unmarshal(content, &k); err != nil {
+			return fmt.Errorf("parsing %s: %w", p, err)
+		}
+		var refs []string
+		refs = append(refs, k.Resources...)
+		refs = append(refs, k.Bases...)
+		refs = append(refs, k.Components...)
+		refs = append(refs, k.PatchesStrategicMerge...)
+		for _, patch := range k.Patches {
+			refs = append(refs, patch.Path)
+		}
+		for _, patch := range k.PatchesJson6902 {
+			refs = append(refs, patch.Path)
+		}
+		for _, ref := range refs {
+			if unsafeKustomizeRef(ref) {
+				return fmt.Errorf("%s: refuses non-local kustomize reference %q", p, ref)
+			}
+		}
+	}
+	return nil
+}
+
+// unsafeKustomizeRef reports whether ref is anything other than a plain
+// relative local path: an explicit-scheme URL (http://, https://, ssh://,
+// file://, ...), a protocol-relative "//host/path", kustomize's one
+// recognized scheme-less git shorthand ("github.com/..." or "github.com:...",
+// case-insensitively — see internal/git.isStandardGithubHost in
+// sigs.k8s.io/kustomize/api; every other git host requires an explicit
+// scheme or user@host: syntax, which the "://" check already catches), an
+// absolute path, or a path that escapes its starting directory via "..".
+// The escape check runs path.Clean first, the same way github.FetchK8s's
+// tarball-entry guard does, so "a/../../b"-style decoys are caught too, not
+// just a literal leading "../".
+func unsafeKustomizeRef(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	lower := strings.ToLower(ref)
+	if strings.Contains(ref, "://") ||
+		strings.HasPrefix(ref, "//") ||
+		strings.HasPrefix(lower, "github.com/") ||
+		strings.HasPrefix(lower, "github.com:") {
+		return true
+	}
+	if path.IsAbs(ref) {
+		return true
+	}
+	cleaned := path.Clean(ref)
+	return cleaned == ".." || strings.HasPrefix(cleaned, "../")
+}
+
 // baseFacts records what the fetched base declares, so the generated
 // overlay only patches around things that actually exist.
 type baseFacts struct {
@@ -144,16 +255,28 @@ type baseFacts struct {
 // and whether the Deployment declares volumes (the incomplete CSI
 // secrets-store mount every previews must strip).
 //
-// It also guards a failure mode that does NOT surface as a build error: the
-// generated deployment-patch's implicit target matches the base Deployment
-// by resource name (service), which kustomize enforces (a missing Deployment
-// name errors loudly at Run time) — but the patch's container list is
-// merged into the base's *containers* by container name, which kustomize
-// does not cross-check against anything. If the base Deployment's container
-// isn't actually named service, the patch's {name, envFrom}-only container
-// silently lands as a second, incomplete container alongside the untouched
-// original, instead of patching it. So detectBase checks this explicitly
-// and fails fast with a clear error rather than letting it render silently.
+// It also guards two failure modes that do NOT surface as build errors.
+//
+// First: the generated deployment-patch's implicit target matches the base
+// Deployment by resource name (service), which kustomize enforces (a
+// missing Deployment name errors loudly at Run time) — but the patch's
+// container list is merged into the base's *containers* by container name,
+// which kustomize does not cross-check against anything. If the base
+// Deployment's container isn't actually named service, the patch's {name,
+// envFrom}-only container silently lands as a second, incomplete container
+// alongside the untouched original, instead of patching it.
+//
+// Second: the overlay's `images:` transformer (see writeOverlay) retags
+// whichever container image exactly matches imageRepoBase + "/" + service —
+// matched by repository name only, ignoring whatever tag the base pins. If
+// the base Deployment's image name doesn't match that (a typo, a renamed
+// service, a copy-pasted image from a different member), the transformer
+// silently no-ops instead of erroring, and the preview runs the base's own
+// pinned tag (":prod" or ":latest") under the impression it's running the
+// branch's freshly-built image.
+//
+// detectBase checks both explicitly and fails fast with a clear error
+// rather than letting either render silently wrong.
 func detectBase(base resmap.ResMap, service string) (baseFacts, error) {
 	var f baseFacts
 	for _, res := range base.Resources() {
@@ -181,7 +304,8 @@ func detectBase(base resmap.ResMap, service string) (baseFacts, error) {
 			if err != nil {
 				return baseFacts{}, err
 			}
-			if !hasContainerNamed(containers, service) {
+			container, found := findContainerNamed(containers, service)
+			if !found {
 				return baseFacts{}, fmt.Errorf(
 					"preview: render: base Deployment %s has no container named %q; "+
 						"the generated deployment-patch merges its container by that name, "+
@@ -190,24 +314,36 @@ func detectBase(base resmap.ResMap, service string) (baseFacts, error) {
 					id.Name, service,
 				)
 			}
+			wantImagePrefix := imageRepoBase + "/" + service + ":"
+			image, _ := container["image"].(string)
+			if !strings.HasPrefix(image, wantImagePrefix) {
+				return baseFacts{}, fmt.Errorf(
+					"preview: render: base Deployment %s container %q has image %q, "+
+						"want it to start with %q; the overlay's images: transformer matches "+
+						"by repository name only, so a mismatch would silently no-op and the "+
+						"preview would run the base's own pinned tag instead of the built image",
+					id.Name, service, image, wantImagePrefix,
+				)
+			}
 		}
 	}
 	return f, nil
 }
 
-// hasContainerNamed reports whether containers (a spec.template.spec.containers
-// slice from an unstructured object) includes one named name.
-func hasContainerNamed(containers []any, name string) bool {
+// findContainerNamed returns the container in containers (a
+// spec.template.spec.containers slice from an unstructured object) named
+// name, or (nil, false) if none matches.
+func findContainerNamed(containers []any, name string) (map[string]any, bool) {
 	for _, c := range containers {
 		m, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
 		if n, _ := m["name"].(string); n == name {
-			return true
+			return m, true
 		}
 	}
-	return false
+	return nil, false
 }
 
 // writeOverlay generates /overlay: the kustomization.yaml tying the fetched

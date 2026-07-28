@@ -351,7 +351,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		if err != nil {
 			return fmt.Errorf("render %s: %w", svc, err)
 		}
-		if err := o.Kube.ApplyObjects(ctx, objs); err != nil {
+		if err := o.Kube.ApplyObjects(ctx, ns, objs); err != nil {
 			return fmt.Errorf("apply %s: %w", svc, err)
 		}
 	}

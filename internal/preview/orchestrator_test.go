@@ -256,7 +256,7 @@ func (f *fakeKube) AnnotateNamespace(ctx context.Context, name string, annotatio
 	return nil
 }
 
-func (f *fakeKube) ApplyObjects(_ context.Context, objs []*unstructured.Unstructured) error {
+func (f *fakeKube) ApplyObjects(_ context.Context, _ string, objs []*unstructured.Unstructured) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.applyErr != nil {
