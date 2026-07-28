@@ -21,7 +21,8 @@ type EvalContext struct {
 	Members []string
 	// Cfg is bifrost's static config: StagingURLs and PreviewOAuthClientID.
 	Cfg *config.Config
-	// Baseline is the target app's own staging ConfigMap data. Cascade step
+	// Baseline is the staging ConfigMap data of the app being rendered (NOT of
+	// the service named in the template). Cascade step
 	// 2 defers to it: if Key already has a value here, that value wins, so
 	// bifrost never restates a fact the app already owns.
 	Baseline map[string]string
@@ -89,7 +90,7 @@ func Eval(tmpl string, ctx EvalContext) (string, error) {
 //     or one of this preview's members -> its own preview URL
 //     (previewURL/internalPreviewURL -- the single source of truth for the
 //     URL shape, shared with render.go).
-//  2. Else, if ctx.Key already has a value in the target app's own staging
+//  2. Else, if ctx.Key already has a value in the rendered app's own staging
 //     ConfigMap (ctx.Baseline) -> that value, untouched. This is the point
 //     of the whole cascade: resolving to cfg.StagingURLs instead would give
 //     bifrost a second, independently-maintained copy of a fact the app

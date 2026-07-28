@@ -1,8 +1,16 @@
 # Previewable services. Adding one here + a cloudbuild-preview.yaml and
 # {repo}-preview-build trigger in its repo is the whole onboarding path —
-# no Go changes. Templates: {{ url X }} is X's preview URL when X is part of
-# this preview, else X's staging URL; {{ internalUrl X }} is in-cluster DNS
-# (preview namespace when X is a member, else X's staging namespace);
+# no Go changes. Templates resolve by cascade, stopping at the first hit:
+#   1. X is part of this preview -> X's preview URL ({{ url X }}) or its
+#      in-cluster preview DNS ({{ internalUrl X }}).
+#   2. else the key already has a value in the staging ConfigMap of the app
+#      being rendered -> that value is kept untouched. This is why editing
+#      bifrost's STAGING_URLS does NOT change a key an app already sets:
+#      the app's own config wins, so the two can't drift apart.
+#   3. else bifrost's STAGING_URLS[X], or the X.X-staging.svc.cluster.local
+#      convention for {{ internalUrl }} (the path a service with no staging
+#      ConfigMap takes, e.g. footstrike-dashboard).
+#   4. else an error naming the key and the unresolvable service.
 # {{ config KEY }} is an operator-supplied value from bifrost's config.
 # Neon references live here and never come from the branch under test.
 footstrike-api:

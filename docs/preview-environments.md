@@ -151,15 +151,19 @@ first hit:
    the cluster is touched, rather than deploying a pod that crash-loops or
    silently misbehaves on a broken URL.
 
-Step 2 is deliberately checked *before* step 3. Both bifrost's `STAGING_URLS`
-and the target app's own staging ConfigMap describe the same fact (that
-app's staging URL), maintained independently in two different repos, and
+Step 2 is deliberately checked *before* step 3. Note whose ConfigMap this is:
+the baseline belongs to **the app being rendered**, not to X. `JWT_ISSUER` for
+a footstrike-api preview resolves from *footstrike-api's* own
+`staging/configmap-env.yaml`, even though the template argument is `identity`.
+
+Both bifrost's `STAGING_URLS` and that app's own staging ConfigMap describe
+the same fact (X's staging URL), maintained independently in two repos, and
 **nothing enforces they agree**. Deferring to the app's own value means
 bifrost never restates a fact the app already owns — if the two ever drift,
 previews still resolve to what the app itself says, so drift in bifrost's
 `STAGING_URLS` can't leak into a preview's env. Keep this in mind if you're
 ever tempted to "fix" a preview URL by editing `STAGING_URLS` — check the
-target app's `staging/configmap-env.yaml` first.
+`staging/configmap-env.yaml` of the app whose env you're changing first.
 
 ## Onboarding a new previewable app
 
