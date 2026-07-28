@@ -45,6 +45,18 @@ type createPreviewRequest struct {
 // bifrost/phase / bifrost/error annotations — that's the orchestrator's
 // job, not this handler's — so the only thing done here on failure is a
 // slog line; the HTTP response has already been sent.
+//
+// The Busy(tag) pre-check is advisory, not a reservation: it and the
+// goroutine's own Orchestrator.acquire() below are non-atomic, so two
+// near-simultaneous POSTs for the same branch can both pass the check and
+// both get a 202. This is accepted as a bounded, documented limitation
+// (adjudicated in task 5 review) rather than fixed with a synchronous
+// reservation API: the orchestrator's mutex still prevents duplicate work
+// (the loser's Up simply returns preview.ErrBusy, logged and discarded —
+// see the goroutine below), and the 202's "creating" claim remains true for
+// the tag either way, since the winner is in fact creating it. Callers that
+// need ground truth for a specific tag should poll
+// GET /api/previews/{tag} rather than trust 202 as a uniqueness guarantee.
 func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 	if !h.verifyMutationCSRF(w, r) {
 		return
@@ -77,6 +89,10 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), asyncOrchestrationTimeout)
 		defer cancel()
+		// err may be preview.ErrBusy here if this request lost the race
+		// against a concurrent POST for the same tag (see the Busy(tag)
+		// pre-check note above) — that's a no-op loser, not a real failure,
+		// but it's still logged rather than silently discarded.
 		if err := h.Orch.Up(ctx, branch); err != nil {
 			slog.Error("preview create failed", "tag", tag, "branch", branch, "err", err)
 			return
@@ -97,6 +113,13 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 // Down, to give a real 404. Like Create, teardown continues in the
 // background; failures are logged, never surfaced to the (already-answered)
 // HTTP caller.
+//
+// Same advisory-Busy-pre-check caveat as CreatePreviewJSON: this handler's
+// Busy(tag) check and the goroutine's Orchestrator.acquire() below are
+// non-atomic, so two near-simultaneous DELETEs (or a DELETE racing a POST)
+// for the same tag can both 202; the loser's Down returns preview.ErrBusy,
+// logged and discarded. Accepted as a bounded limitation (task 5
+// adjudication) — poll GET /api/previews/{tag} for ground truth.
 func (h *Handlers) DeletePreviewJSON(w http.ResponseWriter, r *http.Request) {
 	if !h.verifyMutationCSRF(w, r) {
 		return
@@ -125,6 +148,10 @@ func (h *Handlers) DeletePreviewJSON(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), asyncOrchestrationTimeout)
 		defer cancel()
+		// err may be preview.ErrBusy here if this request lost the race
+		// against a concurrent POST/DELETE for the same tag (see the
+		// Busy(tag) pre-check note above) — a no-op loser, not a real
+		// failure, but still logged rather than silently discarded.
 		if err := h.Orch.Down(ctx, tag); err != nil {
 			slog.Error("preview delete failed", "tag", tag, "err", err)
 			return
