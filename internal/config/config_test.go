@@ -150,6 +150,21 @@ func TestPreviewConfigDefaults(t *testing.T) {
 	if cfg.GitHubToken != "" || cfg.NeonAPIKey != "" || cfg.PreviewAPIToken != "" {
 		t.Errorf("expected empty tokens by default")
 	}
+	if cfg.PreviewOAuthClientID != "" {
+		t.Errorf("expected empty PreviewOAuthClientID by default")
+	}
+}
+
+func TestPreviewOAuthClientIDParsed(t *testing.T) {
+	m := minimalValidEnv()
+	m["PREVIEW_OAUTH_CLIENT_ID"] = "preview-client-id"
+	cfg, err := loadFromMap(m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PreviewOAuthClientID != "preview-client-id" {
+		t.Errorf("PreviewOAuthClientID = %q, want preview-client-id", cfg.PreviewOAuthClientID)
+	}
 }
 
 func TestPreviewServicesParsed(t *testing.T) {
