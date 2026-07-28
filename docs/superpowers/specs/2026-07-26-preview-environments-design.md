@@ -1,7 +1,7 @@
 # Preview Environments — Design
 
 **Date:** 2026-07-26
-**Status:** Approved; implemented through the build-pipeline plan (2026-07-27)
+**Status:** Shipped (2026-07-28) — implemented across identity wildcard redirects → build pipeline → control plane 3a/3b/3c → provisioning + CLI
 **Owner repos touched:** bifrost (primary), infra (`ib.py`, Pulumi), identity, footstrike-api, footstrike-dashboard (small per-repo additions)
 
 ## Problem
