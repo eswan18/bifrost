@@ -82,7 +82,13 @@ func envConfigFor(svc, tag string, members []string, stagingData map[string]stri
 
 func footstrikeAPIEnvConfig(tag string, members []string, stagingData map[string]string) map[string]string {
 	data := copyStringMap(stagingData)
-	data["ENV"] = "preview"
+	// Previews are staging-flavored, and ENV is not a free-form label: the api
+	// validates it against a closed set (dev|staging|prod) and exits at import
+	// on anything else. It only selects an optional .env.{ENV} file, which
+	// images don't ship — so "staging" is both accurate and the value that
+	// keeps app repos from needing to know previews exist. Everything genuinely
+	// preview-specific is overridden by key below.
+	data["ENV"] = "staging"
 	data["PUBLIC_API_BASE_URL"] = previewURL(svcFootstrikeAPI, tag)
 	data["PUBLIC_DASHBOARD_BASE_URL"] = previewURL(svcDashboard, tag)
 	if slices.Contains(members, svcIdentity) {
