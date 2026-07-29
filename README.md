@@ -33,8 +33,8 @@ there is **no CSS build step** and no Node toolchain.
 
 Ephemeral, per-branch environments layered onto staging. `ib preview up
 <branch>` stands up namespace `preview-<tag>` (`<tag>` = a slug of the
-branch), containing only the services declared in
-`internal/preview/registry.yaml` whose repo has that branch pushed —
+branch), containing only the services whose `internal/registry/registry.yaml`
+entry has a `preview:` block and whose repo has that branch pushed —
 everything else a preview app talks to resolves cross-namespace to shared
 staging.
 
@@ -66,7 +66,11 @@ deploys to `<app>-staging` and `<app>-prod` namespaces, its ArgoCD
 `Application`s are named `<app>-staging` / `<app>-prod` and pin images via
 `spec.source.kustomize.images`, images are tagged by commit SHA, and staging
 is auto-updated by ArgoCD Image Updater. The CI-build column is Google Cloud
-Build-specific and optional — leave `GCP_PROJECT` unset to disable it.
+Build-specific and optional — leave `GCP_PROJECT` unset to disable it. Every
+app bifrost knows about — its repo, public URLs, and whether it's
+previewable — is one entry in `internal/registry/registry.yaml`; see
+`docs/adding-a-service.md` for what's bifrost's to configure versus what
+lives in the app's own repo and infra.
 
 Self-promotion is supported. If a bad version of bifrost ever lands in prod
 and bricks the UI, the fallback is patching its `Application` by hand — the
@@ -82,7 +86,6 @@ Requires these env vars to run (see `internal/config/config.go`):
 
     BASE_URL=http://localhost:8080
     ENV=local
-    SERVICES=api,dashboard
     ALLOWED_EMAIL=you@example.com
     OIDC_ISSUER_EXTERNAL=...
     OIDC_ISSUER_INTERNAL=...

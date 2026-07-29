@@ -32,11 +32,12 @@ forecasting:
 #      in-cluster preview DNS ({{ internalUrl X }}).
 #   2. else the key already has a value in the staging ConfigMap of the app
 #      being rendered -> that value is kept untouched. This is why editing
-#      bifrost's STAGING_URLS does NOT change a key an app already sets:
-#      the app's own config wins, so the two can't drift apart.
-#   3. else bifrost's STAGING_URLS[X], or the X.X-staging.svc.cluster.local
-#      convention for {{ internalUrl }} (the path a service with no staging
-#      ConfigMap takes, e.g. footstrike-dashboard).
+#      this registry's urls.staging does NOT change a key an app already
+#      sets: the app's own config wins, so the two can't drift apart.
+#   3. else this registry's urls.staging for X, or the
+#      X.X-staging.svc.cluster.local convention for {{ internalUrl }} (the
+#      path a service with no staging ConfigMap takes, e.g.
+#      footstrike-dashboard).
 #   4. else an error naming the key and the unresolvable service.
 # {{ config KEY }} is an operator-supplied value from bifrost's config.
 # Neon references live here and never come from the branch under test.

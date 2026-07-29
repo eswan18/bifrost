@@ -5,11 +5,13 @@ stands up namespace `preview-<tag>` (`<tag>` = a slug of the branch name),
 containing only the apps whose repo has that branch pushed — everything else
 a preview app talks to resolves cross-namespace to shared staging.
 
-Which apps are previewable, their Neon reference (if any), and their preview
-env wiring all live in one place: `internal/preview/registry.yaml`. Adding an
-app there (plus a build trigger — see "Onboarding a new app" below) is the
-whole path to making it previewable; nothing else in bifrost's Go code
-changes.
+Which apps exist in the fleet at all lives in `internal/registry/registry.yaml`
+— see [`docs/adding-a-service.md`](adding-a-service.md) for that half.
+Previewability is an optional `preview:` sub-block on a fleet entry: a Neon
+reference (if any) and the app's preview env wiring. Adding that sub-block
+to an existing entry (plus a build trigger — see "Onboarding a new
+previewable app" below) is the whole path to making an already-onboarded app
+previewable; nothing else in bifrost's Go code changes.
 
 ```
 ib preview list                     # table of preview environments
@@ -95,23 +97,28 @@ the only record `Down` has) — best-effort deletes a `preview-<tag>` Neon
 branch if one exists. Every step runs regardless of earlier failures; all
 errors are joined and returned together.
 
-## The registry (`internal/preview/registry.yaml`)
+## The registry (`internal/registry/registry.yaml`)
 
-Each entry is a `Service`:
+Preview wiring is the `preview:` sub-block of a fleet entry (`registry.Preview`,
+aliased in this package as `Service`):
 
 ```yaml
 footstrike-api:
-  neon:                                 # omit for apps with no database
-    project: aged-river-81935268
-    database: neondb
-    role: neondb_owner
-  env:
-    ENV: staging
-    PUBLIC_API_BASE_URL: "{{ url self }}"
-    PUBLIC_DASHBOARD_BASE_URL: "{{ url footstrike-dashboard }}"
-    IDENTITY_PROVIDER_URL: "{{ internalUrl identity }}"
-    JWT_ISSUER: "{{ url identity }}"
-  required: [...]                       # keys that must render non-empty
+  urls:
+    staging: https://api.staging.footstrike.run
+    prod: https://api.footstrike.run
+  preview:
+    neon:                                 # omit for apps with no database
+      project: aged-river-81935268
+      database: neondb
+      role: neondb_owner
+    env:
+      ENV: staging
+      PUBLIC_API_BASE_URL: "{{ url self }}"
+      PUBLIC_DASHBOARD_BASE_URL: "{{ url footstrike-dashboard }}"
+      IDENTITY_PROVIDER_URL: "{{ internalUrl identity }}"
+      JWT_ISSUER: "{{ url identity }}"
+    required: [...]                       # keys that must render non-empty
 ```
 
 Three template forms (`internal/preview/template.go`'s `Eval`), each either a
@@ -142,8 +149,9 @@ first hit:
 2. **The app's own staging baseline**: if the *target* app's own
    `staging/configmap-env.yaml` already has a value for this exact env key,
    that value wins, untouched.
-3. **`STAGING_URLS`/DNS convention**: bifrost's own `STAGING_URLS` config
-   (for `url`) or the `http://{svc}.{svc}-staging.svc.cluster.local`
+3. **Fleet registry / DNS convention**: the fleet registry's `urls.staging`
+   for X (`internal/registry/registry.yaml`, `registry.Registry[X].URLs.Staging`
+   — for `url`) or the `http://{svc}.{svc}-staging.svc.cluster.local`
    convention (for `internalUrl`, which always succeeds — it's a pure string
    formula).
 4. **Error** (only reachable for `url`): names the key and the unresolvable
@@ -156,24 +164,30 @@ the baseline belongs to **the app being rendered**, not to X. `JWT_ISSUER` for
 a footstrike-api preview resolves from *footstrike-api's* own
 `staging/configmap-env.yaml`, even though the template argument is `identity`.
 
-Both bifrost's `STAGING_URLS` and that app's own staging ConfigMap describe
-the same fact (X's staging URL), maintained independently in two repos, and
-**nothing enforces they agree**. Deferring to the app's own value means
-bifrost never restates a fact the app already owns — if the two ever drift,
-previews still resolve to what the app itself says, so drift in bifrost's
-`STAGING_URLS` can't leak into a preview's env. Keep this in mind if you're
-ever tempted to "fix" a preview URL by editing `STAGING_URLS` — check the
-`staging/configmap-env.yaml` of the app whose env you're changing first.
+Both the fleet registry's `urls.staging` and that app's own staging
+ConfigMap describe the same fact (X's staging URL), maintained independently
+in two repos, and **nothing enforces they agree**. Deferring to the app's own
+value means bifrost never restates a fact the app already owns — if the two
+ever drift, previews still resolve to what the app itself says, so drift in
+the registry's `urls.staging` can't leak into a preview's env. Keep this in
+mind if you're ever tempted to "fix" a preview URL by editing
+`internal/registry/registry.yaml` — check the `staging/configmap-env.yaml`
+of the app whose env you're changing first.
 
 ## Onboarding a new previewable app
 
-No Go changes. Three pieces:
+The app must already be a fleet member — a plain entry in
+`internal/registry/registry.yaml` with no `preview:` block — before it can
+be made previewable; see [`docs/adding-a-service.md`](adding-a-service.md)
+for that half. From there, making it previewable is three pieces, no Go
+changes:
 
-1. **A `internal/preview/registry.yaml` entry** — a `neon:` block if the app
-   has a database, an `env:` map of templates (`{{ url X }}` /
-   `{{ internalUrl X }}` / `{{ config KEY }}`, or plain literals), and a
-   `required:` list for any keys that must render non-empty (a required key
-   with no matching `env` entry is rejected at load time).
+1. **A `preview:` sub-block on its `internal/registry/registry.yaml`
+   entry** — a `neon:` block if the app has a database, an `env:` map of
+   templates (`{{ url X }}` / `{{ internalUrl X }}` / `{{ config KEY }}`, or
+   plain literals), and a `required:` list for any keys that must render
+   non-empty (a required key with no matching `env` entry is rejected at
+   load time).
 2. **A `cloudbuild-preview.yaml` in the app's own repo** that builds and
    pushes `{image}:preview-$SHORT_SHA` (see
    `footstrike-api/cloudbuild-preview.yaml` for the working pattern — no

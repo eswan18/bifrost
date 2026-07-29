@@ -119,10 +119,9 @@ func (r Registry) PreviewNames() []string {
 
 // RepoFor returns svc's repo name: its registry override when one is
 // configured (e.g. asset-manager -> asset_manager), or svc itself
-// otherwise — the same "repos are named after the service, except when
-// they're not" convention config.Config.RepoFor documents. An svc absent
-// from the registry entirely still returns svc unchanged, matching that
-// same fallback.
+// otherwise — "repos are named after the service, except when they're not."
+// An svc absent from the registry entirely still returns svc unchanged,
+// matching that same fallback.
 func (r Registry) RepoFor(svc string) string {
 	if s, ok := r[svc]; ok && s.Repo != "" {
 		return s.Repo
