@@ -260,9 +260,20 @@ func TestPreviewsPage(t *testing.T) {
 		t.Error("creating preview's step text missing from page")
 	}
 	// The ready preview (no step annotation) must render its bare phase —
-	// no step decoration, no stray separator, nothing tacked on.
+	// no step decoration, no stray separator, nothing tacked on. The
+	// Contains check alone is too weak to prove this on its own: the
+	// mobile job-card-top phase span (untouched by this feature, always
+	// bare) also matches `<span class="c-mut">ready</span>`, so it would
+	// still pass even if the desktop preview-phase cell were broken (e.g.
+	// unconditionally emitting "{{.Phase}} · {{.Step}}"). The negative
+	// check below is what actually pins the desktop cell: it fails if a
+	// dangling " · " separator leaks in for an empty Step, the same
+	// pattern TestPreviewsPageCreatingWithoutStepRendersClean uses.
 	if !strings.Contains(body, `<span class="c-mut">ready</span>`) {
 		t.Error("ready preview must render its bare phase with no step")
+	}
+	if strings.Contains(body, "ready ·") {
+		t.Error("ready preview must not leave a dangling separator")
 	}
 }
 
