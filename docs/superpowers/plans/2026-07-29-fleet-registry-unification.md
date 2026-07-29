@@ -90,7 +90,7 @@ The YAML must reproduce today's config exactly. Read `k8s/base/configmap.yaml` f
 - Modify: `k8s/base/configmap.yaml`, `k8s/staging/configmap-env.yaml` and `k8s/prod/configmap-env.yaml` if they carry any of the four keys
 
 - [ ] **Step 1:** Remove `SERVICES`, `REPO_OVERRIDES`, `STAGING_URLS`, `PROD_URLS`. Check all three overlay files; leave everything else (`ARGOCD_NAMESPACE`, `GITHUB_ORG`, OIDC, `DISPLAY_TIMEZONE`, preview keys) alone.
-- [ ] **Step 2:** Confirm deployment order is safe in both directions and state it in the report for the PR body: a running old pod ignores nothing (it *reads* those keys — so manifest-first means an old pod that restarts in the window loses its service list). **This is the one genuinely unsafe direction in this plan** — unlike plan 5's optional preview keys, `SERVICES` is required by the old binary and an empty list means an empty Apps tab. Recommend in the PR body: merge (ArgoCD applies the ConfigMap), then promote bifrost promptly; a restart in the gap degrades the UI until the new image lands. If that risk isn't acceptable, the alternative is a two-PR sequence (new binary tolerating both sources first, ConfigMap cleanup second) — say so explicitly and let the owner choose.
+- [ ] **Step 2:** Document the deployment caveat for the PR body — do NOT re-litigate it, the owner ruled on 2026-07-29. Unlike plan 5's optional preview keys, `SERVICES` is REQUIRED by the currently-deployed binary: once ArgoCD applies this ConfigMap, a pod restart before the new image is promoted boots with an empty service list and a blank Apps tab. **Owner's decision: accept it — merge, then promote bifrost promptly; a minute of degraded UI is fine.** The PR body must state this plainly so whoever merges knows to promote, and must NOT present the two-PR alternative as an open question.
 - [ ] **Step 3:** Gates + commit — "Drop the fleet inventory ConfigMap keys".
 
 ---
@@ -109,6 +109,6 @@ The YAML must reproduce today's config exactly. Read `k8s/base/configmap.yaml` f
 ## Self-review notes
 
 - **The risky task is 2**, gated by goldens captured from running code — same discipline that caught three real divergences in plan 5.
-- **Task 3 carries a real deployment caveat** and the plan says so rather than hiding it: unlike plan 5's optional keys, `SERVICES` is load-bearing for the old binary. The two-PR alternative is offered explicitly.
+- **Task 3 carries a real deployment caveat**, ruled on by the owner (2026-07-29): accept the brief blank-Apps-tab window; merge then promote promptly. The plan states it in the PR body rather than hiding it, and does not re-open the choice.
 - **Not in scope:** `ib.py`'s `SERVICES` list stays duplicated on purpose (it must work when bifrost is down — add a comment saying so if touching the file), `infra/__main__.py` stays code, and no new app is onboarded here.
 - **Type consistency:** `registry.Preview` is plan 5's `preview.Service` renamed; its json tags and validation carry over unchanged so the preview equivalence tests keep passing.
