@@ -23,6 +23,7 @@ import (
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/neon"
 	"github.com/eswan18/bifrost/internal/preview"
+	"github.com/eswan18/bifrost/internal/registry"
 	"github.com/eswan18/bifrost/internal/web"
 )
 
@@ -58,10 +59,15 @@ func main() {
 	// disabling the preview control plane. Loaded unconditionally (not just
 	// when GCPProject/preview deps are present) since it's also the source
 	// of which services are previewable at all, used below.
-	reg, err := preview.LoadRegistry()
+	fleet, err := registry.Load()
 	if err != nil {
-		log.Fatalf("preview registry: %v", err)
+		log.Fatalf("registry: %v", err)
 	}
+	// reg narrows the fleet-wide registry down to the previewable subset —
+	// the shape the preview control plane below expects. Other fleet-wide
+	// consumers of the full registry (build badges, service cards, ...) are
+	// wired up right here in this file, off `fleet` directly.
+	reg := preview.FromFleet(fleet)
 
 	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	oidcClient, err := auth.NewOIDC(oidcCtx,
@@ -112,8 +118,8 @@ func main() {
 		if names, err := gcb.TriggerIDs(context.Background(), cfg.GCPProject); err != nil {
 			log.Printf("cloud build triggers unavailable, pipeline links disabled: %v", err)
 		} else {
-			triggerIDs = make(map[string]string, len(cfg.Services))
-			for _, svc := range cfg.Services {
+			triggerIDs = make(map[string]string, len(fleet))
+			for _, svc := range fleet.Names() {
 				if id, ok := names[svc+"-build"]; ok {
 					triggerIDs[svc] = id
 				}
@@ -142,7 +148,7 @@ func main() {
 
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
-	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
+	webH := &web.Handlers{Cfg: cfg, Registry: fleet, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
 	// The preview orchestrator needs every one of its dependencies present —
 	// partial config (e.g. a GitHub token but no Neon key, or an empty
@@ -157,6 +163,7 @@ func main() {
 			Builds:     builds,
 			TriggerIDs: previewTriggerIDs,
 			Registry:   reg,
+			Fleet:      fleet,
 		}
 	}
 

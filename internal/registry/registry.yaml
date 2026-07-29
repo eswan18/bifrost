@@ -1,0 +1,81 @@
+# The bifrost fleet: every service bifrost operates on. Adding an app is a
+# single entry here — its repo name (only needed when it differs from the
+# service name) and its public staging/prod URLs for the "open ↗" links on
+# its service card. `preview:` is an optional sub-block, present only for
+# services onboarded to preview environments; see its own header comment
+# below for how a preview's env values resolve.
+#
+# comms has no urls: it's a background worker with no ingress, so there's no
+# public staging/prod URL to link to.
+asset-manager:
+  repo: asset_manager
+  urls:
+    staging: https://assets-staging.tailc06f30.ts.net
+    prod: https://assets.ethanswan.com
+
+bifrost:
+  urls:
+    staging: https://bifrost-staging.tailc06f30.ts.net
+    prod: https://bifrost.ethanswan.com
+
+comms: {}
+
+forecasting:
+  urls:
+    staging: https://forecasting-staging.tailc06f30.ts.net
+    prod: https://forecasting.ethanswan.com
+
+# Previewable services. Adding one here + a cloudbuild-preview.yaml and
+# {service}-preview-build trigger in its repo is the whole onboarding path —
+# no Go changes. Templates resolve by cascade, stopping at the first hit:
+#   1. X is part of this preview -> X's preview URL ({{ url X }}) or its
+#      in-cluster preview DNS ({{ internalUrl X }}).
+#   2. else the key already has a value in the staging ConfigMap of the app
+#      being rendered -> that value is kept untouched. This is why editing
+#      this registry's urls.staging does NOT change a key an app already
+#      sets: the app's own config wins, so the two can't drift apart.
+#   3. else this registry's urls.staging for X, or the
+#      X.X-staging.svc.cluster.local convention for {{ internalUrl }} (the
+#      path a service with no staging ConfigMap takes, e.g.
+#      footstrike-dashboard).
+#   4. else an error naming the key and the unresolvable service.
+# {{ config KEY }} is an operator-supplied value from bifrost's config.
+# Neon references live here and never come from the branch under test.
+footstrike-api:
+  urls:
+    staging: https://api.staging.footstrike.run
+    prod: https://api.footstrike.run
+  preview:
+    neon:
+      project: aged-river-81935268
+      database: neondb
+      role: neondb_owner
+    env:
+      ENV: staging
+      PUBLIC_API_BASE_URL: "{{ url self }}"
+      PUBLIC_DASHBOARD_BASE_URL: "{{ url footstrike-dashboard }}"
+      IDENTITY_PROVIDER_URL: "{{ internalUrl identity }}"
+      JWT_ISSUER: "{{ url identity }}"
+
+footstrike-dashboard:
+  urls:
+    staging: https://staging.footstrike.run
+    prod: https://footstrike.run
+  preview:
+    env:
+      APP_API_URL: "{{ url footstrike-api }}"
+      APP_IDENTITY_URL: "{{ url identity }}"
+      APP_OAUTH_CLIENT_ID: "{{ config previewOAuthClientID }}"
+    required: [APP_API_URL, APP_IDENTITY_URL, APP_OAUTH_CLIENT_ID]
+
+identity:
+  urls:
+    staging: https://identity-staging.tailc06f30.ts.net
+    prod: https://identity.ethanswan.com
+  preview:
+    neon:
+      project: plain-heart-27630935
+      database: neondb
+      role: app
+    env:
+      JWT_ISSUER: "{{ url self }}"

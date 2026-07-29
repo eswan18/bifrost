@@ -13,6 +13,7 @@ import (
 	"github.com/eswan18/bifrost/internal/github"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/neon"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // ErrBusy reports that an Up or Down for this tag is already in flight. The
@@ -41,6 +42,14 @@ type Orchestrator struct {
 	// into envConfigFor. Normally populated once at startup via
 	// LoadRegistry() (main.go) rather than reloaded per-request.
 	Registry Registry
+	// Fleet is the fleet-wide registry (internal/registry) -- every
+	// service's repo name and public URLs, not just the previewable
+	// subset Registry narrows to. resolveMembers/renderAndApply use it for
+	// RepoFor; envConfigFor threads it through to the preview cascade's
+	// step 3 (a non-member service's staging URL fallback). Normally the
+	// same value main.go loaded via registry.Load() before narrowing it
+	// into Registry via FromFleet.
+	Fleet registry.Registry
 
 	mu   sync.Mutex
 	busy map[string]bool
@@ -130,7 +139,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 		// envConfigFor's own error already names both the service and that
 		// it's an env-config failure ("preview: env config for %s: ..."), so
 		// this only adds the missing "which stage of Up" context.
-		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry); err != nil {
+		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry, o.Fleet); err != nil {
 			return fmt.Errorf("preview: Up: pre-flight: %w", err)
 		}
 	}
@@ -210,7 +219,7 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]string, error) {
 	var members []string
 	for _, svc := range o.Registry.Names() {
-		_, err := o.GitHub.BranchSHA(ctx, o.Cfg.RepoFor(svc), branch)
+		_, err := o.GitHub.BranchSHA(ctx, o.Fleet.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
 			continue
@@ -346,7 +355,7 @@ func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []str
 // renders its manifests, and applies them into ns.
 func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, shortSHAs map[string]string) error {
 	for _, svc := range members {
-		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Cfg.RepoFor(svc), branch)
+		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Fleet.RepoFor(svc), branch)
 		if err != nil {
 			return fmt.Errorf("fetch k8s files for %s: %w", svc, err)
 		}
@@ -358,7 +367,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		// service and the stage ("preview: env config for %s: ..."); adding
 		// another "env config for %s: %w" around it would just duplicate
 		// that segment in the bifrost/error annotation a human reads.
-		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry)
+		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry, o.Fleet)
 		if err != nil {
 			return err
 		}

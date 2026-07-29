@@ -1,68 +1,64 @@
 package preview
 
 import (
-	_ "embed"
-	"fmt"
 	"sort"
 
-	sigsyaml "sigs.k8s.io/yaml"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
-//go:embed registry.yaml
-var registryYAML []byte
+// This package's registry types are now thin aliases onto internal/registry,
+// the fleet-wide source of truth (plan 2026-07-29-fleet-registry-unification,
+// task 1). Service aliases registry.Preview -- not registry.Service, whose
+// preview fields live one level deeper under .Preview -- so Registry keeps
+// exactly the narrow "previewable services only, preview fields promoted to
+// the top level" shape this package's orchestration logic (envConfigFor,
+// Orchestrator) has always operated on. That keeps every existing call site
+// (o.Registry[svc].Neon, entry.Env, entry.Required, and test literals like
+// Registry{"svc": {Neon: &NeonRef{...}}}) unchanged, so this move carries no
+// risk of altering preview behavior. See FromFleet for how the two shapes
+// connect.
 
-// NeonRef locates one service's Neon database for preview branching. It
-// lives in the registry — never in the branch under test — so a preview
-// can never point at a database other than the one bifrost was configured
-// to trust.
-type NeonRef struct {
-	Project  string `json:"project"`
-	Database string `json:"database"`
-	Role     string `json:"role"`
-}
+// NeonRef locates one service's Neon database for preview branching (see
+// registry.NeonRef's doc comment for the full rationale).
+type NeonRef = registry.NeonRef
 
 // Service is one previewable app's declaration: its Neon reference (nil if
 // it has no database), its env wiring as unevaluated templates (see
 // template.go for the primitives), and which of those env keys must resolve
-// to a non-empty value.
-type Service struct {
-	Neon     *NeonRef          `json:"neon,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
-	Required []string          `json:"required,omitempty"`
-}
+// to a non-empty value. It aliases registry.Preview, the fleet registry's
+// optional per-service preview block.
+type Service = registry.Preview
 
 // Registry is every previewable service, keyed by name.
 type Registry map[string]Service
 
-// LoadRegistry parses the embedded registry.yaml — the single source of
-// truth for which services are previewable, their Neon references, and
-// their env wiring.
+// LoadRegistry loads the fleet registry and narrows it to the preview view
+// (see FromFleet). It's the preview control plane's sole entry point onto
+// the registry; registry.Load is the one that actually parses and embeds
+// the YAML.
 func LoadRegistry() (Registry, error) {
-	return parseRegistry(registryYAML)
+	fleet, err := registry.Load()
+	if err != nil {
+		return nil, err
+	}
+	return FromFleet(fleet), nil
 }
 
-// parseRegistry parses raw registry YAML. It is split out from LoadRegistry
-// so tests can exercise malformed and invalid input without touching the
-// embedded file.
-//
-// Unknown fields (typos in a service's neon/env/required keys) are rejected
-// so they surface here, at load time, rather than silently doing nothing at
-// preview-creation time. Every required key must also appear in that
-// service's env — a required key with no template to resolve is a registry
-// bug, not a runtime error to discover later.
-func parseRegistry(data []byte) (Registry, error) {
-	var reg Registry
-	if err := sigsyaml.UnmarshalStrict(data, &reg); err != nil {
-		return nil, fmt.Errorf("preview: parsing registry: %w", err)
+// FromFleet narrows a fleet registry down to the previewable subset,
+// promoting each service's Preview block to the map value -- exactly the
+// shape this package's orchestration logic has always operated on, now
+// sourced from the fleet-wide registry.yaml instead of one of its own.
+// Services with no preview block are dropped, matching the old registry's
+// contents exactly (it only ever held the three previewable services).
+// PreviewNames is the single source of truth for "previewable" -- this
+// reuses it rather than re-testing svc.Preview != nil itself.
+func FromFleet(fleet registry.Registry) Registry {
+	names := fleet.PreviewNames()
+	reg := make(Registry, len(names))
+	for _, name := range names {
+		reg[name] = *fleet[name].Preview
 	}
-	for name, svc := range reg {
-		for _, key := range svc.Required {
-			if _, ok := svc.Env[key]; !ok {
-				return nil, fmt.Errorf("preview: registry: %s: required key %q has no matching env template", name, key)
-			}
-		}
-	}
-	return reg, nil
+	return reg
 }
 
 // Names returns the previewable service names, sorted.
