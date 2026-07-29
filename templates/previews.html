@@ -1,7 +1,15 @@
 {{/* previews.html reuses the jobs tab's grid/card idiom (jobs-grid/jobs-head/
      jobs-row/jobs-desktop/jobs-mobile/job-card/jobs-empty): previews are a
      flat list with the same six-column shape jobs already has, and no new
-     CSS is allowed for this tab. */}}
+     CSS is allowed for this tab.
+
+     The PHASE cell additionally narrates .Step (creating) and .Error
+     (failed, alongside its retained last step) using c-mut/c-red — the same
+     muted/error color classes fleet.go already assigns job StateClass — so a
+     creating or failed preview reads like "creating · building
+     footstrike-api (1/2)" or "failed · building footstrike-api (1/2) —
+     build ended with status FAILURE". A ready preview (Step/Error both "")
+     renders its bare phase, identical to before this was added. */}}
 {{define "tab-body"}}
 <div class="previews"{{if .AnyActive}} data-active{{end}}>
 
@@ -14,7 +22,7 @@
       <span class="mono w6">{{.Tag}}</span>
       <span class="mono">{{or .Branch "—"}}</span>
       <span>{{template "preview-apps" .}}</span>
-      <span class="c-mut">{{.Phase}}</span>
+      {{template "preview-phase" .}}
       <span class="c-mut">{{.Health}}</span>
       <span class="c-mut" title="{{abstime .CreatedAt}}">{{reltime .CreatedAt}}</span>
     </div>
@@ -29,6 +37,9 @@
       <div class="job-card-top"><span class="mono w6">{{.Tag}}</span><span class="c-mut">{{.Phase}}</span></div>
       <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}</div>
       <div class="c-mut job-card-meta">{{template "preview-apps" .}}</div>
+      {{if or .Step .Error}}
+      <div class="job-card-meta">{{if .Step}}<span class="c-mut">{{.Step}}</span>{{end}}{{if .Error}} <span class="c-red">{{.Error}}</span>{{end}}</div>
+      {{end}}
     </div>
     {{else}}
     <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
@@ -41,3 +52,10 @@
 {{/* preview-apps renders one preview's app links (name → its preview URL),
      shared by the desktop APPS column and the mobile card meta line. */}}
 {{define "preview-apps"}}{{if .URLs}}{{range $app, $url := .URLs}}<a href="{{$url}}" target="_blank" class="jobs-link">{{$app}}</a> {{end}}{{else}}<span class="c-faint">—</span>{{end}}{{end}}
+
+{{/* preview-phase renders the desktop PHASE cell: the bare phase, plus (when
+     present) its step narration and, for a failed preview, the retained
+     error in c-red. Everything stays inside one <span> so a failed row
+     (which adds the error) still counts as exactly one grid item — the
+     jobs-grid CSS is shared with jobs.html and assumes six. */}}
+{{define "preview-phase"}}<span class="c-mut">{{.Phase}}{{if .Step}} · {{.Step}}{{end}}{{if .Error}} — <span class="c-red">{{.Error}}</span>{{end}}</span>{{end}}

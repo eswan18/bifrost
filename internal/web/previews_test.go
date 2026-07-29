@@ -230,8 +230,11 @@ func TestPreviewsListJSONEmpty(t *testing.T) {
 // --- UI tab ------------------------------------------------------------------
 
 func TestPreviewsPage(t *testing.T) {
+	creating := nsInfo("preview-x", "x", "footstrike-api", "creating")
+	creating.Annotations["bifrost/step"] = "building footstrike-api (1/2)"
 	k := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-hae-cadence", "hae-cadence", "foo", "ready"),
+		creating,
 	}}
 	h, sess := newTestHandlers(t, k)
 	req := authed(t, "GET", "/previews", "", sess)
@@ -248,9 +251,78 @@ func TestPreviewsPage(t *testing.T) {
 	if !strings.Contains(body, `class="tab active"`) {
 		t.Error("previews tab not marked active")
 	}
-	// One preview: the nav badge should render its count.
-	if !strings.Contains(body, `Previews<span class="tab-count">1</span>`) {
+	// Two previews: the nav badge should render their count.
+	if !strings.Contains(body, `Previews<span class="tab-count">2</span>`) {
 		t.Error("nav badge should show PreviewCount when non-zero")
+	}
+	// The creating preview's step must be narrated next to its phase.
+	if !strings.Contains(body, "building footstrike-api (1/2)") {
+		t.Error("creating preview's step text missing from page")
+	}
+	// The ready preview (no step annotation) must render its bare phase —
+	// no step decoration, no stray separator, nothing tacked on.
+	if !strings.Contains(body, `<span class="c-mut">ready</span>`) {
+		t.Error("ready preview must render its bare phase with no step")
+	}
+}
+
+// TestPreviewsPageCreatingWithoutStepRendersClean guards the "older preview,
+// no step annotation" case (a preview created before this feature existed,
+// or simply between step writes): Step is "" but Phase is still "creating",
+// and the PHASE cell must render just the bare phase — no dangling " · "
+// separator, no "unknown" placeholder, no broken markup.
+func TestPreviewsPageCreatingWithoutStepRendersClean(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-x", "x", "footstrike-api", "creating"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// The exact-match here (not just Contains) is the "not unknown, no
+	// broken markup" assertion: it pins the PHASE cell's entire content to
+	// the bare phase, with nothing appended (no "unknown" placeholder, no
+	// dangling " · " separator, no stray markup) when Step is absent — the
+	// HEALTH column legitimately renders "unknown" for this pod-less
+	// fixture, so a body-wide substring check for "unknown" would be a
+	// false positive here.
+	if !strings.Contains(body, `<span class="c-mut">creating</span>`) {
+		t.Error("phase with no step must render bare, got a decorated or broken phase cell")
+	}
+	if strings.Contains(body, "creating ·") {
+		t.Error("phase with no step must not leave a dangling separator")
+	}
+}
+
+// TestPreviewsPageShowsFailedStepAndError covers the third phase in the
+// contract: a failed preview keeps narrating its last step (task 1 retains
+// it rather than clearing it) and additionally surfaces the error, in
+// c-red — the same color class fleet.go already uses for a failed job's
+// StateClass — so a failed row reads as "failed while building X" plus why.
+func TestPreviewsPageShowsFailedStepAndError(t *testing.T) {
+	failed := nsInfo("preview-x", "x", "footstrike-api", "failed")
+	failed.Annotations["bifrost/step"] = "building footstrike-api (1/2)"
+	failed.Annotations["bifrost/error"] = "build ended with status FAILURE"
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{failed}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "building footstrike-api (1/2)") {
+		t.Error("failed preview must retain and show its last step")
+	}
+	if !strings.Contains(body, `<span class="c-red">build ended with status FAILURE</span>`) {
+		t.Error("failed preview must show its error in c-red")
 	}
 }
 
