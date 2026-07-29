@@ -26,7 +26,7 @@ forecasting:
     prod: https://forecasting.ethanswan.com
 
 # Previewable services. Adding one here + a cloudbuild-preview.yaml and
-# {repo}-preview-build trigger in its repo is the whole onboarding path —
+# {service}-preview-build trigger in its repo is the whole onboarding path —
 # no Go changes. Templates resolve by cascade, stopping at the first hit:
 #   1. X is part of this preview -> X's preview URL ({{ url X }}) or its
 #      in-cluster preview DNS ({{ internalUrl X }}).

@@ -3,9 +3,15 @@
 Bifrost's Apps/Jobs tabs, promote/rollback, and build-status badges are all
 driven off one file: `internal/registry/registry.yaml`. Adding a service
 there is bifrost's entire side of onboarding — a single YAML entry, no Go
-changes, no rebuild required (it's read at process start, so a live pod
-needs a restart to pick up a new entry). Everything else — the app's own CI,
-its Kubernetes manifests, its GCP identity/secrets, and its ArgoCD
+code changes. That file is compiled into the binary (`//go:embed
+registry.yaml` in `internal/registry/registry.go`), not read from disk at
+runtime, so a merged entry only takes effect through bifrost's normal
+deploy lifecycle: bifrost's own CI builds a new image from the merged
+commit, staging picks it up automatically via ArgoCD Image Updater, and
+prod picks it up once someone runs `ib promote bifrost`. Restarting a
+*live* pod on an unchanged image does nothing — it comes back up with the
+same embedded (old) registry. Everything else — the app's own CI, its
+Kubernetes manifests, its GCP identity/secrets, and its ArgoCD
 `Application`s — is plumbing that lives outside this repo. This doc draws
 that line explicitly so a future onboarding doesn't have to rediscover it.
 
@@ -33,7 +39,12 @@ types:
   service name (e.g. `asset-manager`'s repo is `asset_manager`). Omit it and
   the service name is used unchanged. This feeds `Registry.RepoFor`, which
   bifrost uses to build the "view commit" link next to a deployed SHA — get
-  it wrong and that link 404s, but nothing else breaks.
+  it wrong and that link 404s. For a non-previewable service that's the only
+  effect; for a previewable one, `RepoFor` is also how the preview
+  orchestrator finds `branch` for membership (`BranchSHA`,
+  `orchestrator.go`'s `resolveMembers`) and fetches k8s manifests
+  (`FetchK8s`, `renderAndApply`) — get it wrong there and the service either
+  never joins a preview or fails to render one.
 - **`urls.staging`** / **`urls.prod`** (both optional) — the public URL for
   the "open ↗" link on that environment's card. Leave a field (or the whole
   `urls:` block) empty for a service with no ingress on that environment —
@@ -45,11 +56,12 @@ types:
   service with no `preview:` block simply isn't a preview candidate, and
   everything above still works without it.
 
-That's it on bifrost's side. The moment this entry merges and the running
-pod restarts, the service appears in the Apps tab (`Registry.Names()` drives
-that list directly) and in the Jobs tab, reading `<name>-staging`/
-`<name>-prod` — even before any of the infrastructure below exists, just
-with pods/images showing as unknown/absent until it does.
+That's it on bifrost's side. Once a new image carrying this entry is
+running — staging automatically, prod after `ib promote bifrost` — the
+service appears in the Apps tab (`Registry.Names()` drives that list
+directly) and in the Jobs tab, reading `<name>-staging`/`<name>-prod` — even
+before any of the infrastructure below exists, just with pods/images showing
+as unknown/absent until it does.
 
 If you also want a Cloud Build status badge and pipeline link on the card,
 GCP builds must find a Cloud Build trigger literally named `<name>-build`
@@ -106,7 +118,7 @@ If the service is also going to be previewable, add a `preview:` sub-block
 per step 1 above, then follow "Onboarding a new previewable app" in
 [`docs/preview-environments.md`](preview-environments.md#onboarding-a-new-previewable-app)
 for the two additional preview-only pieces (a `cloudbuild-preview.yaml` and
-a `{repo}-preview-build` trigger). That's strictly additive to everything
+a `<name>-preview-build` trigger). That's strictly additive to everything
 above — a service is a normal fleet member first, previewable second.
 
 ## Gotcha: `ib.py`'s own service list

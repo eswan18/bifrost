@@ -56,7 +56,7 @@ ingress class staging uses.
 3. **Ensure the namespace**: `preview-<tag>`, annotated
    `bifrost/branch`, `bifrost/apps` (comma-joined members), and
    `bifrost/phase: creating`.
-4. **Build**: run each member's `{repo}-preview-build` Cloud Build trigger and
+4. **Build**: run each member's `{service}-preview-build` Cloud Build trigger and
    wait for it (`buildPollInterval`, 10s), collecting the resulting short SHA.
    Every member's build runs, every time — there is no check for "this SHA
    already has a preview image."
@@ -194,10 +194,13 @@ changes:
    push trigger, no `--all-tags`, and the `preview-` prefix deliberately
    fails the staging ImageUpdater's `allowTags` regexp so a preview build can
    never accidentally auto-deploy to staging).
-3. **A `{repo}-preview-build` manual-invocation Cloud Build trigger** in
+3. **A `{service}-preview-build` manual-invocation Cloud Build trigger** in
    infra's Pulumi (`__main__.py`'s `for preview_repo in [...]` loop, pinned to
    `cloudbuild-preview.yaml` on the repo's `main`) — add the repo name to
-   that list and `pulumi up`. The GCP IAM prod bifrost needs to run any
+   that list and `pulumi up`. The trigger is named after the registry key
+   (matching what `Orchestrator.TriggerIDs` looks up), not the repo — the two
+   coincide for every previewable service today, but aren't guaranteed to.
+   The GCP IAM prod bifrost needs to run any
    preview-build trigger (`cloudbuild.builds.editor` + `actAs` on the Cloud
    Build SA) is already granted once, not per app.
 
@@ -206,7 +209,7 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
 ## Gotchas
 
 - **Preview builds are manual-only** — nothing fires on push or PR. A branch
-  with no completed `{repo}-preview-build` run has no image for `up` to
+  with no completed `{service}-preview-build` run has no image for `up` to
   deploy.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `ib preview up <branch>` — safe, since every stage is

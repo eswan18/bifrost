@@ -66,7 +66,7 @@ func main() {
 	// reg narrows the fleet-wide registry down to the previewable subset —
 	// the shape the preview control plane below expects. Other fleet-wide
 	// consumers of the full registry (build badges, service cards, ...) are
-	// wired up in a later plan step.
+	// wired up right here in this file, off `fleet` directly.
 	reg := preview.FromFleet(fleet)
 
 	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)

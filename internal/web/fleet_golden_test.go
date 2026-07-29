@@ -81,11 +81,12 @@ func goldenFleetConfig() *config.Config {
 
 // goldenFleetRegistry is the registry-shaped equivalent of the four maps
 // goldenFleetConfig used to carry, populated with the exact values
-// k8s/base/configmap.yaml carries today (SERVICES, REPO_OVERRIDES,
-// STAGING_URLS, PROD_URLS) — the same source Task 1 verified registry.yaml
-// against field-by-field. A self-contained literal (not registry.Load()) so
-// this golden can't silently start passing/failing because someone edited
-// the embedded registry.yaml for an unrelated reason.
+// k8s/base/configmap.yaml carried at the base commit (SERVICES,
+// REPO_OVERRIDES, STAGING_URLS, PROD_URLS) — the same source Task 1 verified
+// registry.yaml against field-by-field. A self-contained literal (not
+// registry.Load()) so this golden can't silently start passing/failing
+// because someone edited the embedded registry.yaml for an unrelated
+// reason.
 func goldenFleetRegistry() registry.Registry {
 	return registry.Registry{
 		"asset-manager": {
