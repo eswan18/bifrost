@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +36,11 @@ type Orchestrator struct {
 	Neon       neon.Client
 	Builds     gcb.Client
 	TriggerIDs map[string]string // {svc}-preview-build → Cloud Build trigger ID
+	// Registry is every previewable service's Neon reference and env
+	// wiring (see registry.yaml); Up and renderAndApply both thread it
+	// into envConfigFor. Normally populated once at startup via
+	// LoadRegistry() (main.go) rather than reloaded per-request.
+	Registry Registry
 
 	mu   sync.Mutex
 	busy map[string]bool
@@ -104,14 +107,31 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	if len(members) == 0 {
 		return fmt.Errorf("preview: Up: branch %q matches no preview-eligible service", branch)
 	}
-	// Mandatory-triple pre-flight: if the dashboard is going to be rendered
-	// at all, every one of its three APP_* vars must resolve before we touch
-	// the cluster. dashboardEnvConfig is the same function stage 6 uses to
-	// build the dashboard's actual ConfigMap data, so this pre-check and the
-	// real computation can never disagree.
-	if slices.Contains(members, svcDashboard) {
-		if _, err := dashboardEnvConfig(members, tag, o.Cfg); err != nil {
-			return fmt.Errorf("preview: Up: dashboard env config: %w", err)
+	// Mandatory required-key pre-flight: any member whose registry entry
+	// declares Required env keys (today, only footstrike-dashboard's
+	// mandatory APP_API_URL/APP_IDENTITY_URL/APP_OAUTH_CLIENT_ID triple) must
+	// have every one of them resolve to a non-empty value before we touch
+	// the cluster. envConfigFor is the same function stage 6 uses to build
+	// that service's actual ConfigMap data, so this pre-check and the real
+	// computation can never disagree AS LONG AS the Required-bearing service
+	// also has no staging baseline of its own -- true of every one today
+	// (footstrike-dashboard ships no staging/configmap-env.yaml, so passing
+	// an empty stagingData here, before it's even been fetched, matches what
+	// the real render step will see too). A future Required-key service that
+	// DOES ship a staging baseline could disagree between this pre-check
+	// (which never sees it) and the real computation (which would) -- but
+	// only in the fail-closed direction: this pre-flight would reject a
+	// preview that the real render step, with the actual baseline available,
+	// would have gone on to render successfully.
+	for _, svc := range members {
+		if len(o.Registry[svc].Required) == 0 {
+			continue
+		}
+		// envConfigFor's own error already names both the service and that
+		// it's an env-config failure ("preview: env config for %s: ..."), so
+		// this only adds the missing "which stage of Up" context.
+		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry); err != nil {
+			return fmt.Errorf("preview: Up: pre-flight: %w", err)
 		}
 	}
 
@@ -183,12 +203,13 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 	return cause
 }
 
-// resolveMembers determines which of Cfg.PreviewServices have branch pushed
-// to their repo: ErrNoBranch means "not a member", any other error aborts
-// the whole run (we can't tell membership, so we can't safely proceed).
+// resolveMembers determines which of the registry's previewable services
+// have branch pushed to their repo: ErrNoBranch means "not a member", any
+// other error aborts the whole run (we can't tell membership, so we can't
+// safely proceed).
 func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]string, error) {
 	var members []string
-	for _, svc := range o.Cfg.PreviewServices {
+	for _, svc := range o.Registry.Names() {
 		_, err := o.GitHub.BranchSHA(ctx, o.Cfg.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
@@ -253,17 +274,18 @@ func (o *Orchestrator) awaitBuild(ctx context.Context, buildID string) (string, 
 }
 
 // branchNeonDatabases ensures a preview-<tag> Neon branch exists for every
-// member with a configured NeonProjectRef, returning each one's connection
-// URI. Errors are wrapped without ever including the URI itself (it's a
-// secret) — only service/project identifiers appear in the returned error.
+// member with a registry-declared Neon reference, returning each one's
+// connection URI. Errors are wrapped without ever including the URI itself
+// (it's a secret) — only service/project identifiers appear in the returned
+// error.
 func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, members []string) (map[string]string, error) {
 	dbURIs := make(map[string]string, len(members))
 	for _, svc := range members {
-		ref, ok := o.Cfg.NeonProjects[svc]
-		if !ok {
+		ref := o.Registry[svc].Neon
+		if ref == nil {
 			continue
 		}
-		uri, err := o.ensureNeonBranch(ctx, ref, tag)
+		uri, err := o.ensureNeonBranch(ctx, *ref, tag)
 		if err != nil {
 			return nil, fmt.Errorf("neon branch for %s: %w", svc, err)
 		}
@@ -272,11 +294,11 @@ func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, memb
 	return dbURIs, nil
 }
 
-// ensureNeonBranch finds (or creates) projectID's preview-<tag> branch and
-// returns its connection URI for ref's database/role.
-func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProjectRef, tag string) (string, error) {
+// ensureNeonBranch finds (or creates) ref's project's preview-<tag> branch
+// and returns its connection URI for ref's database/role.
+func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (string, error) {
 	branchName := "preview-" + tag
-	branches, err := o.Neon.ListBranches(ctx, ref.ProjectID)
+	branches, err := o.Neon.ListBranches(ctx, ref.Project)
 	if err != nil {
 		return "", fmt.Errorf("listing branches: %w", err)
 	}
@@ -288,13 +310,13 @@ func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProj
 		}
 	}
 	if branchID == "" {
-		created, err := o.Neon.CreateBranch(ctx, ref.ProjectID, branchName, "")
+		created, err := o.Neon.CreateBranch(ctx, ref.Project, branchName, "")
 		if err != nil {
 			return "", fmt.Errorf("creating branch: %w", err)
 		}
 		branchID = created.ID
 	}
-	uri, err := o.Neon.ConnectionURI(ctx, ref.ProjectID, branchID, ref.Database, ref.Role)
+	uri, err := o.Neon.ConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.Role)
 	if err != nil {
 		return "", fmt.Errorf("fetching connection uri: %w", err)
 	}
@@ -306,7 +328,7 @@ func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref config.NeonProj
 // plus the shared wildcard TLS cert every preview namespace needs.
 func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []string, dbURIs map[string]string) error {
 	for _, svc := range members {
-		if _, ok := o.Cfg.NeonProjects[svc]; !ok {
+		if o.Registry[svc].Neon == nil {
 			continue
 		}
 		overrides := map[string][]byte{"DATABASE_URL": []byte(dbURIs[svc])}
@@ -332,12 +354,16 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		if err != nil {
 			return fmt.Errorf("parse staging env for %s: %w", svc, err)
 		}
-		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg)
+		// No extra wrap here: envConfigFor's own error already names both the
+		// service and the stage ("preview: env config for %s: ..."); adding
+		// another "env config for %s: %w" around it would just duplicate
+		// that segment in the bifrost/error annotation a human reads.
+		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry)
 		if err != nil {
-			return fmt.Errorf("env config for %s: %w", svc, err)
+			return err
 		}
 		secretName := ""
-		if _, ok := o.Cfg.NeonProjects[svc]; ok {
+		if o.Registry[svc].Neon != nil {
 			secretName = previewSecretName(svc)
 		}
 		objs, err := Render(RenderInput{
@@ -361,11 +387,12 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 func previewSecretName(svc string) string { return svc + "-preview-secrets" }
 
 // Down tears tag's preview down: delete its namespace, then best-effort
-// delete a preview-<tag> Neon branch from every *configured* NeonProjectRef —
-// not just the tag's current members, since a re-created preview may have
-// changed its membership since the branch was created, and Down has no other
-// way to know which projects to check. Every step is attempted regardless of
-// earlier failures; all errors are joined and returned.
+// delete a preview-<tag> Neon branch from every registry service that
+// declares a Neon reference — not just the tag's current members, since a
+// re-created preview may have changed its membership since the branch was
+// created, and Down has no other way to know which projects to check. Every
+// step is attempted regardless of earlier failures; all errors are joined
+// and returned.
 func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 	if !o.acquire(tag) {
 		return ErrBusy
@@ -377,16 +404,15 @@ func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 		errs = append(errs, fmt.Errorf("delete namespace: %w", err))
 	}
 
-	svcs := make([]string, 0, len(o.Cfg.NeonProjects))
-	for svc := range o.Cfg.NeonProjects {
-		svcs = append(svcs, svc)
-	}
-	sort.Strings(svcs) // deterministic order for logs/tests; map order is not
+	svcs := o.Registry.Names() // already sorted: deterministic order for logs/tests
 
 	branchName := "preview-" + tag
 	for _, svc := range svcs {
-		ref := o.Cfg.NeonProjects[svc]
-		branches, err := o.Neon.ListBranches(ctx, ref.ProjectID)
+		ref := o.Registry[svc].Neon
+		if ref == nil {
+			continue
+		}
+		branches, err := o.Neon.ListBranches(ctx, ref.Project)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("neon list branches for %s: %w", svc, err))
 			continue
@@ -395,7 +421,7 @@ func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 			if b.Name != branchName {
 				continue
 			}
-			if err := o.Neon.DeleteBranch(ctx, ref.ProjectID, b.ID); err != nil {
+			if err := o.Neon.DeleteBranch(ctx, ref.Project, b.ID); err != nil {
 				errs = append(errs, fmt.Errorf("neon delete branch for %s: %w", svc, err))
 			}
 			break

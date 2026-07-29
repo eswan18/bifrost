@@ -1,21 +1,11 @@
 package preview
 
 import (
-	"errors"
 	"fmt"
-	"slices"
+	"sort"
 
 	"github.com/eswan18/bifrost/internal/config"
 	sigsyaml "sigs.k8s.io/yaml"
-)
-
-// Service names the preview control plane treats specially: footstrike-api's
-// and identity's env config get identity-aware URL overrides, and the
-// dashboard's env config is synthesized from scratch rather than fetched.
-const (
-	svcFootstrikeAPI = "footstrike-api"
-	svcDashboard     = "footstrike-dashboard"
-	svcIdentity      = "identity"
 )
 
 // stagingConfigMapPath is where github.FetchK8s's returned map carries the
@@ -25,8 +15,7 @@ const stagingConfigMapPath = "staging/configmap-env.yaml"
 
 // parseStagingEnv extracts the staging ConfigMap's data map from a member's
 // fetched k8s/ tree. A repo with no staging/configmap-env.yaml (e.g. the
-// dashboard, which is env-agnostic) yields an empty map, not an error —
-// envConfigFor's dashboard branch ignores it anyway.
+// dashboard, which is env-agnostic) yields an empty map, not an error.
 func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
 	content, ok := k8sFiles[stagingConfigMapPath]
 	if !ok {
@@ -46,102 +35,75 @@ func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
 
 // envConfigFor computes the final preview ConfigMap data for one member
 // service. It is a pure function: stagingData is never mutated, and the same
-// inputs always produce the same output — everything the orchestrator needs
-// to know (the preview's tag and its full member list) is passed in
-// explicitly rather than read from shared state.
+// inputs always produce the same output — everything needed (the preview's
+// tag, its full member list, and the registry describing every previewable
+// service's env wiring) is passed in explicitly rather than read from shared
+// state.
 //
-//   - footstrike-api: staging config plus ENV=preview, PUBLIC_API_BASE_URL /
-//     PUBLIC_DASHBOARD_BASE_URL pointed at this preview's own URLs, and
-//     IDENTITY_PROVIDER_URL/JWT_ISSUER repointed at the preview's own
-//     identity when identity is a member (otherwise left as whatever the
-//     branch's staging config already had — normally staging identity).
-//   - identity: staging config plus JWT_ISSUER repointed at identity's own
-//     preview URL, since identity's issuer claim must describe wherever
-//     identity itself is actually running.
-//   - footstrike-dashboard: synthesized from scratch (dashboard ships no
-//     staging/configmap-env.yaml — its image is env-agnostic), and the
-//     mandatory triple: APP_API_URL/APP_IDENTITY_URL derived from membership
-//     (preview URL when the service is a member, else its configured staging
-//     URL) and APP_OAUTH_CLIENT_ID from cfg.PreviewOAuthClientID. Any of the
-//     three being unresolvable is an error — the dashboard preview image
-//     carries no baked fallback, so a partial set only fails at runtime in
-//     the browser (see the preview design doc).
-//   - anything else: staging config passed through unchanged.
-func envConfigFor(svc, tag string, members []string, stagingData map[string]string, cfg *config.Config) (map[string]string, error) {
-	switch svc {
-	case svcDashboard:
-		return dashboardEnvConfig(members, tag, cfg)
-	case svcFootstrikeAPI:
-		return footstrikeAPIEnvConfig(tag, members, stagingData), nil
-	case svcIdentity:
-		return identityEnvConfig(tag, members, stagingData), nil
-	default:
-		return copyStringMap(stagingData), nil
-	}
-}
-
-func footstrikeAPIEnvConfig(tag string, members []string, stagingData map[string]string) map[string]string {
+// The result is stagingData copied verbatim, then reg[svc]'s env templates
+// (registry.yaml's Service.Env) rendered over it one key at a time via
+// Eval/EvalContext — see template.go for the resolution cascade each
+// template goes through. A service with no registry entry (there is none
+// today, but the registry doesn't guarantee full coverage) passes staging
+// data through unchanged, matching previewable services with no special env
+// wiring.
+//
+// Once every key has rendered, every key named in reg[svc]'s Required list
+// must have rendered to a non-empty value — a required key that resolves to
+// "" (e.g. an unset PreviewOAuthClientID rendering "{{ config
+// previewOAuthClientID }}" to "") is an error, not a silently broken preview
+// deploy. This complements parseRegistry's load-time check: that only proves
+// a required key has *a* template to render; this proves the rendered value
+// is actually usable.
+//
+// Callers must draw svc from members (as every real call site does — see
+// orchestrator.go's "for _, svc := range members" loops): Eval's "{{ url
+// self }}" resolves svc == ctx.Service to its own preview URL
+// unconditionally, regardless of whether svc actually appears in members
+// (see EvalContext.Members and resolveURL in template.go). Calling this with
+// svc absent from members would silently change that service's own "self"
+// URL semantics rather than erroring.
+func envConfigFor(svc, tag string, members []string, stagingData map[string]string, cfg *config.Config, reg Registry) (map[string]string, error) {
 	data := copyStringMap(stagingData)
-	// Previews are staging-flavored, and ENV is not a free-form label: the api
-	// validates it against a closed set (dev|staging|prod) and exits at import
-	// on anything else. It only selects an optional .env.{ENV} file, which
-	// images don't ship — so "staging" is both accurate and the value that
-	// keeps app repos from needing to know previews exist. Everything genuinely
-	// preview-specific is overridden by key below.
-	data["ENV"] = "staging"
-	data["PUBLIC_API_BASE_URL"] = previewURL(svcFootstrikeAPI, tag)
-	data["PUBLIC_DASHBOARD_BASE_URL"] = previewURL(svcDashboard, tag)
-	if slices.Contains(members, svcIdentity) {
-		data["IDENTITY_PROVIDER_URL"] = internalPreviewURL(svcIdentity, tag)
-		data["JWT_ISSUER"] = previewURL(svcIdentity, tag)
-	}
-	return data
-}
 
-func identityEnvConfig(tag string, members []string, stagingData map[string]string) map[string]string {
-	data := copyStringMap(stagingData)
-	if slices.Contains(members, svcIdentity) {
-		data["JWT_ISSUER"] = previewURL(svcIdentity, tag)
+	entry, ok := reg[svc]
+	if !ok {
+		return data, nil
 	}
-	return data
-}
 
-// dashboardEnvConfig builds the dashboard's mandatory env triple. It is
-// called both as Up's stage-1 pre-flight validation (dashboard member
-// without all three resolvable must fail before EnsureNamespace ever runs)
-// and, later, to compute the dashboard's actual ConfigMap data — the same
-// logic must produce the same verdict both times, so there is exactly one
-// implementation.
-func dashboardEnvConfig(members []string, tag string, cfg *config.Config) (map[string]string, error) {
-	apiURL, err := memberOrStagingURL(svcFootstrikeAPI, tag, members, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("APP_API_URL: %w", err)
+	ctx := EvalContext{
+		Service:  svc,
+		Tag:      tag,
+		Members:  members,
+		Cfg:      cfg,
+		Baseline: stagingData,
 	}
-	identityURL, err := memberOrStagingURL(svcIdentity, tag, members, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("APP_IDENTITY_URL: %w", err)
-	}
-	if cfg.PreviewOAuthClientID == "" {
-		return nil, errors.New("APP_OAUTH_CLIENT_ID: PreviewOAuthClientID is not configured")
-	}
-	return map[string]string{
-		"APP_API_URL":         apiURL,
-		"APP_IDENTITY_URL":    identityURL,
-		"APP_OAUTH_CLIENT_ID": cfg.PreviewOAuthClientID,
-	}, nil
-}
 
-// memberOrStagingURL resolves the URL a dashboard preview should point at
-// for svc: its own preview URL when svc is a member of this preview,
-// otherwise its configured staging URL. Neither being available is an error.
-func memberOrStagingURL(svc, tag string, members []string, cfg *config.Config) (string, error) {
-	if slices.Contains(members, svc) {
-		return previewURL(svc, tag), nil
+	// Sorted, not range-order: map iteration order is randomized, and a
+	// registry with more than one unresolvable key would otherwise report a
+	// different offender on every run.
+	keys := make([]string, 0, len(entry.Env))
+	for key := range entry.Env {
+		keys = append(keys, key)
 	}
-	if url := cfg.StagingURLs[svc]; url != "" {
-		return url, nil
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		ctx.Key = key
+		val, err := Eval(entry.Env[key], ctx)
+		if err != nil {
+			return nil, fmt.Errorf("preview: env config for %s: %w", svc, err)
+		}
+		data[key] = val
 	}
-	return "", fmt.Errorf("%s is not in this preview and has no staging URL configured", svc)
+
+	for _, key := range entry.Required {
+		if data[key] == "" {
+			return nil, fmt.Errorf("preview: env config for %s: %s: required but rendered empty", svc, key)
+		}
+	}
+
+	return data, nil
 }
 
 // previewURL is the externally-reachable preview URL for svc (see
