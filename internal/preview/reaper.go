@@ -36,38 +36,35 @@ const sweepBudget = 10 * time.Minute
 // time.Now so callers (and tests) fix the instant the whole sweep is judged
 // against.
 //
-// It reclaims only on unambiguous evidence that a preview is past due.
-// Anything else is skipped silently — not reported as an error, because none
-// of these are one:
+// It reclaims only on unambiguous evidence that a preview is past due. Every
+// rule about a namespace's own state lives in reclaimable; a namespace it
+// rejects is skipped silently — not reported as an error, because none of
+// those cases are one. Three further skips are the sweep's own:
 //
-//   - no bifrost/expires-at, an empty one, or one that doesn't parse. The
-//     annotation is optional and most previews carry none; a value bifrost
-//     can't read means "no expiry", never "expired long ago".
-//   - an expiry still in the future.
-//   - a namespace already Terminating: its teardown is underway.
-//   - bifrost/phase=creating: an Up is still running, and deleting the
-//     namespace out from under it races a create that may be minutes from
-//     finishing. Note what this does NOT say: that the preview will be
-//     reclaimed on a later pass. Nothing moves a namespace out of creating
-//     except the Up that wrote it (to ready, or to failed via fail()), so a
-//     preview whose Up died with the process — a spot-node preemption, the
-//     routine case — sits at creating forever and this sweep will never
-//     reclaim it. That is deliberate: see the note below.
+//   - a namespace labelled bifrost/preview=true but not named preview-<tag>:
+//     there is no tag to derive from it safely. Logged as a warning (silent
+//     like the rest as far as the returned error goes), since it means
+//     something outside bifrost applied that label.
 //   - a tag that's Busy: an Up or Down holds it. Down would refuse it with
 //     ErrBusy anyway; checking first keeps that off the error list, where it
 //     would read as a failure rather than as the sweep deferring.
+//   - a namespace whose re-read, immediately before teardown, no longer says
+//     it is reclaimable — or that has vanished by then. See below.
 //
-// The permanently-creating case is left to a human on purpose. Bounding it
-// would mean guessing, from bifrost/step-since, when an Up stopped making
-// progress — and that annotation is best-effort (step() swallows its write
-// errors), absent on a preview that died before its first step, and legally
-// stale for a long while: a real Up can spend minutes in a build and five
-// more waiting for pods, under a 30-minute API-layer ceiling. A bound short
-// enough to be useful is a bound that eventually deletes a live create, which
-// is the one outcome this whole design refuses. A wedged creating preview is
-// visible as such in the UI and `ib preview list`, and `ib preview down`
-// tears it down on demand (teardown does not consult the phase at all), so
-// the manual path is short. Recorded as a known limitation, not an oversight.
+// The rules are applied twice, to two different reads of the same namespace.
+// ListNamespaces at the top is a snapshot, and a sweep is not instantaneous:
+// an Up that starts AND FINISHES while the loop works through the namespaces
+// ahead of this one leaves that snapshot describing a preview that no longer
+// exists — one just renewed with a fresh 24h expiry, or back at creating.
+// Busy here and Down's own acquire both cover an Up still in flight; neither
+// covers one that already completed. So the decision is re-confirmed against
+// a GetNamespace taken immediately before Down, through the same predicate,
+// and only a namespace still reclaimable on that fresh copy is torn down.
+// A namespace that has vanished by then is skipped silently: something else
+// already tore it down, which is the outcome the sweep wanted anyway. A
+// GetNamespace that actually fails skips it too, but is recorded as an error
+// — a namespace bifrost cannot read is not evidence of anything, least of all
+// a reason to delete it.
 //
 // Deleting an environment someone is still using is the failure mode this
 // function exists to avoid, and every one of those rules trades a preview
@@ -86,11 +83,7 @@ func (o *Orchestrator) PurgeExpired(ctx context.Context, now time.Time) ([]strin
 		errs      []error
 	)
 	for _, ns := range namespaces {
-		if ns.Phase == "Terminating" || ns.Annotations[phaseAnnotationKey] == "creating" {
-			continue
-		}
-		expiry, ok := parseExpiry(ns)
-		if !ok || !expiry.Before(now) {
+		if _, ok := reclaimable(ns, now); !ok {
 			continue
 		}
 		// A labelled namespace that isn't named preview-<tag> has no tag to
@@ -109,6 +102,22 @@ func (o *Orchestrator) PurgeExpired(ctx context.Context, now time.Time) ([]strin
 		// between). Neither is dead code, and no test can tell them apart —
 		// their observable behavior is identical by construction.
 		if o.Busy(tag) {
+			continue
+		}
+		// The snapshot above may be minutes old by now; re-decide on a fresh
+		// copy. Both halves of Down — the namespace AND the Neon branch — are
+		// unrecoverable, so this read is worth its cost on the rare path that
+		// reaches it (only already-expired previews get this far).
+		fresh, found, err := o.Kube.GetNamespace(ctx, ns.Name)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("purge %s: re-read namespace: %w", tag, err))
+			continue
+		}
+		if !found {
+			continue
+		}
+		expiry, ok := reclaimable(fresh, now)
+		if !ok {
 			continue
 		}
 		if err := o.Down(ctx, tag); err != nil {
@@ -131,6 +140,53 @@ func (o *Orchestrator) PurgeExpired(ctx context.Context, now time.Time) ([]strin
 		reclaimed = append(reclaimed, tag)
 	}
 	return reclaimed, errors.Join(errs...)
+}
+
+// reclaimable reports whether ns — on the evidence THIS copy of it carries —
+// is a preview the sweep may tear down at now, returning the expiry it judged
+// so the caller can log what it acted on.
+//
+// It is the single definition of that rule, deliberately: PurgeExpired asks it
+// once about the List snapshot and again about the namespace re-read just
+// before teardown, and two hand-written copies of these conditions drifting
+// apart would be a bug of exactly the kind the re-read exists to prevent.
+//
+// False means "skip, silently" — none of these are errors:
+//
+//   - no bifrost/expires-at, an empty one, or one that doesn't parse. The
+//     annotation is optional and most previews carry none; a value bifrost
+//     can't read means "no expiry", never "expired long ago".
+//   - an expiry still in the future.
+//   - a namespace already Terminating: its teardown is underway.
+//   - bifrost/phase=creating: an Up is still running, and deleting the
+//     namespace out from under it races a create that may be minutes from
+//     finishing. Note what this does NOT say: that the preview will be
+//     reclaimed on a later pass. Nothing moves a namespace out of creating
+//     except the Up that wrote it (to ready, or to failed via fail()), so a
+//     preview whose Up died with the process — a spot-node preemption, the
+//     routine case — sits at creating forever and this sweep will never
+//     reclaim it. That is deliberate: see below.
+//
+// The permanently-creating case is left to a human on purpose. Bounding it
+// would mean guessing, from bifrost/step-since, when an Up stopped making
+// progress — and that annotation is best-effort (step() swallows its write
+// errors), absent on a preview that died before its first step, and legally
+// stale for a long while: a real Up can spend minutes in a build and five
+// more waiting for pods, under a 30-minute API-layer ceiling. A bound short
+// enough to be useful is a bound that eventually deletes a live create, which
+// is the one outcome this whole design refuses. A wedged creating preview is
+// visible as such in the UI and `ib preview list`, and `ib preview down`
+// tears it down on demand (teardown does not consult the phase at all), so
+// the manual path is short. Recorded as a known limitation, not an oversight.
+func reclaimable(ns kube.NamespaceInfo, now time.Time) (time.Time, bool) {
+	if ns.Phase == "Terminating" || ns.Annotations[phaseAnnotationKey] == "creating" {
+		return time.Time{}, false
+	}
+	expiry, ok := parseExpiry(ns)
+	if !ok || !expiry.Before(now) {
+		return time.Time{}, false
+	}
+	return expiry, true
 }
 
 // parseExpiry reads ns's bifrost/expires-at. ok=false means "no expiry":
@@ -174,7 +230,11 @@ func parseExpiry(ns kube.NamespaceInfo) (time.Time, bool) {
 // cancel the Neon calls, and once the namespace is gone the preview is no
 // longer in ListNamespaces at all — no later sweep would ever see it again,
 // so the branch would be orphaned with nothing left to retry it. Detaching
-// lets that in-flight teardown finish through the shutdown drain. It is not
+// buys that in-flight teardown whatever time the process has left, instead of
+// cancelling it the instant the signal lands — and that is less than the
+// shutdown drain suggests: main gives srv.Shutdown a 10s ceiling, but Shutdown
+// returns as soon as connections are idle and main returns right behind it, so
+// the real post-SIGTERM window is usually well under a second. It is not
 // absolute: nothing waits on this goroutine, so a process that exits fast
 // enough can still cut a sweep short. It removes the guaranteed truncation,
 // not the possibility of one.

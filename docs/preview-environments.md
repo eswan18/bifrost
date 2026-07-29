@@ -92,7 +92,10 @@ ingress class staging uses.
    whole retry.
 
    The same write also sets `bifrost/expires-at`: an absolute RFC3339 instant
-   (`now + ttl`) if `ttl` was given, or `""` if it wasn't — written
+   (`now + ttl`, where `now` is *this* step — so the clock starts when `up`
+   begins, not when the preview becomes usable, and a `--ttl 90m` preview
+   whose builds take 25 minutes has 65 minutes of ready life) if `ttl` was
+   given, or `""` if it wasn't — written
    unconditionally either way, for the identical merge reason the error/step
    fields above are cleared unconditionally. **This means re-running `up`
    (a fresh `POST /api/previews` for the same tag) *without* a `ttl` clears
@@ -226,6 +229,18 @@ Every other case is skipped — silently, and never logged as an error:
 - the namespace is labelled `bifrost/preview=true` but its name doesn't have
   the `preview-` prefix — off-convention, so there's no tag to safely derive
   (logged as a warning, but still never acted on).
+
+Those rules are judged **twice**: once against the namespace list the sweep
+starts from, and again against a fresh `GetNamespace` taken immediately before
+each teardown. A sweep isn't instantaneous, and an `up` that starts *and
+finishes* while it works through earlier namespaces would otherwise be
+reclaimed on the strength of the expiry it had when the sweep began — the busy
+set covers an `up` still running, not one that has already completed. A preview
+whose fresh copy has a renewed (or cleared) expiry, or is back in `creating`,
+is left alone; one whose namespace has vanished by then is skipped silently
+(something else tore it down). A namespace that can't be re-read at all is
+skipped too, but that failure *is* reported — an unreadable namespace is no
+evidence of anything, least of all a reason to delete it.
 
 One preview's teardown failing doesn't abort the sweep — errors accumulate
 across the whole pass and are joined, the same way `Down` itself accumulates
@@ -378,6 +393,33 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   rather than firing immediately (see "Automatic expiry" above) — so a
   preview reading "expired" in the UI or past its `expiresAt` in the API
   hasn't necessarily been torn down yet.
+- **A teardown that dies after the namespace delete orphans the Neon branch,
+  and nothing ever retries it.** `Down` deletes the namespace first and the
+  `preview-<tag>` Neon branches second. Once the namespace is gone the preview
+  is no longer in `ListNamespaces`, so no later sweep can see it and no `ib
+  preview down` can name it — whatever the second half didn't finish stays
+  unfinished forever. A Neon list/delete API error does it; so does the process
+  exiting mid-teardown (`RunReaper` runs each sweep on a context detached from
+  shutdown to narrow that window, but nothing waits on the goroutine, so a fast
+  exit can still cut one short). What's left behind is a live Neon branch:
+  billed, and invisible to the UI, `ib preview list` and bifrost generally,
+  since all three list *namespaces*. Nor is there much of a signal — teardown
+  runs in a background goroutine and `DELETE /api/previews/{tag}` answers `202`
+  before it starts, so `ib preview down` reports success either way; the only
+  trace is in bifrost's own logs (`preview delete failed`, or `preview: expiry
+  sweep had failures`). To check for strays, list the branches of every Neon
+  project in `internal/registry/registry.yaml` (the `preview.neon.project`
+  keys — today `footstrike-api`'s and `identity`'s) and look for `preview-*`
+  branches with no matching `preview-<tag>` namespace; delete those by hand.
+- **A `failed` preview still expires, on schedule.** Marking a preview failed
+  writes only `bifrost/phase` and `bifrost/error` — `bifrost/expires-at`
+  survives untouched — and the only phase the sweep skips is `creating`, so a
+  preview created with a `ttl` that then failed to build is reclaimed exactly
+  like a healthy one, Neon branch included. Usually that's the best case (a broken
+  preview is the one least worth keeping), but if you're debugging a failed
+  build, note that the namespace you're reading `kubectl` output from will
+  disappear at its `expiresAt`. Re-running `up` without a `ttl` clears the
+  expiry (see below) at the cost of a full rebuild.
 - **Re-running `up` without a `ttl` clears any expiry the tag already
   had** — it does not leave a previous run's `bifrost/expires-at` in place.
   See step 3 of the `Up` lifecycle above for why. Recovering a stuck or

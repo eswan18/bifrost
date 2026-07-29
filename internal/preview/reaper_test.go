@@ -266,6 +266,113 @@ func TestPurgeExpiredSkipsNamespacesOutsideThePreviewPrefix(t *testing.T) {
 	d.assertUntouched(t, "shadow")
 }
 
+// ---- the pre-teardown re-read -----------------------------------------------
+
+// TestPurgeExpiredRechecksTheNamespaceBeforeTearingItDown covers the one gap
+// the busy set does not: an Up that starts AND FINISHES inside a single sweep,
+// after ListNamespaces has already snapshotted its namespace. Busy(tag) and
+// Down's acquire both cover an Up still in flight; neither sees one that has
+// come and gone, and acting on the snapshot alone would reclaim a preview
+// carrying a freshly renewed expiry — namespace and Neon branch both.
+//
+// Both mutations are worth covering because they are different halves of the
+// same predicate: a renewed expiry (the re-`up --ttl 24h` case) and a phase
+// back at creating (a re-`up` still running when the loop arrives).
+func TestPurgeExpiredRechecksTheNamespaceBeforeTearingItDown(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(ns *fakeNamespace)
+	}{
+		{
+			name:   "its expiry was renewed",
+			mutate: func(ns *fakeNamespace) { ns.annotations["bifrost/expires-at"] = expiryAt(24 * time.Hour) },
+		},
+		{
+			name:   "a new Up put it back in creating",
+			mutate: func(ns *fakeNamespace) { ns.annotations["bifrost/phase"] = "creating" },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newReaperDeps()
+			// Namespaces sweep in name order, so aaa-first's teardown is the
+			// moment mid-sweep at which zzz-renewed changes underneath the
+			// snapshot — the same staging a real concurrent Up would produce,
+			// without needing one to actually run.
+			d.addPreview("aaa-first", expiredAnnotation())
+			d.addPreview("zzz-renewed", expiredAnnotation())
+			d.kube.onDeleteNamespace = func(deleting string) {
+				if deleting == previewNamespace("aaa-first") {
+					tc.mutate(d.kube.namespaces[previewNamespace("zzz-renewed")])
+				}
+			}
+
+			reclaimed, err := d.orch.PurgeExpired(context.Background(), sweepNow)
+			if err != nil {
+				t.Fatalf("PurgeExpired failed: %v", err)
+			}
+			// The control matters as much as the survivor: a sweep that
+			// reclaimed nothing at all would satisfy the untouched assertion
+			// for entirely the wrong reason.
+			assertReclaimed(t, reclaimed, "aaa-first")
+			d.assertTornDown(t, "aaa-first")
+			d.assertUntouched(t, "zzz-renewed")
+		})
+	}
+}
+
+// TestPurgeExpiredSkipsAPreviewThatVanishedMidSweep is the other outcome of
+// that re-read: the namespace is simply gone (an operator's `ib preview down`
+// landed while the sweep was working). Nothing to reclaim and nothing to
+// report — silence, not an error, and above all no Down, whose Neon half would
+// still have run against a preview bifrost no longer owns.
+func TestPurgeExpiredSkipsAPreviewThatVanishedMidSweep(t *testing.T) {
+	d := newReaperDeps()
+	d.addPreview("aaa-first", expiredAnnotation())
+	d.addPreview("zzz-gone", expiredAnnotation())
+	d.kube.onDeleteNamespace = func(deleting string) {
+		if deleting == previewNamespace("aaa-first") {
+			delete(d.kube.namespaces, previewNamespace("zzz-gone"))
+		}
+	}
+
+	reclaimed, err := d.orch.PurgeExpired(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeExpired failed: %v", err)
+	}
+	assertReclaimed(t, reclaimed, "aaa-first")
+	d.assertTornDown(t, "aaa-first")
+	// The namespace is gone either way, so the Neon branch is the only thing
+	// that can tell "skipped" apart from "torn down after the fact".
+	if !d.hasNeonBranch("zzz-gone") {
+		t.Error("neon branch preview-zzz-gone was deleted: Down ran for a namespace that had already gone")
+	}
+}
+
+// TestPurgeExpiredReportsAFailedRecheck pins the fail-closed direction: a
+// re-read that errors is not a licence to fall back on the stale snapshot. The
+// preview stays, and the failure is reported like any other — an unreadable
+// namespace is not evidence of anything, least of all a reason to delete it.
+func TestPurgeExpiredReportsAFailedRecheck(t *testing.T) {
+	d := newReaperDeps()
+	d.addPreview("aaa-unreadable", expiredAnnotation())
+	d.addPreview("zzz-healthy", expiredAnnotation()) // control: this one must go
+	d.kube.getErrByNS = map[string]error{
+		previewNamespace("aaa-unreadable"): errors.New("get namespace: connection refused"),
+	}
+
+	reclaimed, err := d.orch.PurgeExpired(context.Background(), sweepNow)
+	if err == nil {
+		t.Fatal("expected the failed re-read to be reported, got nil")
+	}
+	if !strings.Contains(err.Error(), "aaa-unreadable") || !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error = %q, want it to name both the tag and the cause", err)
+	}
+	assertReclaimed(t, reclaimed, "zzz-healthy")
+	d.assertTornDown(t, "zzz-healthy")
+	d.assertUntouched(t, "aaa-unreadable")
+}
+
 // ---- RunReaper ---------------------------------------------------------------
 
 // TestRunReaperSweepsOnEveryTick is the test that keeps the whole feature from

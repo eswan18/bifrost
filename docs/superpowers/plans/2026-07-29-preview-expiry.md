@@ -282,6 +282,8 @@ git add -A && git commit -m "Show preview expiry on the Previews tab and documen
 
 `--ttl 8h` is passed through verbatim as the request's `ttl` — the server owns parsing and validation, so the CLI must not reimplement duration parsing. Surface the server's 400 message as-is rather than inventing client-side rules that would drift.
 
+The module docstring must say that re-running `ib preview up` **without** `--ttl` clears an expiry the preview already had (Task 1 Step 3's unconditional write). The runbook documents this twice, but the CLI is the only place a human actually meets it: help text that describes `--ttl` as purely additive leaves "I re-ran `up` to rebuild and my 24h expiry vanished" reading as a bug rather than as the documented trade. One sentence, next to the flag.
+
 `expiresAt` is `omitzero`, so the key is **absent** for a preview with no expiry. Use `.get()` with a default everywhere; never `KeyError`. `ib preview list` shows remaining time, or a blank/`-` for no expiry — not `None`.
 
 - [ ] **Step 1: Add the flag and thread it through**
@@ -289,6 +291,8 @@ git add -A && git commit -m "Show preview expiry on the Previews tab and documen
 - [ ] **Step 2: Show expiry in `preview_list`**
 
 - [ ] **Step 3: Update the module docstring**
+
+Cover `--ttl`'s duration format, that omitting it means the preview never expires, and that re-running `up` without it clears an existing expiry.
 
 - [ ] **Step 4: Extend `verify_preview_progress.py`**
 

@@ -249,6 +249,17 @@ type fakeKube struct {
 	// every other one working. deleteErr fails them all; a sweep test needs
 	// one teardown to fail while the next still succeeds.
 	deleteErrByNS map[string]error
+	// getErrByNS fails GetNamespace for named namespaces only — the expiry
+	// sweep's re-read, whose failure must skip that preview rather than let it
+	// be torn down on a stale snapshot.
+	getErrByNS map[string]error
+	// onDeleteNamespace, if set, runs at the top of every DeleteNamespace call
+	// (before the delete itself), and is how a sweep test moves the cluster
+	// underneath an in-progress sweep: renewing a later namespace's expiry, or
+	// deleting it outright, while an earlier one is being torn down. It runs
+	// with f.mu ALREADY HELD, so it must touch f's fields directly rather than
+	// calling back into the fake's own locking methods.
+	onDeleteNamespace func(deleting string)
 }
 
 // isStepOnlyAnnotation reports whether annotations is exactly what
@@ -384,6 +395,9 @@ func (f *fakeKube) CopySecret(_ context.Context, srcNS, srcName, dstNS, dstName 
 func (f *fakeKube) DeleteNamespace(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onDeleteNamespace != nil {
+		f.onDeleteNamespace(name)
+	}
 	if err, ok := f.deleteErrByNS[name]; ok {
 		return err
 	}
@@ -492,19 +506,50 @@ func (f *fakeKube) ListNamespaces(ctx context.Context, selector string) ([]kube.
 		if hasSelector && ns.labels[key] != value {
 			continue
 		}
-		phase := ns.phase
-		if phase == "" {
-			phase = "Active"
-		}
-		out = append(out, kube.NamespaceInfo{
-			Name:        name,
-			Labels:      copyStringMap(ns.labels),
-			Annotations: copyStringMap(ns.annotations),
-			Phase:       phase,
-		})
+		out = append(out, namespaceInfo(name, ns))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// GetNamespace serves the expiry sweep's re-read: the fresh copy it re-decides
+// against immediately before tearing a preview down. Shares namespaceInfo with
+// ListNamespaces so a test can't have the two disagree about a namespace the
+// real cluster would describe identically either way.
+//
+// Context-respecting for the same reason ListNamespaces is, and absent means
+// found=false with a nil error — the contract kube.Client documents, and the
+// case where something else has already deleted the namespace mid-sweep.
+func (f *fakeKube) GetNamespace(ctx context.Context, name string) (kube.NamespaceInfo, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return kube.NamespaceInfo{}, false, err
+	}
+	if err, ok := f.getErrByNS[name]; ok {
+		return kube.NamespaceInfo{}, false, err
+	}
+	ns, ok := f.namespaces[name]
+	if !ok {
+		return kube.NamespaceInfo{}, false, nil
+	}
+	return namespaceInfo(name, ns), true, nil
+}
+
+// namespaceInfo renders one fake namespace as the kube.Client type. An empty
+// fake phase lists as "Active", so only a test that cares has to say anything.
+// Callers must hold f.mu.
+func namespaceInfo(name string, ns *fakeNamespace) kube.NamespaceInfo {
+	phase := ns.phase
+	if phase == "" {
+		phase = "Active"
+	}
+	return kube.NamespaceInfo{
+		Name:        name,
+		Labels:      copyStringMap(ns.labels),
+		Annotations: copyStringMap(ns.annotations),
+		Phase:       phase,
+	}
 }
 
 // Unused kube.Client methods — plain stubs to satisfy the interface.
@@ -518,9 +563,6 @@ func (f *fakeKube) ListCronJobs(context.Context, string) ([]kube.CronJobInfo, er
 func (f *fakeKube) ListJobs(context.Context, string) ([]kube.JobInfo, error) { return nil, nil }
 func (f *fakeKube) ListReplicaSets(context.Context, string) ([]kube.ReplicaSetInfo, error) {
 	return nil, nil
-}
-func (f *fakeKube) GetNamespace(context.Context, string) (kube.NamespaceInfo, bool, error) {
-	return kube.NamespaceInfo{}, false, nil
 }
 
 // ---- test fixtures & helpers ------------------------------------------------
