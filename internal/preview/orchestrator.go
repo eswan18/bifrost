@@ -15,6 +15,8 @@ import (
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/neon"
 	"github.com/eswan18/bifrost/internal/registry"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // ErrBusy reports that an Up or Down for this tag is already in flight. The
@@ -25,6 +27,40 @@ var ErrBusy = errors.New("preview: orchestration already in progress for this ta
 // status. A var (not a const) so tests can shrink it instead of waiting on
 // the real interval.
 var buildPollInterval = 10 * time.Second
+
+// podReadyTimeout bounds Up's final wait for the applied manifests' pods to
+// actually come up. Five minutes covers a cold-node image pull plus a
+// branch's alembic migrations (the "migrate" initContainer) with room to
+// spare, while staying far inside the API layer's 30-minute per-run
+// goroutine budget, so a wedged preview surfaces as a failed one long before
+// the caller's own ceiling fires.
+//
+// podPollInterval is how often that wait re-lists the namespace's pods.
+// Deliberately tighter than buildPollInterval's 10s: a build takes minutes
+// and a poll costs a Cloud Build API call, whereas pods flip to ready in
+// seconds and this poll is what stands between a finished preview and the
+// user being told about it. 60 List calls over the full bound is nothing
+// against the client's 50 QPS budget.
+//
+// Both are vars (not consts) so tests can shrink them instead of waiting on
+// the real values.
+var (
+	podReadyTimeout = 5 * time.Minute
+	podPollInterval = 5 * time.Second
+)
+
+const (
+	// crashLoopBackOff is the one container waiting reason the readiness
+	// wait treats as terminal: the kubelet only reports it after the
+	// container has already failed and been restarted, so waiting out the
+	// rest of the bound would just delay a verdict that's already in.
+	crashLoopBackOff = "CrashLoopBackOff"
+	// podInitializing is what the kubelet reports for an app container
+	// while the pod's init containers are still running. It says nothing
+	// about the app itself, so it's never used as a diagnosis when an init
+	// container has a real reason of its own to report.
+	podInitializing = "PodInitializing"
+)
 
 // Orchestrator composes the preview control plane's clients into the full
 // creation (Up) and teardown (Down) flows. It has no constructor: every
@@ -87,8 +123,19 @@ func (o *Orchestrator) Busy(tag string) bool {
 
 // Up runs the full preview creation flow for branch to completion: resolve
 // membership, stand up (or update) the namespace, build+branch+secret+render
-// each member, and mark the namespace ready. Every stage past EnsureNamespace
-// that fails marks the namespace bifrost/phase=failed with a sanitized
+// each member, wait for the resulting pods to actually report ready, and
+// only then mark the namespace ready.
+//
+// That wait is what bifrost/phase=ready means: not "the manifests were
+// accepted" but "every member has running, ready pods". Applying a
+// Deployment is not evidence its pods can start — a branch whose migrations
+// fail leaves the "migrate" initContainer in Init:CrashLoopBackOff and the
+// app container never runs at all, which the old apply-then-declare-ready
+// flow reported as a perfectly healthy preview. Consumers of the API
+// (`ib preview up`, the Previews tab) rely on this: ready means usable.
+//
+// Every stage past EnsureNamespace that fails — the readiness wait
+// included — marks the namespace bifrost/phase=failed with a sanitized
 // bifrost/error annotation before returning; stage-1 validation failures
 // (bad membership, an unresolvable dashboard triple) return before the
 // namespace is ever touched, so they never leave a zombie behind.
@@ -185,7 +232,12 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 		return o.fail(ctx, ns, err)
 	}
 	o.step(ctx, ns, "applying manifests")
-	if err := o.renderAndApply(ctx, ns, tag, branch, members, shortSHAs); err != nil {
+	appImages, err := o.renderAndApply(ctx, ns, tag, branch, members, shortSHAs)
+	if err != nil {
+		return o.fail(ctx, ns, err)
+	}
+	o.step(ctx, ns, "waiting for pods")
+	if err := o.waitForPods(ctx, ns, members, appImages); err != nil {
 		return o.fail(ctx, ns, err)
 	}
 
@@ -422,15 +474,23 @@ func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []str
 
 // renderAndApply fetches each member's k8s/ tree, computes its env config,
 // renders its manifests, and applies them into ns.
-func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, shortSHAs map[string]string) error {
+//
+// It returns each member's applied app-container image, read back out of the
+// objects it actually applied rather than reconstructed from the naming
+// convention — waitForPods uses it to tell this run's pods apart from the
+// previous run's (see podsForMember), and a reconstruction that drifted from
+// what render really produced would silently match nothing and time out
+// every preview.
+func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, shortSHAs map[string]string) (map[string]string, error) {
+	appImages := make(map[string]string, len(members))
 	for _, svc := range members {
 		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Fleet.RepoFor(svc), branch)
 		if err != nil {
-			return fmt.Errorf("fetch k8s files for %s: %w", svc, err)
+			return nil, fmt.Errorf("fetch k8s files for %s: %w", svc, err)
 		}
 		stagingData, err := parseStagingEnv(k8sFiles)
 		if err != nil {
-			return fmt.Errorf("parse staging env for %s: %w", svc, err)
+			return nil, fmt.Errorf("parse staging env for %s: %w", svc, err)
 		}
 		// No extra wrap here: envConfigFor's own error already names both the
 		// service and the stage ("preview: env config for %s: ..."); adding
@@ -438,7 +498,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		// that segment in the bifrost/error annotation a human reads.
 		envConfig, err := envConfigFor(svc, tag, members, stagingData, o.Cfg, o.Registry, o.Fleet)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		secretName := ""
 		if o.Registry[svc].Neon != nil {
@@ -451,18 +511,308 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 			K8sFiles:   k8sFiles,
 			EnvConfig:  envConfig,
 			SecretName: secretName,
+			Migrate:    o.Registry[svc].Migrate,
 		})
 		if err != nil {
-			return fmt.Errorf("render %s: %w", svc, err)
+			return nil, fmt.Errorf("render %s: %w", svc, err)
 		}
 		if err := o.Kube.ApplyObjects(ctx, ns, objs); err != nil {
-			return fmt.Errorf("apply %s: %w", svc, err)
+			return nil, fmt.Errorf("apply %s: %w", svc, err)
+		}
+		if image := appliedAppImage(objs, svc); image != "" {
+			appImages[svc] = image
 		}
 	}
-	return nil
+	return appImages, nil
+}
+
+// appliedAppImage returns the image of svc's app container in the objects
+// just applied for it — the Deployment named svc (enforced by the generated
+// deployment patch's target) holding the container named svc (enforced by
+// render.go's detectBase). "" when it
+// can't be found, which callers must treat as "don't filter on image"
+// rather than "match nothing".
+func appliedAppImage(objs []*unstructured.Unstructured, svc string) string {
+	for _, o := range objs {
+		if o.GetKind() != "Deployment" || o.GetName() != svc {
+			continue
+		}
+		containers, found, err := unstructured.NestedSlice(o.Object, "spec", "template", "spec", "containers")
+		if err != nil || !found {
+			return ""
+		}
+		if c, ok := findContainerNamed(containers, svc); ok {
+			image, _ := c["image"].(string)
+			return image
+		}
+	}
+	return ""
 }
 
 func previewSecretName(svc string) string { return svc + "-preview-secrets" }
+
+// waitForPods polls ns until every member has at least one Deployment-managed
+// pod and all of those pods report ready, or until podReadyTimeout expires.
+// It's the last stage of Up, and the one that gives bifrost/phase=ready its
+// meaning.
+//
+// Failure modes, all of them ending in a sanitized message safe for the
+// bifrost/error annotation (member name + the pod's own reason — never a
+// connection URI, token, or env value, and never pod logs, which are not
+// sanitizable at all):
+//
+//   - a crash-looping container fails immediately rather than waiting out
+//     the bound: CrashLoopBackOff is already the kubelet's verdict on a
+//     container that failed and was restarted, so there's nothing left to
+//     wait for.
+//   - anything else that hasn't converged — including a member with no pods
+//     at all, which is what a preview whose member rendered no Deployment
+//     looks like — keeps polling until the bound and then fails with
+//     whatever the last observed reason was. "No pods" must never loop
+//     forever waiting for something that will never appear.
+//
+// A ListPods error does NOT fail the run on the spot: it's kept as the
+// current reason and retried until the bound, so one API blip can't destroy
+// a preview whose builds just took ten minutes. If it never clears, the
+// timeout message carries it.
+//
+// appImages (member -> the image renderAndApply just applied for it) scopes
+// the wait to this run's pods; see podsForMember for why that matters.
+func (o *Orchestrator) waitForPods(ctx context.Context, ns string, members []string, appImages map[string]string) error {
+	deadline := time.Now().Add(podReadyTimeout)
+	// Always assigned before the deadline check below can read it: every
+	// path through the loop body either returns or records a reason.
+	var lastReason string
+	for {
+		pods, err := o.Kube.ListPods(ctx, ns)
+		if err != nil {
+			lastReason = "listing pods failed: " + sanitizeReason(err.Error())
+		} else {
+			notReady := membersNotReady(pods, members, appImages)
+			if len(notReady) == 0 {
+				return nil
+			}
+			for _, nr := range notReady {
+				if nr.fatal {
+					return errors.New(nr.String())
+				}
+			}
+			reasons := make([]string, 0, len(notReady))
+			for _, nr := range notReady {
+				reasons = append(reasons, nr.String())
+			}
+			lastReason = strings.Join(reasons, "; ")
+		}
+
+		// Sleep the poll interval, but never past the deadline: the loop
+		// always gets one final check exactly at the bound before giving up.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("timed out after %s waiting for pods: %s", podReadyTimeout, lastReason)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for pods: %w", ctx.Err())
+		case <-time.After(min(podPollInterval, remaining)):
+		}
+	}
+}
+
+// memberNotReady is one member's reason for not being ready yet. fatal marks
+// a reason that will not resolve on its own, so the wait can stop early
+// instead of burning the whole bound.
+type memberNotReady struct {
+	member string
+	reason string
+	fatal  bool
+}
+
+func (m memberNotReady) String() string { return m.member + " not ready: " + m.reason }
+
+// membersNotReady returns one entry per member that isn't ready yet, in
+// members order (deterministic, so a multi-member failure message doesn't
+// shuffle between polls). A ready member contributes nothing.
+func membersNotReady(pods []kube.PodInfo, members []string, appImages map[string]string) []memberNotReady {
+	var out []memberNotReady
+	for _, svc := range members {
+		owned, anyGeneration := podsForMember(pods, svc, appImages[svc])
+		if len(owned) == 0 {
+			reason := "no pods found"
+			if anyGeneration {
+				// The member has pods, just none from this apply yet — the
+				// deployment controller hasn't created the new ReplicaSet's
+				// pods. Saying "no pods found" here would send an operator
+				// hunting for a missing Deployment that's right there.
+				reason = "no pods running this preview's image yet"
+			}
+			out = append(out, memberNotReady{member: svc, reason: reason})
+			continue
+		}
+		var found *memberNotReady
+		for _, p := range owned {
+			reason, fatal := podNotReadyReason(p)
+			if reason == "" {
+				continue
+			}
+			// Report the first unready pod, but let a fatal one anywhere in
+			// the member's set win: a crash-looping replica alongside a
+			// merely-still-starting one is the diagnosis worth surfacing.
+			if found == nil || fatal {
+				found = &memberNotReady{member: svc, reason: reason, fatal: fatal}
+			}
+			if fatal {
+				break
+			}
+		}
+		if found != nil {
+			out = append(out, *found)
+		}
+	}
+	return out
+}
+
+// podsForMember picks out the pods this run's Deployment for svc owns, and
+// reports separately whether svc has any pods at all (from any generation).
+//
+// The join is via the pod's controlling ReplicaSet, whose name is always
+// "<deployment>-<pod-template-hash>" and whose Deployment is named after the
+// service. That naming isn't merely conventional: the generated overlay's
+// deployment patch targets metadata.name: <svc>, so kustomize fails the
+// render outright if the base has no Deployment by that name. (detectBase
+// separately pins the container name and image repo, but not this.)
+// Going through the ReplicaSet
+// rather than matching pod names directly also structurally excludes
+// Job-owned pods — a member's CronJob is suspended in a preview, but a
+// leftover job pod named "<svc>-purge-..." would otherwise match a
+// name-prefix test and could hold a preview un-ready forever. Pods in phase
+// Succeeded are skipped for the same reason: a completed pod is not
+// something to wait on.
+//
+// wantImage (the image renderAndApply just applied for svc, "" if it
+// couldn't be determined) then narrows that to the generation this run
+// created. This is what makes re-running Up a real recovery path rather
+// than a guaranteed second failure: a rolling update keeps the previous
+// generation's pods around until the new ones are ready, so a preview being
+// re-run to FIX a crash-looping migration still has the broken pod sitting
+// in its namespace the whole time the fixed one starts. Judging readiness on
+// that pod would fail the fix on the strength of the bug it fixes.
+//
+// A re-run that produces the same image (rebuilding an unchanged commit) is
+// deliberately not distinguished: those pods are running exactly what this
+// run applied, so they are the right thing to judge.
+func podsForMember(pods []kube.PodInfo, svc, wantImage string) (owned []kube.PodInfo, anyGeneration bool) {
+	for _, p := range pods {
+		if p.OwnerKind != "ReplicaSet" || p.Phase == "Succeeded" {
+			continue
+		}
+		if p.OwnerName != svc && !strings.HasPrefix(p.OwnerName, svc+"-") {
+			continue
+		}
+		anyGeneration = true
+		if wantImage != "" && !runsImage(p, wantImage) {
+			continue
+		}
+		owned = append(owned, p)
+	}
+	return owned, anyGeneration
+}
+
+// runsImage reports whether any of p's containers (app or init — the
+// migrate initContainer shares the app image) runs image exactly.
+func runsImage(p kube.PodInfo, image string) bool {
+	for _, c := range p.Containers {
+		if c.Image == image {
+			return true
+		}
+	}
+	for _, c := range p.InitContainers {
+		if c.Image == image {
+			return true
+		}
+	}
+	return false
+}
+
+// podNotReadyReason returns "" when p is ready, else a short sanitized
+// reason and whether that reason is terminal.
+//
+// Readiness itself is decided by the app containers alone — exactly what
+// Kubernetes means by a ready pod, and the only rule that stays correct for
+// a base declaring a sidecar-style init container that never terminates.
+// Init containers are consulted only to *explain* a not-ready pod, and they
+// go first: while one is running or failing, every app container reports the
+// contentless "PodInitializing", so "migrate initContainer CrashLoopBackOff"
+// is the difference between an operator knowing their migration failed and
+// an operator staring at a generic pod message.
+func podNotReadyReason(p kube.PodInfo) (string, bool) {
+	ready := len(p.Containers) > 0
+	for _, c := range p.Containers {
+		if !c.Ready {
+			ready = false
+			break
+		}
+	}
+	if ready {
+		return "", false
+	}
+	for _, c := range p.InitContainers {
+		if reason, fatal, problem := initContainerProblem(c); problem {
+			return sanitizeReason(c.Name + " initContainer " + reason), fatal
+		}
+	}
+	for _, c := range p.Containers {
+		if c.Ready {
+			continue
+		}
+		if c.WaitingReason != "" {
+			return sanitizeReason(c.WaitingReason), c.WaitingReason == crashLoopBackOff
+		}
+	}
+	if p.Phase != "" && p.Phase != "Running" {
+		return sanitizeReason("pod phase " + p.Phase), false
+	}
+	return "containers not ready", false
+}
+
+// initContainerProblem reports whether an init container is visibly in
+// trouble (problem), what to call it, and whether that's terminal. A
+// successfully completed init container has exit code 0 and no waiting
+// reason, so it reports nothing; one that's simply still running is likewise
+// no problem in itself (the app containers' own state governs readiness).
+//
+// A non-zero exit code is a problem but not terminal: it's the state a
+// failing init container passes through before the kubelet has restarted it
+// enough times to call it CrashLoopBackOff, and the next poll upgrades it.
+func initContainerProblem(c kube.ContainerInfo) (reason string, fatal, problem bool) {
+	switch {
+	case c.WaitingReason == crashLoopBackOff:
+		return c.WaitingReason, true, true
+	case c.WaitingReason != "" && c.WaitingReason != podInitializing:
+		return c.WaitingReason, false, true
+	case c.ExitCode != nil && *c.ExitCode != 0:
+		if c.TerminatedReason != "" && c.TerminatedReason != "Error" {
+			return fmt.Sprintf("%s (exit %d)", c.TerminatedReason, *c.ExitCode), false, true
+		}
+		return fmt.Sprintf("exited %d", *c.ExitCode), false, true
+	}
+	return "", false, false
+}
+
+// sanitizeReason bounds what a pod-derived reason can put into the
+// bifrost/error annotation, which is world-readable in-cluster and served
+// over the JSON API. Container reasons are short CamelCase tokens and are
+// safe by construction; a client-go error string is free-form, so flatten
+// whitespace and cap the length rather than trusting the source. Nothing
+// secret-bearing is ever passed in here (no env values, no connection URIs,
+// no pod logs) — this is the second line of defense, not the first.
+func sanitizeReason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	const maxLen = 160
+	if r := []rune(s); len(r) > maxLen {
+		s = string(r[:maxLen]) + "..."
+	}
+	return s
+}
 
 // Down tears tag's preview down: delete its namespace, then best-effort
 // delete a preview-<tag> Neon branch from every registry service that

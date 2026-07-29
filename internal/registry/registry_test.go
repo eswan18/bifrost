@@ -120,6 +120,10 @@ func TestLoad(t *testing.T) {
 		if len(svc.Preview.Required) != 0 {
 			t.Errorf("Preview.Required = %v, want empty", svc.Preview.Required)
 		}
+		wantMigrate := []string{"alembic", "upgrade", "head"}
+		if !reflect.DeepEqual(svc.Preview.Migrate, wantMigrate) {
+			t.Errorf("Preview.Migrate = %v, want %v", svc.Preview.Migrate, wantMigrate)
+		}
 	})
 
 	t.Run("footstrike-dashboard: urls, preview with no neon, required keys", func(t *testing.T) {
@@ -149,6 +153,9 @@ func TestLoad(t *testing.T) {
 		if !reflect.DeepEqual(svc.Preview.Required, wantRequired) {
 			t.Errorf("Preview.Required = %v, want %v", svc.Preview.Required, wantRequired)
 		}
+		if svc.Preview.Migrate != nil {
+			t.Errorf("Preview.Migrate = %v, want nil (dashboard has no migrate step)", svc.Preview.Migrate)
+		}
 	})
 
 	t.Run("identity: urls and preview (neon + env)", func(t *testing.T) {
@@ -170,6 +177,12 @@ func TestLoad(t *testing.T) {
 		wantEnv := map[string]string{"JWT_ISSUER": "{{ url self }}"}
 		if !reflect.DeepEqual(svc.Preview.Env, wantEnv) {
 			t.Errorf("Preview.Env = %v, want %v", svc.Preview.Env, wantEnv)
+		}
+		// identity isn't previewable yet in the sense of having a verified
+		// migration invocation -- inventing one would be untested
+		// speculation, so it must stay unset.
+		if svc.Preview.Migrate != nil {
+			t.Errorf("Preview.Migrate = %v, want nil (identity has no verified migrate command)", svc.Preview.Migrate)
 		}
 	})
 
@@ -282,6 +295,26 @@ foo:
 		}
 		if reg["foo"].Preview.Neon != nil {
 			t.Errorf("Preview.Neon = %+v, want nil", reg["foo"].Preview.Neon)
+		}
+		if reg["foo"].Preview.Migrate != nil {
+			t.Errorf("Preview.Migrate = %v, want nil (not declared)", reg["foo"].Preview.Migrate)
+		}
+	})
+
+	t.Run("migrate field parses into an ordered command", func(t *testing.T) {
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    env:
+      A: b
+    migrate: ["alembic", "upgrade", "head"]
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"alembic", "upgrade", "head"}
+		if !reflect.DeepEqual(reg["foo"].Preview.Migrate, want) {
+			t.Errorf("Preview.Migrate = %v, want %v", reg["foo"].Preview.Migrate, want)
 		}
 	})
 
