@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -177,6 +178,11 @@ func (f *fakeGCB) GetBuild(_ context.Context, buildID string) (gcb.BuildStatus, 
 type fakeNamespace struct {
 	labels      map[string]string
 	annotations map[string]string
+	// phase is the KUBERNETES namespace status phase ("Active" |
+	// "Terminating"), not the bifrost/phase annotation — the expiry sweep
+	// reads both, and they mean different things. "" lists as "Active", so
+	// only a test that cares has to say anything.
+	phase string
 }
 
 type copySecretCall struct {
@@ -239,6 +245,10 @@ type fakeKube struct {
 	applyErr        error
 	copySecretErr   error
 	deleteErr       error
+	// deleteErrByNS fails DeleteNamespace for named namespaces only, leaving
+	// every other one working. deleteErr fails them all; a sweep test needs
+	// one teardown to fail while the next still succeeds.
+	deleteErrByNS map[string]error
 }
 
 // isStepOnlyAnnotation reports whether annotations is exactly what
@@ -364,6 +374,9 @@ func (f *fakeKube) CopySecret(_ context.Context, srcNS, srcName, dstNS, dstName 
 func (f *fakeKube) DeleteNamespace(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err, ok := f.deleteErrByNS[name]; ok {
+		return err
+	}
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
@@ -447,6 +460,35 @@ func initializingPod(deployment, image string, init ...kube.ContainerInfo) kube.
 	return p
 }
 
+// ListNamespaces serves the expiry sweep. selector is understood only in the
+// single "key=value" form the preview control plane actually uses ("" matches
+// everything) — enough to prove the sweep filters on bifrost/preview rather
+// than reaching for every namespace in the cluster. Results are sorted by
+// name so a multi-namespace sweep processes them in a fixed order.
+func (f *fakeKube) ListNamespaces(_ context.Context, selector string) ([]kube.NamespaceInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key, value, hasSelector := strings.Cut(selector, "=")
+	var out []kube.NamespaceInfo
+	for name, ns := range f.namespaces {
+		if hasSelector && ns.labels[key] != value {
+			continue
+		}
+		phase := ns.phase
+		if phase == "" {
+			phase = "Active"
+		}
+		out = append(out, kube.NamespaceInfo{
+			Name:        name,
+			Labels:      copyStringMap(ns.labels),
+			Annotations: copyStringMap(ns.annotations),
+			Phase:       phase,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 // Unused kube.Client methods — plain stubs to satisfy the interface.
 func (f *fakeKube) ListArgoApps(context.Context) (map[string]kube.AppStatus, error) {
 	return nil, nil
@@ -457,9 +499,6 @@ func (f *fakeKube) ListCronJobs(context.Context, string) ([]kube.CronJobInfo, er
 }
 func (f *fakeKube) ListJobs(context.Context, string) ([]kube.JobInfo, error) { return nil, nil }
 func (f *fakeKube) ListReplicaSets(context.Context, string) ([]kube.ReplicaSetInfo, error) {
-	return nil, nil
-}
-func (f *fakeKube) ListNamespaces(context.Context, string) ([]kube.NamespaceInfo, error) {
 	return nil, nil
 }
 func (f *fakeKube) GetNamespace(context.Context, string) (kube.NamespaceInfo, bool, error) {

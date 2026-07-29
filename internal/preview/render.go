@@ -570,7 +570,7 @@ func previewIngress(in RenderInput) map[string]any {
 	}
 }
 
-func previewNamespace(tag string) string            { return "preview-" + tag }
+func previewNamespace(tag string) string            { return previewNSPrefix + tag }
 func previewEnvConfigMapName(service string) string { return service + "-preview-env" }
 func previewHost(service, tag string) string {
 	return fmt.Sprintf("%s-%s.%s", service, tag, previewDomain)

@@ -27,6 +27,13 @@ import (
 	"github.com/eswan18/bifrost/internal/web"
 )
 
+// previewReapInterval is how often bifrost looks for previews past their
+// bifrost/expires-at. Hourly because the deadline is soft by construction:
+// nothing downstream breaks if a preview outlives its expiry by up to one
+// sweep, and a tighter loop would only List the cluster more often to find
+// nothing (most previews carry no expiry at all).
+const previewReapInterval = time.Hour
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -161,8 +168,13 @@ func main() {
 	// partial config (e.g. a GitHub token but no Neon key, or an empty
 	// registry) leaves webH.Orch nil, and the mutating preview endpoints
 	// answer 503 rather than running a half-wired flow.
+	//
+	// Held concretely as well as through webH.Orch: that field is the narrow
+	// Up/Down/Busy interface the handlers are tested against, and the expiry
+	// sweep below is not a handler concern to widen it with.
+	var orch *preview.Orchestrator
 	if kc != nil && builds != nil && ghClient != nil && neonClient != nil && len(reg) > 0 {
-		webH.Orch = &preview.Orchestrator{
+		orch = &preview.Orchestrator{
 			Cfg:        cfg,
 			Kube:       kc,
 			GitHub:     ghClient,
@@ -172,6 +184,7 @@ func main() {
 			Registry:   reg,
 			Fleet:      fleet,
 		}
+		webH.Orch = orch
 	}
 
 	requireAuth := auth.RequireAuth(sm, cfg.AllowedEmail, "/auth/login")
@@ -224,6 +237,19 @@ func main() {
 	// prod — drain in-flight requests on SIGTERM instead of dropping them.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Reclaim expired previews in the background, on the same ctx the signal
+	// handler cancels so a SIGTERM stops the loop along with the server. Only
+	// when the orchestrator is wired (the same condition that decides whether
+	// webH.Orch is set): without one there is no Down to call.
+	//
+	// Prod runs a single bifrost replica, so this loop exists once. A second
+	// replica would double-fire it — harmless, since teardown is idempotent
+	// and both would go through the same busy set — but nothing here elects a
+	// leader, so that is an observation, not a guarantee.
+	if orch != nil {
+		go orch.RunReaper(ctx, previewReapInterval)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
