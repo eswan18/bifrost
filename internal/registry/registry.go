@@ -40,6 +40,12 @@ type Preview struct {
 	Neon     *NeonRef          `json:"neon,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`
 	Required []string          `json:"required,omitempty"`
+	// Migrate is run as an initContainer before the app starts, with the
+	// same image and env as the app container — so it sees DATABASE_URL
+	// pointing at this preview's fresh Neon branch. Empty = no migration
+	// step. Kept beside Neon deliberately: branch the database, then bring
+	// it up to the branch's schema.
+	Migrate []string `json:"migrate,omitempty"`
 }
 
 // URLs is a service's public endpoints, used for the "open ↗" links on its

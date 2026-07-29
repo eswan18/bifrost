@@ -56,6 +56,15 @@ footstrike-api:
       PUBLIC_DASHBOARD_BASE_URL: "{{ url footstrike-dashboard }}"
       IDENTITY_PROVIDER_URL: "{{ internalUrl identity }}"
       JWT_ISSUER: "{{ url identity }}"
+    # Bare "alembic", not "uv run alembic": the runtime image's final stage
+    # only copies /app (the built venv) from the builder, never the uv/uvx
+    # binaries the builder stage placed in /bin — uv isn't on PATH here.
+    # /app/.venv/bin (where `uv sync` installs alembic's entry-point script)
+    # is on PATH via the image's own ENV, and footstrike-api's own CronJob
+    # (k8s/base/cronjob.yaml, command: ["fitapi-purge"]) already runs its
+    # entry-point scripts the same bare way. Verified against
+    # footstrike-api/Dockerfile.
+    migrate: ["alembic", "upgrade", "head"]
 
 footstrike-dashboard:
   urls:

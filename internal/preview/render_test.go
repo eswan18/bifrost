@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -119,6 +120,13 @@ func TestRenderFootstrikeAPI(t *testing.T) {
 
 	if _, found, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "volumes"); found {
 		t.Errorf("Deployment still has spec.template.spec.volumes, want removed")
+	}
+
+	// in.Migrate is unset in this test's RenderInput: migrate: is optional,
+	// and a service without it must render EXACTLY as today -- no
+	// initContainers at all, not an empty list.
+	if _, found, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers"); found {
+		t.Errorf("Deployment has spec.template.spec.initContainers, want none (Migrate unset)")
 	}
 
 	containers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
@@ -279,6 +287,107 @@ func ingressBackend(t *testing.T, rule map[string]any) (string, int64) {
 	return name, number
 }
 
+// TestRenderMigrateInitContainer is the discriminating test for the whole
+// feature: with RenderInput.Migrate set, the rendered Deployment must gain
+// exactly one "migrate" initContainer sharing the app container's envFrom
+// and, critically, ending up at the SAME retagged image as the app
+// container. That last part is asserted against the actual rendered
+// output rather than assumed: kustomize's images: transformer field-spec
+// config (sigs.k8s.io/kustomize/api/internal/konfig/builtinpluginconsts,
+// imagesFieldSpecs) explicitly lists
+// "spec/template/spec/initContainers[]/image" alongside the containers[]
+// path, both with create:true -- so the transformer does retag
+// initContainers, and this test's image assertion pins that empirically
+// rather than trusting the library's source. If that ever silently
+// stopped being true, this is the assertion that would catch a preview
+// migrating against the WRONG schema version.
+func TestRenderMigrateInitContainer(t *testing.T) {
+	envConfig := loadEnvConfigFixture(t, "footstrike-api")
+	in := RenderInput{
+		Service:    "footstrike-api",
+		Tag:        "hae-cadence",
+		ShortSHA:   "abc1234",
+		K8sFiles:   loadK8sFixture(t, "footstrike-api"),
+		EnvConfig:  envConfig,
+		SecretName: "footstrike-api-preview-secrets",
+		Migrate:    []string{"alembic", "upgrade", "head"},
+	}
+
+	objs, err := Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	dep := findObject(t, objs, "Deployment", "footstrike-api")
+
+	initContainers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers")
+	if err != nil || !found || len(initContainers) != 1 {
+		t.Fatalf("initContainers = %v (found=%v, err=%v), want exactly 1", initContainers, found, err)
+	}
+	initContainer, ok := initContainers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initContainers[0] is not a map: %T", initContainers[0])
+	}
+
+	if name, _ := initContainer["name"].(string); name != "migrate" {
+		t.Errorf("initContainer name = %q, want %q", name, "migrate")
+	}
+
+	wantCommand := []any{"alembic", "upgrade", "head"}
+	if !reflect.DeepEqual(initContainer["command"], wantCommand) {
+		t.Errorf("initContainer command = %v, want %v", initContainer["command"], wantCommand)
+	}
+
+	// The load-bearing assertion: the migrate initContainer's image, after
+	// the shared images: transformer runs, must be byte-identical to the
+	// app container's -- both the repository and the preview-<sha> tag.
+	// A mismatch here would mean the migration silently ran against the
+	// wrong schema version.
+	containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+	if len(containers) != 1 {
+		t.Fatalf("containers = %v, want exactly 1", containers)
+	}
+	appContainer, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("containers[0] is not a map: %T", containers[0])
+	}
+	wantImage := imageRepoBase + "/footstrike-api:preview-abc1234"
+	appImage, _ := appContainer["image"].(string)
+	migrateImage, _ := initContainer["image"].(string)
+	if appImage != wantImage {
+		t.Fatalf("app container image = %q, want %q", appImage, wantImage)
+	}
+	if migrateImage != wantImage {
+		t.Errorf("initContainer image = %q, want %q (must match the app container's retagged image exactly)", migrateImage, wantImage)
+	}
+
+	// envFrom must be the identical list the app container gets: same
+	// base ConfigMap, preview-env ConfigMap, and preview Secret, in the
+	// same order -- so the migrate step sees DATABASE_URL from the same
+	// preview Secret the app does.
+	if !reflect.DeepEqual(initContainer["envFrom"], appContainer["envFrom"]) {
+		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
+	}
+
+	// No volumeMounts: previews strip the base's CSI secrets-store volume
+	// machinery entirely (volumesDeletePatch), and the initContainer is
+	// generated fresh with none to begin with.
+	if _, hasMounts := initContainer["volumeMounts"]; hasMounts {
+		t.Errorf("initContainer has volumeMounts, want none")
+	}
+
+	// restartPolicy untouched: the initContainer itself must not declare
+	// one (that would make it a Kubernetes "sidecar" native init container
+	// that runs alongside the app instead of to completion before it), and
+	// the pod-level spec must not gain one either (the base declares none).
+	if _, hasRestart := initContainer["restartPolicy"]; hasRestart {
+		t.Errorf("initContainer has restartPolicy, want none (would make it a sidecar-style init container)")
+	}
+	if _, found, _ := unstructured.NestedString(dep.Object, "spec", "template", "spec", "restartPolicy"); found {
+		t.Errorf("pod spec has restartPolicy, want untouched/absent (base declares none)")
+	}
+}
+
 func TestRenderDashboard(t *testing.T) {
 	in := RenderInput{
 		Service:  "footstrike-dashboard",
@@ -313,6 +422,11 @@ func TestRenderDashboard(t *testing.T) {
 	}
 	if _, found, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "volumes"); found {
 		t.Errorf("dashboard Deployment has volumes, want none (base declares none)")
+	}
+	// The dashboard has no registry migrate: entry, so RenderInput.Migrate
+	// is unset here too -- must render with no initContainers at all.
+	if _, found, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers"); found {
+		t.Errorf("dashboard Deployment has spec.template.spec.initContainers, want none (Migrate unset)")
 	}
 
 	containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")

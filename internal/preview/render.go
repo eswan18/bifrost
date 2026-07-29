@@ -52,6 +52,15 @@ type RenderInput struct {
 	// SecretName is the preview Secret to wire into envFrom, or "" if the
 	// service has no secret (e.g. the dashboard).
 	SecretName string
+
+	// Migrate, if non-empty, is run as a "migrate" initContainer before the
+	// app container starts: same image (including the preview tag
+	// override) and same envFrom as the app container, so it sees
+	// DATABASE_URL pointing at this preview's fresh Neon branch. Nil/empty
+	// means no migration step, and the rendered Deployment gets no
+	// initContainers at all — this is the common case (see
+	// registry.Preview.Migrate for which services set it and why).
+	Migrate []string
 }
 
 // Render builds a generated kustomize overlay atop the service's fetched
@@ -253,6 +262,17 @@ type baseFacts struct {
 	cronJobName   string
 	configMapName string // "" if the base has no ConfigMap
 	hasVolumes    bool   // the Deployment's pod spec declares any volumes
+	// appImage is the base Deployment's app container's raw image string
+	// (already confirmed by detectBase to start with imageRepoBase + "/" +
+	// service + ":"). deploymentPatch stamps this onto the generated
+	// migrate initContainer so it starts from the exact same repository
+	// path as the app container — there's no base initContainer for a
+	// strategic-merge patch to inherit an image from, unlike the app
+	// container itself, so it has to be given explicitly. Because it's the
+	// same repository path, the overlay's images: transformer (matched by
+	// repository name only) retags it to the same preview-<sha> tag as the
+	// app container.
+	appImage string
 }
 
 // detectBase builds base (without the generated overlay) and scans its
@@ -332,6 +352,7 @@ func detectBase(base resmap.ResMap, service string) (baseFacts, error) {
 					id.Name, service, image, wantImagePrefix,
 				)
 			}
+			f.appImage = image
 		}
 	}
 	return f, nil
@@ -415,6 +436,16 @@ func writeOverlay(fs filesys.FileSystem, in RenderInput, facts baseFacts) error 
 // one), the generated preview-env ConfigMap, and the preview Secret (if the
 // service has one). No explicit target is needed: kustomize infers it from
 // this patch's own apiVersion/kind/metadata.name.
+//
+// When in.Migrate is set, it also adds a single "migrate" initContainer
+// sharing the app container's envFrom (identical list, same object) and
+// starting from the app container's own base image (facts.appImage) so the
+// shared images: transformer retags both to the same preview-<sha> tag —
+// see baseFacts.appImage. It deliberately does not set restartPolicy (which
+// would make it a Kubernetes "sidecar" native init container that runs
+// alongside the app instead of to completion before it) or any
+// volumeMounts (previews strip the base's CSI volume machinery entirely;
+// see volumesDeletePatch).
 func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
 	var envFrom []map[string]any
 	if facts.configMapName != "" {
@@ -431,6 +462,22 @@ func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
 		})
 	}
 
+	podSpec := map[string]any{
+		"containers": []map[string]any{
+			{"name": in.Service, "envFrom": envFrom},
+		},
+	}
+	if len(in.Migrate) > 0 {
+		podSpec["initContainers"] = []map[string]any{
+			{
+				"name":    "migrate",
+				"image":   facts.appImage,
+				"command": []string(in.Migrate),
+				"envFrom": envFrom,
+			},
+		}
+	}
+
 	return map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
@@ -438,11 +485,7 @@ func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
 		"spec": map[string]any{
 			"replicas": 1,
 			"template": map[string]any{
-				"spec": map[string]any{
-					"containers": []map[string]any{
-						{"name": in.Service, "envFrom": envFrom},
-					},
-				},
+				"spec": podSpec,
 			},
 		},
 	}

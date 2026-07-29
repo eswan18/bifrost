@@ -451,6 +451,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 			K8sFiles:   k8sFiles,
 			EnvConfig:  envConfig,
 			SecretName: secretName,
+			Migrate:    o.Registry[svc].Migrate,
 		})
 		if err != nil {
 			return fmt.Errorf("render %s: %w", svc, err)
