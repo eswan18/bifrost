@@ -33,6 +33,10 @@ func LoadTemplates(dir string) (*Renderer, error) {
 		// label stays fresh across the page's background re-renders.
 		"reltime": func(t time.Time) string { return relativeTime(t, time.Now()) },
 		"abstime": absTime,
+		// expiry renders a preview's remaining time until t (or "expired",
+		// or "" for no expiry) against the request-time clock, same
+		// freshness reasoning as reltime above.
+		"expiry": func(t time.Time) string { return expiresIn(t, time.Now()) },
 		// dict builds a map inline so a shared block (e.g. the rollback modal
 		// row) can be handed several named values at once.
 		"dict": func(pairs ...any) (map[string]any, error) {

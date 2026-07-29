@@ -9,7 +9,12 @@
      creating or failed preview reads like "creating · building
      footstrike-api (1/2)" or "failed · building footstrike-api (1/2) —
      build ended with status FAILURE". A ready preview (Step/Error both "")
-     renders its bare phase, identical to before this was added. */}}
+     renders its bare phase, identical to before this was added.
+
+     The AGE cell additionally folds in .ExpiresAt (via preview-expiry)
+     rather than adding a seventh grid column — jobs-grid's CSS is a fixed
+     six-column layout shared with jobs.html. A preview with no TTL (the
+     common case) is unaffected: preview-expiry renders nothing for it. */}}
 {{define "tab-body"}}
 <div class="previews"{{if .AnyActive}} data-active{{end}}>
 
@@ -24,7 +29,7 @@
       <span>{{template "preview-apps" .}}</span>
       {{template "preview-phase" .}}
       <span class="c-mut">{{.Health}}</span>
-      <span class="c-mut" title="{{abstime .CreatedAt}}">{{reltime .CreatedAt}}</span>
+      <span class="c-mut" title="{{abstime .CreatedAt}}">{{reltime .CreatedAt}}{{template "preview-expiry" .}}</span>
     </div>
     {{else}}
     <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
@@ -35,7 +40,7 @@
     {{range .Previews}}
     <div class="job-card">
       <div class="job-card-top"><span class="mono w6">{{.Tag}}</span><span class="c-mut">{{.Phase}}</span></div>
-      <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}</div>
+      <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}{{template "preview-expiry" .}}</div>
       <div class="c-mut job-card-meta">{{template "preview-apps" .}}</div>
       {{if or .Step .Error}}
       <div class="job-card-meta">{{if .Step}}<span class="c-mut">{{.Step}}</span>{{end}}{{if .Error}} <span class="c-red">{{.Error}}</span>{{end}}</div>
@@ -59,3 +64,15 @@
      (which adds the error) still counts as exactly one grid item — the
      jobs-grid CSS is shared with jobs.html and assumes six. */}}
 {{define "preview-phase"}}<span class="c-mut">{{.Phase}}{{if .Step}} · {{.Step}}{{end}}{{if .Error}} — <span class="c-red">{{.Error}}</span>{{end}}</span>{{end}}
+
+{{/* preview-expiry renders " · <remaining time>" for a preview with an
+     expiry, or nothing at all for the zero-valued .ExpiresAt a no-TTL
+     preview (the common case) carries — the expiry template func returns ""
+     for the zero time, so the "with" below never enters and no separator
+     leaks out. It reads "expired" rather than a negative duration once the
+     expiry has passed but the hourly sweep hasn't run yet (internal/preview's
+     RunReaper — up to an hour). Shared by the desktop AGE cell (folded in
+     rather than a seventh jobs-grid column) and the mobile card meta line,
+     the same "no new grid column" reasoning preview-apps above follows for
+     APPS. */}}
+{{define "preview-expiry"}}{{with expiry .ExpiresAt}} · {{.}}{{end}}{{end}}

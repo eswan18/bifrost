@@ -375,6 +375,102 @@ func TestPreviewsPageCreatingWithoutStepRendersClean(t *testing.T) {
 	}
 }
 
+// desktopAgeCell isolates the desktop AGE grid cell's HTML: the AGE span is
+// the only element on the page carrying a title="<abstime>" attribute (the
+// mobile job-card-meta line renders no title at all), so scoping to it makes
+// an assertion attributable to the desktop cell specifically. Without this,
+// a Contains check against the whole body could be satisfied by the mobile
+// card even if the desktop jobs-grid cell were broken — see
+// TestPreviewsPage's comment on the same trap for the PHASE cell.
+func desktopAgeCell(t *testing.T, body, title string) string {
+	t.Helper()
+	start := strings.Index(body, `title="`+title+`"`)
+	if start == -1 {
+		t.Fatalf("age cell title %q not found in body", title)
+	}
+	end := strings.Index(body[start:], "</span>")
+	if end == -1 {
+		t.Fatalf("age cell closing </span> not found after title %q", title)
+	}
+	return body[start : start+end+len("</span>")]
+}
+
+// TestPreviewsPageFutureExpiryShowsRemainingTime covers a preview created
+// with --ttl whose expiry hasn't arrived yet: the AGE cell must show the
+// remaining time, not the absolute instant.
+func TestPreviewsPageFutureExpiryShowsRemainingTime(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+	ns.Annotations["bifrost/expires-at"] = time.Now().Add(6*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{ns}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	cell := desktopAgeCell(t, rec.Body.String(), "2026-07-27 12:00 UTC")
+	if !strings.Contains(cell, "expires in 6h") {
+		t.Errorf("AGE cell = %q, want it to show the remaining time", cell)
+	}
+}
+
+// TestPreviewsPageNoExpiryRendersClean guards the common case — a preview
+// created without --ttl, which never expires — the same way
+// TestPreviewsPageCreatingWithoutStepRendersClean guards a stepless PHASE
+// cell: no expiry text, and critically no dangling " · " separator, since
+// that's the mistake a naive "if not zero, prepend a separator" template
+// change would make even for the field it left empty.
+func TestPreviewsPageNoExpiryRendersClean(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-x", "x", "footstrike-api", "ready"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	cell := desktopAgeCell(t, rec.Body.String(), "2026-07-27 12:00 UTC")
+	if strings.Contains(cell, "expir") {
+		t.Errorf("AGE cell = %q, want no expiry text for a preview with no TTL", cell)
+	}
+	if strings.Contains(cell, " · ") {
+		t.Errorf("AGE cell = %q, want no dangling separator when there is no expiry", cell)
+	}
+}
+
+// TestPreviewsPagePastDueExpiryReadsAsExpired covers a preview whose expiry
+// has passed but the hourly sweep hasn't reclaimed it yet (up to an hour —
+// see internal/preview's RunReaper): it must read as expired, not as a
+// negative duration.
+func TestPreviewsPagePastDueExpiryReadsAsExpired(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+	ns.Annotations["bifrost/expires-at"] = time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{ns}}
+	h, sess := newTestHandlers(t, k)
+	req := authed(t, "GET", "/previews", "", sess)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	cell := desktopAgeCell(t, rec.Body.String(), "2026-07-27 12:00 UTC")
+	if !strings.Contains(cell, "expired") {
+		t.Errorf("AGE cell = %q, want a past-due expiry to read as expired", cell)
+	}
+	// Note the title attribute itself ("2026-07-27 12:00 UTC") has hyphens,
+	// so this must check for a negative *duration* specifically, not "-"
+	// anywhere in the cell.
+	if strings.Contains(cell, "-30m") || strings.Contains(cell, "expires in -") {
+		t.Errorf("AGE cell = %q, must not show a negative remaining time", cell)
+	}
+}
+
 // TestPreviewsPageShowsFailedStepAndError covers the third phase in the
 // contract: a failed preview keeps narrating its last step (task 1 retains
 // it rather than clearing it) and additionally surfaces the error, in
