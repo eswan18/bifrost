@@ -456,7 +456,7 @@ func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, memb
 // ensureNeonBranch finds (or creates) ref's project's preview-<tag> branch
 // and returns its connection URI for ref's database/role.
 func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (string, error) {
-	branchName := "preview-" + tag
+	branchName := previewBranchName(tag)
 	branches, err := o.Neon.ListBranches(ctx, ref.Project)
 	if err != nil {
 		return "", fmt.Errorf("listing branches: %w", err)
@@ -863,7 +863,7 @@ func (o *Orchestrator) Down(ctx context.Context, tag string) error {
 
 	svcs := o.Registry.Names() // already sorted: deterministic order for logs/tests
 
-	branchName := "preview-" + tag
+	branchName := previewBranchName(tag)
 	for _, svc := range svcs {
 		ref := o.Registry[svc].Neon
 		if ref == nil {

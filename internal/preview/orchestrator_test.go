@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -64,25 +65,54 @@ func (f *fakeGitHub) FetchK8s(_ context.Context, repo, _ string) (map[string][]b
 
 // fakeNeon is an in-package hand-fake for neon.Client, keyed by projectID.
 type fakeNeon struct {
-	mu           sync.Mutex
-	branches     map[string][]neon.Branch
-	listErr      map[string]error
-	createErr    map[string]error
-	deleteErr    map[string]error
-	connErr      map[string]error
-	connURI      map[string]string // projectID -> uri to return; default is a synthesized fake uri
-	nextBranchID int
+	mu        sync.Mutex
+	branches  map[string][]neon.Branch
+	listErr   map[string]error
+	createErr map[string]error
+	deleteErr map[string]error
+	// deleteErrOnce fails the FIRST DeleteBranch for a project and then clears
+	// itself, leaving later deletes working. It models the failure the orphan
+	// sweep exists for: a teardown whose Neon half didn't land, leaving a
+	// branch behind that a subsequent pass has to reclaim.
+	deleteErrOnce map[string]error
+	connErr       map[string]error
+	connURI       map[string]string // projectID -> uri to return; default is a synthesized fake uri
+	nextBranchID  int
+	// listCalls counts ListBranches calls per project — how a test asserts the
+	// orphan sweep lists a project ONCE even when two registry services share
+	// it, which no assertion on the resulting deletions can distinguish (a
+	// second pass over the same project deletes nothing either way).
+	listCalls map[string]int
 }
 
 func (f *fakeNeon) ListBranches(_ context.Context, projectID string) ([]neon.Branch, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listCalls == nil {
+		f.listCalls = map[string]int{}
+	}
+	f.listCalls[projectID]++
 	if err, ok := f.listErr[projectID]; ok {
 		return nil, err
 	}
 	out := make([]neon.Branch, len(f.branches[projectID]))
 	copy(out, f.branches[projectID])
 	return out, nil
+}
+
+// hasBranch reports whether project still holds a branch named name, under the
+// fake's lock — safe to call while a sweep goroutine is running.
+func (f *fakeNeon) hasBranch(projectID, name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.ContainsFunc(f.branches[projectID], func(b neon.Branch) bool { return b.Name == name })
+}
+
+// listCallsFor reads the ListBranches count for a project under the lock.
+func (f *fakeNeon) listCallsFor(projectID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls[projectID]
 }
 
 func (f *fakeNeon) CreateBranch(_ context.Context, projectID, name, _ string) (neon.Branch, error) {
@@ -103,6 +133,10 @@ func (f *fakeNeon) CreateBranch(_ context.Context, projectID, name, _ string) (n
 func (f *fakeNeon) DeleteBranch(_ context.Context, projectID, branchID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err, ok := f.deleteErrOnce[projectID]; ok {
+		delete(f.deleteErrOnce, projectID)
+		return err
+	}
 	if err, ok := f.deleteErr[projectID]; ok {
 		return err
 	}

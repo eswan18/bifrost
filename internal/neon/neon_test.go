@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func newTestServer(t *testing.T) (*httptest.Server, *http.ServeMux) {
@@ -36,6 +37,40 @@ func TestListBranches(t *testing.T) {
 	}
 }
 
+// TestListBranchesDecodesCreatedAt pins the field the preview orphan sweep's
+// age floor is built on. The payload is shaped like a real Neon response —
+// created_at is an RFC3339 string, and the object carries fields Branch
+// doesn't declare (Neon's branch object has ~25 of them) — so this also proves
+// the additive field didn't turn the decode strict.
+//
+// The second branch has no created_at at all, which is what the sweep must
+// never silently mistake for "old": it decodes to the zero time, and the
+// assertion says so explicitly rather than leaving it implied.
+func TestListBranchesDecodesCreatedAt(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"branches":[
+			{"id":"br-prev-456","name":"preview-hae-cadence","created_at":"2026-07-29T09:30:00Z","updated_at":"2026-07-29T09:31:00Z","default":false,"current_state":"ready"},
+			{"id":"br-no-ts","name":"preview-undated"}
+		]}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	got, err := c.ListBranches(context.Background(), "proj-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("branches = %+v, want 2", got)
+	}
+	want := time.Date(2026, 7, 29, 9, 30, 0, 0, time.UTC)
+	if !got[0].CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", got[0].CreatedAt, want)
+	}
+	if !got[1].CreatedAt.IsZero() {
+		t.Errorf("CreatedAt for a branch with no created_at = %v, want the zero time", got[1].CreatedAt)
+	}
+}
+
 func TestCreateBranch(t *testing.T) {
 	srv, mux := newTestServer(t)
 	mux.HandleFunc("POST /projects/proj-abc/branches", func(w http.ResponseWriter, r *http.Request) {
@@ -54,7 +89,7 @@ func TestCreateBranch(t *testing.T) {
 			t.Error("expected endpoints in create request (branch needs a compute to connect to)")
 		}
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence"}}`))
+		_, _ = w.Write([]byte(`{"branch":{"id":"br-new-789","name":"preview-hae-cadence","created_at":"2026-07-29T09:30:00Z"}}`))
 	})
 	c := NewWithBaseURL("neon-key", srv.URL)
 	got, err := c.CreateBranch(context.Background(), "proj-abc", "preview-hae-cadence", "")
@@ -63,6 +98,11 @@ func TestCreateBranch(t *testing.T) {
 	}
 	if got.ID != "br-new-789" {
 		t.Errorf("branch = %+v", got)
+	}
+	// createProjectBranch returns the same branch schema listProjectBranches
+	// does, created_at included.
+	if want := time.Date(2026, 7, 29, 9, 30, 0, 0, time.UTC); !got.CreatedAt.Equal(want) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want)
 	}
 }
 

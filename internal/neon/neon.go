@@ -15,9 +15,24 @@ import (
 
 const httpTimeout = 10 * time.Second
 
+// Branch is the slice of Neon's v2 branch object bifrost reads.
+//
+// CreatedAt is the API's created_at — a REQUIRED property of that object
+// (verified against Neon's published OpenAPI spec, neon.com/api_spec/release/
+// v2.json: "created_at" is listed in the Branch schema's required set with
+// format date-time, and both listProjectBranches and createProjectBranch
+// return that same schema). encoding/json parses an RFC3339 string straight
+// into time.Time, so no custom unmarshalling is involved.
+//
+// A missing created_at decodes to the zero time, which reads as "created in
+// year 1" — i.e. arbitrarily old. The preview orphan sweep refuses to delete a
+// branch younger than an hour, so a silently absent timestamp would defeat
+// that floor rather than trip it. The field is required by the API, so this is
+// a note on what to watch for, not a live hazard.
 type Branch struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Client interface {
