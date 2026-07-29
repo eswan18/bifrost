@@ -25,7 +25,7 @@
     {{range .Previews}}
     <div class="jobs-grid jobs-row">
       <span class="mono w6">{{.Tag}}</span>
-      <span class="mono">{{or .Branch "—"}}</span>
+      <span class="mono">{{or .Branch "—"}}{{template "preview-autoupdate" .}}</span>
       <span>{{template "preview-apps" .}}</span>
       {{template "preview-phase" .}}
       <span class="c-mut">{{.Health}}</span>
@@ -40,7 +40,7 @@
     {{range .Previews}}
     <div class="job-card">
       <div class="job-card-top"><span class="mono w6">{{.Tag}}</span><span class="c-mut">{{.Phase}}</span></div>
-      <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}{{template "preview-expiry" .}}</div>
+      <div class="c-mut job-card-meta">{{or .Branch "—"}}{{template "preview-autoupdate" .}} · {{.Health}} · {{reltime .CreatedAt}}{{template "preview-expiry" .}}</div>
       <div class="c-mut job-card-meta">{{template "preview-apps" .}}</div>
       {{if or .Step .Error}}
       <div class="job-card-meta">{{if .Step}}<span class="c-mut">{{.Step}}</span>{{end}}{{if .Error}} <span class="c-red">{{.Error}}</span>{{end}}</div>
@@ -76,3 +76,13 @@
      the same "no new grid column" reasoning preview-apps above follows for
      APPS. */}}
 {{define "preview-expiry"}}{{with expiry .ExpiresAt}} · {{.}}{{end}}{{end}}
+
+{{/* preview-autoupdate marks a preview that follows its branch, folded into
+     the BRANCH cell (and the mobile card's meta line) rather than added as a
+     seventh jobs-grid column — the same fixed-six-column constraint
+     preview-expiry works around, and the branch is what the preview is
+     following, so the marker belongs next to it. Renders nothing at all for
+     the common opted-out preview, separator included, so a row that doesn't
+     auto-update is byte-identical to before this existed. c-mut is the same
+     muted class the rest of this tab already uses; no new CSS. */}}
+{{define "preview-autoupdate"}}{{if .AutoUpdate}} <span class="c-mut" title="auto-updates when new commits land on this branch">· auto</span>{{end}}{{end}}

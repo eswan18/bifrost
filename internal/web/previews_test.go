@@ -202,6 +202,67 @@ func TestRecordFromNamespaceExpiresAt(t *testing.T) {
 	}
 }
 
+// TestRecordFromNamespaceAutoUpdate pins the bifrost/auto-update read: only
+// the literal "true" turns it on, and every other reading of the annotation —
+// absent, "" (what an Up that didn't ask for it writes, since that write
+// merges), and any other value — is off. The negative rows discriminate here
+// in a way the expires-at table's do not: a `!= ""` or `strconv.ParseBool`
+// reading of this annotation would pass the "true" row and fail these.
+func TestRecordFromNamespaceAutoUpdate(t *testing.T) {
+	cases := []struct {
+		name       string
+		annotation string
+		setAnn     bool
+		want       bool
+	}{
+		{"opted in", "true", true, true},
+		{"absent", "", false, false},
+		{"cleared by a re-run that didn't ask for it", "", true, false},
+		{"false", "false", true, false},
+		{"garbage", "yes", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "ready")
+			if tc.setAnn {
+				ns.Annotations["bifrost/auto-update"] = tc.annotation
+			}
+			if got := recordFromNamespace(ns).AutoUpdate; got != tc.want {
+				t.Errorf("AutoUpdate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPreviewJSONOmitsAutoUpdateWhenOff pins the wire shape both directions:
+// present as `"autoUpdate":true` for an opted-in preview, and omitted
+// entirely (omitempty) for every other one, so no existing consumer sees a
+// new key on a preview that behaves exactly as it always did.
+func TestPreviewJSONOmitsAutoUpdateWhenOff(t *testing.T) {
+	on := nsInfo("preview-on", "on", "footstrike-api", "ready")
+	on.Annotations["bifrost/auto-update"] = "true"
+	off := nsInfo("preview-off", "off", "footstrike-api", "ready")
+
+	for _, tc := range []struct {
+		name string
+		ns   kube.NamespaceInfo
+		want bool
+	}{{"on", on, true}, {"off", off, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handlers{Kube: &fakeKube{namespaces: []kube.NamespaceInfo{tc.ns}}}
+			rec := httptest.NewRecorder()
+			h.PreviewsListJSON(rec, httptest.NewRequest("GET", "/api/previews", nil))
+			body := rec.Body.String()
+			if got := strings.Contains(body, `"autoUpdate":true`); got != tc.want {
+				t.Errorf("body %q contains autoUpdate = %v, want %v", body, got, tc.want)
+			}
+			if strings.Contains(body, `"autoUpdate":false`) {
+				t.Errorf("body = %q, want the field omitted rather than rendered false", body)
+			}
+		})
+	}
+}
+
 func TestAssemblePreviews(t *testing.T) {
 	fk := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-b", "b", "footstrike-api", "ready"),
@@ -440,6 +501,48 @@ func TestPreviewsPageNoExpiryRendersClean(t *testing.T) {
 	}
 	if strings.Contains(cell, " · ") {
 		t.Errorf("AGE cell = %q, want no dangling separator when there is no expiry", cell)
+	}
+}
+
+// TestPreviewsPageShowsAutoUpdate covers the tab's whole auto-update surface,
+// both directions, in one place — the second half being what makes the first
+// mean anything.
+//
+// The marker is folded into the BRANCH cell rather than given a seventh
+// jobs-grid column (that grid is a fixed six-column layout shared with
+// jobs.html), so the assertion checks it renders INSIDE that cell —
+// `<span class="mono">{branch}<span class="c-mut"` — and not merely somewhere
+// on the page. A body-wide Contains would pass just as happily if the marker
+// leaked into the tag cell or landed outside the grid entirely.
+//
+// The count of 2 pins both renderings: the desktop grid row and the mobile
+// card's meta line. A marker added to only one of them would leave half the
+// UI silently lying about whether a preview redeploys itself.
+func TestPreviewsPageShowsAutoUpdate(t *testing.T) {
+	auto := nsInfo("preview-auto", "auto-branch", "footstrike-api", "ready")
+	auto.Annotations["bifrost/auto-update"] = "true"
+	manual := nsInfo("preview-manual", "manual-branch", "footstrike-api", "ready")
+
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{auto, manual}}
+	h, sess := newTestHandlers(t, k)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if n := strings.Count(body, "· auto<"); n != 2 {
+		t.Errorf("auto-update marker rendered %d times, want 2 (desktop row + mobile card)", n)
+	}
+	if !strings.Contains(body, `<span class="mono">auto-branch <span class="c-mut"`) {
+		t.Error("auto-update marker is not inside the desktop BRANCH cell")
+	}
+	// The opted-out preview is the control: its branch cell must be exactly
+	// what it was before this feature existed — no marker, and no dangling
+	// separator, which is the mistake an unconditional " · auto" would make.
+	if !strings.Contains(body, `<span class="mono">manual-branch</span>`) {
+		t.Error("a preview that doesn't auto-update must render a bare BRANCH cell")
 	}
 }
 

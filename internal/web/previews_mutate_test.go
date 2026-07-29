@@ -15,6 +15,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/preview"
 )
 
 // syncBuffer is a concurrency-safe bytes.Buffer: the background goroutine
@@ -80,7 +81,7 @@ type fakeOrchestration struct {
 	downErr  error
 
 	gotBranch string
-	gotTTL    time.Duration
+	gotOpts   preview.UpOptions
 	gotTag    string
 	gotCtx    context.Context
 	doneCh    chan struct{}
@@ -99,9 +100,9 @@ func newFakeOrchestration() *fakeOrchestration {
 
 func (f *fakeOrchestration) Busy(tag string) bool { return f.busyTags[tag] }
 
-func (f *fakeOrchestration) Up(ctx context.Context, branch string, ttl time.Duration) error {
+func (f *fakeOrchestration) Up(ctx context.Context, branch string, opts preview.UpOptions) error {
 	f.gotBranch = branch
-	f.gotTTL = ttl
+	f.gotOpts = opts
 	f.gotCtx = ctx
 	f.doneCh <- struct{}{}
 	if f.releaseCh != nil {
@@ -208,13 +209,16 @@ func TestCreatePreviewUpFailureIsLoggedNotSurfaced(t *testing.T) {
 }
 
 // TestCreatePreviewTTLReachesUp pins that a valid Go duration in the body is
-// parsed and handed to Orchestrator.Up, which is the only thing that turns it
-// into a bifrost/expires-at annotation.
+// parsed, turned into the absolute instant Up now takes, and handed over —
+// this handler being where a relative ttl stops being relative, so that the
+// auto-update watcher can pass the resulting instant back through a re-run
+// without extending it.
 func TestCreatePreviewTTLReachesUp(t *testing.T) {
 	fo := newFakeOrchestration()
 	h, _ := newTestHandlers(t, &fakeKube{})
 	h.Orch = fo
 
+	before := time.Now().UTC()
 	req := jsonPost("/api/previews", `{"branch":"hae-cadence","ttl":"90m"}`)
 	rec := httptest.NewRecorder()
 	h.CreatePreviewJSON(rec, req)
@@ -223,14 +227,14 @@ func TestCreatePreviewTTLReachesUp(t *testing.T) {
 		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
 	}
 	fo.waitForCall(t)
-	if fo.gotTTL != 90*time.Minute {
-		t.Errorf("Up called with ttl = %v, want 90m", fo.gotTTL)
+	if delta := fo.gotOpts.ExpiresAt.Sub(before.Add(90 * time.Minute)); delta < -time.Minute || delta > time.Minute {
+		t.Errorf("Up called with ExpiresAt = %v, want ~90m from now (%v)", fo.gotOpts.ExpiresAt, before.Add(90*time.Minute))
 	}
 }
 
 // TestCreatePreviewWithoutTTLIsNoExpiry is the plan's headline constraint: no
-// implicit default TTL. A body with no ttl must reach Up as 0 (no expiry),
-// not as some house default.
+// implicit default TTL. A body with no ttl must reach Up with a zero
+// ExpiresAt (no expiry), not as some house default.
 func TestCreatePreviewWithoutTTLIsNoExpiry(t *testing.T) {
 	fo := newFakeOrchestration()
 	h, _ := newTestHandlers(t, &fakeKube{})
@@ -244,8 +248,44 @@ func TestCreatePreviewWithoutTTLIsNoExpiry(t *testing.T) {
 		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
 	}
 	fo.waitForCall(t)
-	if fo.gotTTL != 0 {
-		t.Errorf("Up called with ttl = %v, want 0 (no expiry) when the field is absent", fo.gotTTL)
+	if !fo.gotOpts.ExpiresAt.IsZero() {
+		t.Errorf("Up called with ExpiresAt = %v, want zero (no expiry) when the field is absent", fo.gotOpts.ExpiresAt)
+	}
+}
+
+// TestCreatePreviewAutoUpdateReachesUp pins the new request field in both
+// directions: "autoUpdate":true reaches Up as AutoUpdate:true, and a body
+// without the field reaches it as false. The false case matters as much as
+// the true one — it's what makes a plain re-POST turn auto-update back off
+// (the same way one without a ttl clears the expiry), so a default of true
+// anywhere in this path would silently opt every preview in.
+func TestCreatePreviewAutoUpdateReachesUp(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"requested", `{"branch":"hae-cadence","autoUpdate":true}`, true},
+		{"explicitly false", `{"branch":"hae-cadence","autoUpdate":false}`, false},
+		{"absent", `{"branch":"hae-cadence"}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fo := newFakeOrchestration()
+			h, _ := newTestHandlers(t, &fakeKube{})
+			h.Orch = fo
+
+			rec := httptest.NewRecorder()
+			h.CreatePreviewJSON(rec, jsonPost("/api/previews", tc.body))
+
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+			}
+			fo.waitForCall(t)
+			if fo.gotOpts.AutoUpdate != tc.want {
+				t.Errorf("Up called with AutoUpdate = %v, want %v", fo.gotOpts.AutoUpdate, tc.want)
+			}
+		})
 	}
 }
 
@@ -311,8 +351,8 @@ func TestCreatePreviewEmptyTTLIsNoExpiry(t *testing.T) {
 		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
 	}
 	fo.waitForCall(t)
-	if fo.gotTTL != 0 {
-		t.Errorf("Up called with ttl = %v, want 0", fo.gotTTL)
+	if !fo.gotOpts.ExpiresAt.IsZero() {
+		t.Errorf("Up called with ExpiresAt = %v, want zero", fo.gotOpts.ExpiresAt)
 	}
 }
 

@@ -29,7 +29,8 @@ token (Secret Manager secret `bifrost_prod_preview_api_token`) against:
 ```
 GET    /api/previews          # list
 GET    /api/previews/{tag}    # one preview's record — ib.py polls this from `up`
-POST   /api/previews          # {"branch": "...", "ttl": "8h"} -> create/update, returns {tag, phase}
+POST   /api/previews          # {"branch": "...", "ttl": "8h", "autoUpdate": true}
+                              #   -> create/update, returns {tag, phase}
 DELETE /api/previews/{tag}    # tear down
 ```
 
@@ -47,6 +48,13 @@ That 720h cap is a typo guard (a fat-fingered `8760h` — a year — instead of
 `8h`), not a policy limit: nothing enforces a maximum preview lifetime, and
 omitting `ttl` entirely still means "never expires."
 
+`autoUpdate`, also on the create request, is an optional boolean (default
+`false`) that opts the preview into re-deploying itself when new commits land
+on its branch — see "Following a branch" below. Like `ttl` it describes the
+whole preview rather than this one run, and like `ttl` it is **not** sticky: a
+re-POST without it turns auto-update back off, for the same merge reason
+described in step 3 of the lifecycle.
+
 A record carries `tag`, `branch`, `apps`, `phase`, `health`, `createdAt`,
 `urls`, plus the progress trio: `step` (what `Up` is doing right now, e.g.
 `building footstrike-api (1/2)`), `stepSince` (RFC3339 — a timestamp, not a
@@ -62,6 +70,11 @@ created with a `ttl`; it's omitted from the JSON entirely (`omitzero`) for
 the common case of a preview with no expiry. See "Automatic expiry" below
 for how and when it's actually enforced.
 
+`autoUpdate` (bool) reports whether the preview follows its branch. It's
+`omitempty`, so it appears only as `"autoUpdate": true` and is absent
+entirely for every preview that didn't opt in — a consumer must read a
+missing key as `false`.
+
 A tag mid-`Up`/`Down` is claimed by an in-memory busy set; a concurrent call
 for the same tag gets `409` (`ib.py`: "That preview is busy").
 
@@ -76,6 +89,8 @@ ingress class staging uses.
    service's GitHub repo. A missing branch means "not a member," not an
    error; any other GitHub error aborts the whole run (membership can't be
    determined, so it's not safe to guess). At least one member is required.
+   The same call returns each member's **full** commit SHA, which step 3
+   records.
 2. **Required-key pre-flight**: any member whose registry entry declares
    `required` env keys (today, only `footstrike-dashboard`'s
    `APP_API_URL`/`APP_IDENTITY_URL`/`APP_OAUTH_CLIENT_ID`) has those keys
@@ -83,17 +98,30 @@ ingress class staging uses.
    anything else is touched. This fails fast, cleanly, if — for
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
 3. **Ensure the namespace**: `preview-<tag>`, annotated
-   `bifrost/branch`, `bifrost/apps` (comma-joined members), and
-   `bifrost/phase: creating` — and, in the same write, `bifrost/error`,
+   `bifrost/branch`, `bifrost/apps` (comma-joined members),
+   `bifrost/source-shas`, and `bifrost/phase: creating` — and, in the same
+   write, `bifrost/error`,
    `bifrost/step` and `bifrost/step-since` explicitly cleared to `""`. That
    clearing matters because this write *merges* onto whatever the namespace
    already has: re-running `up` over a previously failed preview (the recovery
    path below) would otherwise show the old run's error and last step for the
    whole retry.
 
+   `bifrost/source-shas` is what step 1 resolved — comma-joined
+   `service=sha` pairs in the same style as `bifrost/apps`, e.g.
+   `footstrike-api=abc123...,footstrike-dashboard=def456...`. These are
+   **full** commit SHAs, not the `preview-<short sha>` image tags the builds
+   produce, because they exist to be compared against a later `BranchSHA`
+   call by the auto-update watcher. Note *when* it's written: here, at the
+   top of the run, from what was resolved — **not** at the end from what
+   deployed. A run that fails therefore still records the commit it
+   attempted, which is exactly what stops the watcher from retrying a
+   doomed build every two minutes forever (see "Following a branch").
+
    The same write also sets `bifrost/expires-at`: an absolute RFC3339 instant
-   (`now + ttl`, where `now` is *this* step — so the clock starts when `up`
-   begins, not when the preview becomes usable, and a `--ttl 90m` preview
+   (`now + ttl`, where `now` is when the API handler parsed the request — so
+   the clock starts when `up` begins, not when the preview becomes usable,
+   and a `--ttl 90m` preview
    whose builds take 25 minutes has 65 minutes of ready life) if `ttl` was
    given, or `""` if it wasn't — written
    unconditionally either way, for the identical merge reason the error/step
@@ -104,6 +132,15 @@ ingress class staging uses.
    no `ttl`) would let a stale expiry silently survive a retry, which is a
    worse failure mode than a caller needing to resend the same `ttl` to keep
    it.
+
+   `bifrost/auto-update` (`"true"` or `""`) is written in that same call, and
+   is unconditional for that same merge reason: an `up` that doesn't ask for
+   auto-update **turns it off** rather than inheriting it.
+
+   The expiry reaching `Up` as an absolute instant rather than a duration is
+   what lets the auto-update watcher re-run a preview without extending its
+   deadline; `internal/preview`'s `UpOptions` carries both this and the
+   auto-update flag, and says so at length.
 4. **Build**: run each member's `{service}-preview-build` Cloud Build trigger and
    wait for it (`buildPollInterval`, 10s), collecting the resulting short SHA.
    Every member's build runs, every time — there is no check for "this SHA
@@ -252,6 +289,112 @@ One preview's teardown failing doesn't abort the sweep — errors accumulate
 across the whole pass and are joined, the same way `Down` itself accumulates
 Neon errors — and every reclaimed tag is logged with how long it had been
 overdue; a sweep that reclaims nothing logs at debug level only.
+
+## Following a branch (auto-update)
+
+A preview created with `"autoUpdate": true` re-deploys itself when new commits
+land on its branch. It is **opt-in and off by default**: every other preview
+is the snapshot it always was, and pushing to its branch does nothing.
+
+A second goroutine inside prod bifrost (`Orchestrator.RunAutoUpdates`, started
+in `cmd/bifrost/main.go` next to the reaper and gated on the same
+"orchestrator is fully wired" condition) wakes every `autoUpdateInterval` —
+**two minutes** — and calls `PollAutoUpdates` (`internal/preview/autoupdate.go`).
+Like the reaper, the first poll happens a full interval after startup, never
+immediately.
+
+For each preview namespace annotated `bifrost/auto-update: "true"`, one poll:
+
+1. reads its members from `bifrost/apps` and the commit each was deployed
+   from out of `bifrost/source-shas`;
+2. calls `BranchSHA` once per member;
+3. if **any** member's branch SHA differs from the recorded one, re-runs the
+   ordinary `Orchestrator.Up` — the same one `ib preview up` runs, so every
+   member is rebuilt and re-applied and the Neon branch (with its data) is
+   found rather than re-created. There is no partial update: `Up` is
+   all-or-nothing.
+
+It's polling rather than a GitHub webhook, deliberately. A tick only ever sees
+where the branch points *now*, so five pushes in a minute coalesce into one
+redeploy for free (a webhook would fire five times and need a debounce queue);
+it adds no new unauthenticated public endpoint to an internet-facing service;
+and it needs no per-repo webhook configuration. The cost is one `BranchSHA`
+call per member of each opted-in preview per tick — nothing at all for the
+previews that didn't opt in.
+
+**A re-run preserves, never extends.** The watcher parses the namespace's
+existing `bifrost/expires-at` and passes that same absolute instant back
+through, so an auto-updating preview expires exactly when it was always going
+to. (This is why `Up` takes an instant rather than a TTL: a duration would be
+recomputed from "now" on every refresh, and an actively-developed preview —
+the only kind that auto-updates — would keep renewing itself and never expire
+at all.) It also passes `autoUpdate` back as true, so a preview keeps
+following its branch after the first refresh. Nothing else the user set is
+touched.
+
+Every skip is silent, and none is an error:
+
+- no `bifrost/auto-update: "true"` — the default, and almost every preview.
+  Only the literal `"true"` counts; `""` (what an `up` that didn't ask for it
+  writes) and anything else read as off.
+- the namespace is `Terminating` — it's being torn down.
+- `bifrost/phase` is `creating` — an `up` is already running.
+- the tag is `Busy` — an `up` or `down` holds it.
+- the namespace is labelled `bifrost/preview=true` but isn't named
+  `preview-<tag>` — no tag to derive. Unlike the reaper's equivalent case this
+  isn't even logged: at one pass every two minutes, a warning nothing can act
+  on would be 720 log lines a day.
+- `bifrost/apps` lists no members — nothing to compare.
+
+One further skip **is** logged, at info: a member whose branch has been
+**deleted** from its repo (`ErrNoBranch`). Deleting the branch after a merge
+is the normal end of a preview's life rather than a failure, so it isn't
+reported as an error — but the preview then sits at whatever it last deployed
+until someone runs `ib preview down`, and the log line is the only notice of
+that.
+
+**Every refresh is logged**, at info, with the tag, the branch, and which
+member's SHA moved (`footstrike-api <old> -> <new>`) — written *before* the
+re-run starts, so a run that dies mid-flight is still accounted for. This
+redeploys an environment someone may be using; it is never silent.
+
+One preview's failure doesn't stop the others: errors accumulate across the
+pass and come back joined, exactly as the reaper's do. A failure to *list*
+namespaces aborts the pass — with nothing listed there is nothing to compare.
+
+On the Previews tab, an opted-in preview's BRANCH cell reads
+`my-branch · auto` (and the same marker appears on the mobile card's meta
+line). It's folded into that cell rather than given a column of its own —
+`jobs-grid` is a fixed six-column layout shared with the Jobs tab — the same
+way the remaining-time text is folded into AGE. A preview that didn't opt in
+renders exactly as it did before.
+
+### What auto-update does not do
+
+- **It never retries the same commit.** Because `Up` records
+  `bifrost/source-shas` at the top of the run (step 3 above), a run whose
+  build fails has still recorded the SHA it attempted, so the next tick sees
+  no difference and leaves the preview alone. A *newer* push produces a new
+  SHA and is picked up normally. Without that ordering, a broken commit would
+  rebuild every two minutes indefinitely.
+- **A failed auto-update marks a previously-working preview `failed`.** The
+  re-run is an ordinary `Up`, so any failure in it sets `bifrost/phase:
+  failed` and a `bifrost/error` on a preview that was `ready` a moment ago —
+  nobody asked for that redeploy, and nobody is watching `ib preview up`
+  output when it happens. Nothing is torn down (no namespace delete, no Neon
+  branch delete), and if the run failed before the apply stage the previous
+  generation's pods are still running and still serving. Re-running
+  `ib preview up <branch>` is the recovery path, exactly as for any other
+  failed preview.
+- **It does not notice membership *changes*.** The comparison only asks about
+  the members already recorded on the namespace, so a repo that *newly* gained
+  the branch won't be added to a running preview (nor will one that lost it be
+  dropped — that member is instead reported as "branch is gone" and the whole
+  preview stops updating). Changing a preview's membership needs a manual
+  `ib preview up <branch>` re-run, which re-resolves it from scratch.
+- **It doesn't extend an expiry**, so an auto-updating preview created with
+  `--ttl 8h` is still reclaimed 8 hours after it was *created*, however many
+  commits it has absorbed since.
 
 ## Orphaned Neon branches
 
@@ -434,9 +577,12 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
 
 ## Gotchas
 
-- **Preview builds are manual-only** — nothing fires on push or PR. A branch
-  with no completed `{service}-preview-build` run has no image for `up` to
-  deploy.
+- **Preview build triggers are manual-invocation only** — nothing in Cloud
+  Build or GitHub fires on push or PR. A branch with no completed
+  `{service}-preview-build` run has no image for `up` to deploy. The one
+  thing that runs a preview build without a human asking is bifrost's own
+  auto-update watcher (see "Following a branch"), and only for a preview that
+  explicitly opted in — it invokes the same manual trigger.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `ib preview up <branch>` — safe, since every stage is
   idempotent — but it **always re-runs every member's preview build** (no
@@ -449,6 +595,11 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   a human intervenes. It's visible as such in the UI and `ib preview list`;
   `ib preview down` (which doesn't consult phase at all) clears it either
   way.
+- **An auto-updating preview can go from `ready` to `failed` on its own.**
+  Nobody ran a command; a teammate pushed a commit that doesn't build, and two
+  minutes later the preview is `failed` with that build's error. See "What
+  auto-update does not do" above for what survives (everything — nothing is
+  torn down) and how to recover (re-run `ib preview up`).
 - **Expiry is strictly opt-in.** A preview created without a `ttl` never
   expires — there's no implicit default — so most previews, including every
   one that predates this feature, simply carry no `bifrost/expires-at` and

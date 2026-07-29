@@ -47,6 +47,11 @@ type previewRecord struct {
 	// Zero, and so omitted from the JSON, means the preview never expires:
 	// most previews carry no TTL, and that is the default by design.
 	ExpiresAt time.Time `json:"expiresAt,omitzero"`
+	// AutoUpdate reports whether the preview follows its branch
+	// (bifrost/auto-update = "true" — see internal/preview's
+	// autoUpdateAnnotation and PollAutoUpdates). Opt-in and false by
+	// default, so it is omitted from the JSON for almost every preview.
+	AutoUpdate bool `json:"autoUpdate,omitempty"`
 }
 
 // recordFromNamespace derives everything derivable without extra cluster
@@ -62,6 +67,11 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 		URLs:      map[string]string{},
 		Step:      ns.Annotations["bifrost/step"],
 		Error:     ns.Annotations["bifrost/error"],
+		// Exactly the test the watcher itself applies (internal/preview's
+		// autoUpdatable): "true" and nothing else means on, so absent, ""
+		// (what an Up without auto-update writes) and any other value all
+		// read as off.
+		AutoUpdate: ns.Annotations["bifrost/auto-update"] == "true",
 	}
 	if since := ns.Annotations["bifrost/step-since"]; since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
