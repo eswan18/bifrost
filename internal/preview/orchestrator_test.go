@@ -1032,7 +1032,7 @@ func TestUpWaitsForPodsBeforeMarkingReady(t *testing.T) {
 	}
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {migrating, migrating, converged}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
@@ -1085,7 +1085,7 @@ func TestUpFailsWhenMigrateInitContainerCrashLoops(t *testing.T) {
 	}}}
 
 	start := time.Now()
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1133,7 +1133,7 @@ func TestUpTimesOutWhenPodsNeverBecomeReady(t *testing.T) {
 		readyPod("footstrike-dashboard", dashImage),
 	}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to fail when a member's pods never become ready, got nil")
 	}
@@ -1172,7 +1172,7 @@ func TestUpTimesOutWhenAMemberHasNoPods(t *testing.T) {
 	// footstrike-dashboard's pods show up; footstrike-api's never do.
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{readyPod("footstrike-dashboard", dashImage)}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to fail when a member never gets any pods, got nil")
 	}
@@ -1194,7 +1194,7 @@ func TestUpPodWaitRetriesListFailures(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.kube.listPodsErr = errors.New("pods list: connection reset by peer")
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to fail when pods can never be listed, got nil")
 	}
@@ -1223,7 +1223,7 @@ func TestUpPodWaitRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := d.orch.Up(ctx, "hae-cadence")
+	err := d.orch.Up(ctx, "hae-cadence", 0)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1252,7 +1252,7 @@ func TestDownWorksAfterAReadinessFailure(t *testing.T) {
 		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", WaitingReason: "CrashLoopBackOff"}),
 	}}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err == nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err == nil {
 		t.Fatal("expected the Up to fail its readiness wait, got nil")
 	}
 	if len(d.neon.branches["aged-river-81935268"]) != 1 {
@@ -1410,7 +1410,7 @@ func TestUpToleratesThePreviousRunsCrashLoopingPod(t *testing.T) {
 		readyPod("footstrike-dashboard", dashImage)}
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {starting, converged}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed on the previous run's leftover pod: %v", err)
 	}
 	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
