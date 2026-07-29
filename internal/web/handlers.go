@@ -135,6 +135,14 @@ func (h *Handlers) previewsPage(w http.ResponseWriter, r *http.Request, full boo
 	vm := h.dashboardVM(r, "previews", "/partial/previews", f)
 	vm.Previews = records
 	vm.PreviewCount = len(records)
+	// dashboardVM's AnyActive is purely fleet-derived (an app deploying or
+	// building, a job running), and a preview mid-creation is none of those —
+	// so on an otherwise-idle fleet this tab would poll at the 30s IDLE
+	// cadence while the steps it renders ("branching databases", "copying
+	// secrets", "applying manifests") each last a few seconds, and would
+	// simply never show most of them. A creating preview is exactly the
+	// "something is in flight" the fast cadence exists for.
+	vm.AnyActive = vm.AnyActive || anyPreviewCreating(records)
 	if full {
 		vm.Flash = TakeFlash(w, r)
 		h.render(w, "previews", vm)

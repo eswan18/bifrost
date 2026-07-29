@@ -73,11 +73,34 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 	}
 	if ns.Phase == "Terminating" {
 		rec.Phase = "terminating"
+		// A namespace being deleted isn't running its retained step any
+		// more, and Down's own failures are reported to the caller rather
+		// than annotated — so whatever step/error the annotations still hold
+		// describes a run that is over. Left in place they'd read as work in
+		// flight: "terminating · building footstrike-api (1/1) — build ended
+		// with status FAILURE" for a failed preview being torn down.
+		rec.Step = ""
+		rec.StepSince = time.Time{}
+		rec.Error = ""
 	}
 	for _, app := range rec.Apps {
 		rec.URLs[app] = fmt.Sprintf("https://%s-%s.preview.footstrike.run", app, tag)
 	}
 	return rec
+}
+
+// anyPreviewCreating reports whether any preview is mid-creation, i.e.
+// whether an Up is (as far as the cluster's annotations say) still running
+// and writing new steps. previewsPage ORs this into the page's AnyActive so
+// the Previews tab polls on the fast cadence while that's true; see the
+// comment there for why the fleet-derived signal alone isn't enough.
+func anyPreviewCreating(records []previewRecord) bool {
+	for _, rec := range records {
+		if rec.Phase == "creating" {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error) {
