@@ -307,6 +307,19 @@ func (f *fakeKube) AnnotateNamespace(ctx context.Context, name string, annotatio
 	return nil
 }
 
+// annotations returns a snapshot of name's merged annotations, or an empty
+// map if the namespace was never created — so a test asserting on a single
+// key reads a missing namespace as a missing annotation rather than panicking.
+func (f *fakeKube) annotations(name string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ns, ok := f.namespaces[name]
+	if !ok {
+		return map[string]string{}
+	}
+	return copyStringMap(ns.annotations)
+}
+
 func (f *fakeKube) ApplyObjects(_ context.Context, _ string, objs []*unstructured.Unstructured) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -519,7 +532,7 @@ func newTwoMemberDeps(t *testing.T) *testDeps {
 func TestUpHappyPathTwoMembers(t *testing.T) {
 	d := newTwoMemberDeps(t)
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 
@@ -636,10 +649,10 @@ func anyObjectHasImage(calls [][]*unstructured.Unstructured, imageFragment strin
 func TestUpIsIdempotentOnRerun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	ctx := context.Background()
-	if err := d.orch.Up(ctx, "hae-cadence"); err != nil {
+	if err := d.orch.Up(ctx, "hae-cadence", 0); err != nil {
 		t.Fatalf("first Up failed: %v", err)
 	}
-	if err := d.orch.Up(ctx, "hae-cadence"); err != nil {
+	if err := d.orch.Up(ctx, "hae-cadence", 0); err != nil {
 		t.Fatalf("second Up (rerun) failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -651,12 +664,43 @@ func TestUpIsIdempotentOnRerun(t *testing.T) {
 	}
 }
 
+// ---- Up: expiry ---------------------------------------------------------------
+
+func TestUpWithTTLRecordsAnAbsoluteExpiry(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	before := time.Now().UTC()
+	if err := d.orch.Up(context.Background(), "hae-cadence", 8*time.Hour); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/expires-at"]
+	parsed, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("bifrost/expires-at = %q, not RFC3339: %v", got, err)
+	}
+	if delta := parsed.Sub(before.Add(8 * time.Hour)); delta < -time.Minute || delta > time.Minute {
+		t.Errorf("expiry %v is not ~8h after creation", parsed)
+	}
+}
+
+func TestUpWithoutTTLClearsAnyPriorExpiry(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence", 8*time.Hour); err != nil {
+		t.Fatalf("first Up failed: %v", err)
+	}
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+		t.Fatalf("second Up failed: %v", err)
+	}
+	if got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/expires-at"]; got != "" {
+		t.Errorf("bifrost/expires-at = %q after a no-TTL re-run, want cleared", got)
+	}
+}
+
 // ---- Up: failure paths --------------------------------------------------------
 
 func TestUpRejectsEmptyBranch(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	for _, branch := range []string{"", "   "} {
-		if err := d.orch.Up(context.Background(), branch); err == nil {
+		if err := d.orch.Up(context.Background(), branch, 0); err == nil {
 			t.Errorf("Up(%q) = nil, want an error", branch)
 		}
 	}
@@ -669,7 +713,7 @@ func TestUpRejectsBranchWithNoUsableTag(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	// TagForBranch strips every character outside [a-z0-9-]; an all-emoji
 	// (or similarly all-invalid) branch name slugs to "".
-	if err := d.orch.Up(context.Background(), "!!!"); err == nil {
+	if err := d.orch.Up(context.Background(), "!!!", 0); err == nil {
 		t.Fatal("expected an error for a branch that slugs to an empty tag, got nil")
 	}
 }
@@ -678,7 +722,7 @@ func TestUpNeonCreateBranchFailureFailsTheRun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.neon.createErr = map[string]error{"aged-river-81935268": errors.New("neon: quota exceeded")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error when Neon branch creation fails, got nil")
 	}
@@ -705,7 +749,7 @@ func TestUpFinalReadyAnnotateFailureIsReturned(t *testing.T) {
 	// still isolates the final-ready branch specifically.
 	kc.annotateErr = errors.New("annotate: etcd unavailable")
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error when the final ready AnnotateNamespace call fails, got nil")
 	}
@@ -732,7 +776,7 @@ func TestUpFailDetachesAnnotateFromADeadRunContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the run context is already dead before the failure is even reached
 
-	err := d.orch.Up(ctx, "hae-cadence")
+	err := d.orch.Up(ctx, "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -758,7 +802,7 @@ func TestUpBuildFailureSetsPhaseFailed(t *testing.T) {
 		"trig-api": {{Status: "FAILURE"}},
 	}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to fail when a build fails, got nil")
 	}
@@ -800,7 +844,7 @@ func TestUpBuildPollRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := d.orch.Up(ctx, "hae-cadence")
+	err := d.orch.Up(ctx, "hae-cadence", 0)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -831,7 +875,7 @@ func TestUpPollsMultipleTimesBeforeSucceeding(t *testing.T) {
 		"trig-api": {{Status: "QUEUED"}, {Status: "WORKING"}, {Status: "SUCCESS", SHA: "realsha7"}},
 	}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	if !anyObjectHasImage(d.kube.applyCalls, "footstrike-api:preview-realsha7") {
@@ -851,7 +895,7 @@ func TestUpDashboardWithoutClientIDErrors(t *testing.T) {
 	// missing PreviewOAuthClientID.
 	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}, Registry: testRegistry(t), Fleet: testFleet(t)}
 
-	err := o.Up(context.Background(), "dash-only-branch")
+	err := o.Up(context.Background(), "dash-only-branch", 0)
 	if err == nil {
 		t.Fatal("expected an error for a dashboard preview with no PreviewOAuthClientID, got nil")
 	}
@@ -867,7 +911,7 @@ func TestUpNoMembersErrors(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.members = map[string]bool{} // no repo has this branch
 
-	err := d.orch.Up(context.Background(), "nonexistent-branch")
+	err := d.orch.Up(context.Background(), "nonexistent-branch", 0)
 	if err == nil {
 		t.Fatal("expected an error when no service has the branch, got nil")
 	}
@@ -880,7 +924,7 @@ func TestUpAbortsOnNonNotFoundMembershipError(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.branchErr = map[string]error{"footstrike-api": errors.New("github: rate limited")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to abort on a non-ErrNoBranch membership error, got nil")
 	}
@@ -903,7 +947,7 @@ func TestUpNeonSecretNeverLeaksIntoErrorAnnotation(t *testing.T) {
 	d.neon.connURI = map[string]string{"aged-river-81935268": secretURI}
 	d.kube.copySecretErr = errors.New("secret copy: connection refused")
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected Up to fail when CopySecret fails, got nil")
 	}
@@ -921,7 +965,7 @@ func TestUpFailureJoinsAnnotateErrorRatherThanSwallowingIt(t *testing.T) {
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 	d.kube.annotateErr = errors.New("annotate: etcd unavailable")
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -937,7 +981,7 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.fetchErr = map[string]error{"footstrike-api": errors.New("github: tarball 500")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error when fetching a member's k8s/ tree fails, got nil")
 	}
@@ -1511,7 +1555,7 @@ func TestBusyMutex(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- d.orch.Up(context.Background(), "busy-branch") }()
+	go func() { done <- d.orch.Up(context.Background(), "busy-branch", 0) }()
 
 	select {
 	case <-started:
@@ -1522,7 +1566,7 @@ func TestBusyMutex(t *testing.T) {
 	if !d.orch.Busy(tag) {
 		t.Error("Busy(tag) = false while Up is in flight, want true")
 	}
-	if err := d.orch.Up(context.Background(), "busy-branch"); !errors.Is(err, ErrBusy) {
+	if err := d.orch.Up(context.Background(), "busy-branch", 0); !errors.Is(err, ErrBusy) {
 		t.Errorf("concurrent Up = %v, want ErrBusy", err)
 	}
 	if err := d.orch.Down(context.Background(), tag); !errors.Is(err, ErrBusy) {
@@ -1567,7 +1611,7 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 func TestUpReportsStepsInOrder(t *testing.T) {
 	d := newTwoMemberDeps(t)
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 
@@ -1606,7 +1650,7 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 // time locally, per the plan) rather than, say, a duration string.
 func TestUpStepSinceIsAnRFC3339Timestamp(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1635,7 +1679,7 @@ func TestUpStepSinceIsAnRFC3339Timestamp(t *testing.T) {
 // carry no step text, so a finished preview doesn't display a stale one.
 func TestUpReadyClearsStep(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1652,7 +1696,7 @@ func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err == nil {
 		t.Fatal("expected an error when a build fails, got nil")
 	}
@@ -1685,7 +1729,7 @@ func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err == nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err == nil {
 		t.Fatal("expected the first Up to fail (its build fails), got nil")
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1698,7 +1742,7 @@ func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
 	// Retry: same branch, builds now succeed (an unconfigured build in
 	// fakeGCB succeeds immediately).
 	d.gcb.statuses = nil
-	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
 		t.Fatalf("retry Up failed: %v", err)
 	}
 	if len(d.kube.annotationHistory) <= firstRunWrites {
@@ -1732,7 +1776,7 @@ func TestUpStepAnnotationFailureDoesNotFailTheRun(t *testing.T) {
 	kc := d.kube
 	kc.annotateStepErr = errors.New("annotate: connection reset")
 
-	err := d.orch.Up(context.Background(), "hae-cadence")
+	err := d.orch.Up(context.Background(), "hae-cadence", 0)
 	if err != nil {
 		t.Fatalf("Up failed despite step-annotation errors being best-effort: %v", err)
 	}

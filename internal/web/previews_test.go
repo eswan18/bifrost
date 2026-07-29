@@ -166,6 +166,42 @@ func TestRecordFromNamespaceInvalidStepSinceIgnored(t *testing.T) {
 	}
 }
 
+// TestRecordFromNamespaceExpiresAt pins the whole bifrost/expires-at read
+// contract, which is bifrost/step-since's contract exactly: the timestamp is
+// parsed (not just copied), and absent/empty/malformed all degrade to the
+// zero time rather than failing the read.
+//
+// The three degrading cases are deliberately table rows alongside the "set"
+// row rather than tests of their own: on their own they would pass even with
+// the parse in recordFromNamespace deleted (an unset field is zero either
+// way), so they only discriminate as guards against a *future* change — a
+// default TTL, or treating an unreadable expiry as "expired" — with the set
+// row as the control that fails the moment the parse itself regresses.
+func TestRecordFromNamespaceExpiresAt(t *testing.T) {
+	cases := []struct {
+		name       string
+		annotation string
+		setAnn     bool
+		want       time.Time
+	}{
+		{"set", "2026-07-27T20:34:56Z", true, time.Date(2026, 7, 27, 20, 34, 56, 0, time.UTC)},
+		{"absent", "", false, time.Time{}},
+		{"cleared by a no-TTL re-run", "", true, time.Time{}},
+		{"unparseable", "not-a-timestamp", true, time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "ready")
+			if tc.setAnn {
+				ns.Annotations["bifrost/expires-at"] = tc.annotation
+			}
+			if got := recordFromNamespace(ns).ExpiresAt; !got.Equal(tc.want) {
+				t.Errorf("ExpiresAt = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAssemblePreviews(t *testing.T) {
 	fk := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-b", "b", "footstrike-api", "ready"),

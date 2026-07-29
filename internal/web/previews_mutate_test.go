@@ -80,6 +80,7 @@ type fakeOrchestration struct {
 	downErr  error
 
 	gotBranch string
+	gotTTL    time.Duration
 	gotTag    string
 	gotCtx    context.Context
 	doneCh    chan struct{}
@@ -98,8 +99,9 @@ func newFakeOrchestration() *fakeOrchestration {
 
 func (f *fakeOrchestration) Busy(tag string) bool { return f.busyTags[tag] }
 
-func (f *fakeOrchestration) Up(ctx context.Context, branch string) error {
+func (f *fakeOrchestration) Up(ctx context.Context, branch string, ttl time.Duration) error {
 	f.gotBranch = branch
+	f.gotTTL = ttl
 	f.gotCtx = ctx
 	f.doneCh <- struct{}{}
 	if f.releaseCh != nil {
@@ -203,6 +205,115 @@ func TestCreatePreviewUpFailureIsLoggedNotSurfaced(t *testing.T) {
 	}
 	fo.waitForCall(t)
 	waitForLog(t, buf, "build failed")
+}
+
+// TestCreatePreviewTTLReachesUp pins that a valid Go duration in the body is
+// parsed and handed to Orchestrator.Up, which is the only thing that turns it
+// into a bifrost/expires-at annotation.
+func TestCreatePreviewTTLReachesUp(t *testing.T) {
+	fo := newFakeOrchestration()
+	h, _ := newTestHandlers(t, &fakeKube{})
+	h.Orch = fo
+
+	req := jsonPost("/api/previews", `{"branch":"hae-cadence","ttl":"90m"}`)
+	rec := httptest.NewRecorder()
+	h.CreatePreviewJSON(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	fo.waitForCall(t)
+	if fo.gotTTL != 90*time.Minute {
+		t.Errorf("Up called with ttl = %v, want 90m", fo.gotTTL)
+	}
+}
+
+// TestCreatePreviewWithoutTTLIsNoExpiry is the plan's headline constraint: no
+// implicit default TTL. A body with no ttl must reach Up as 0 (no expiry),
+// not as some house default.
+func TestCreatePreviewWithoutTTLIsNoExpiry(t *testing.T) {
+	fo := newFakeOrchestration()
+	h, _ := newTestHandlers(t, &fakeKube{})
+	h.Orch = fo
+
+	req := jsonPost("/api/previews", `{"branch":"hae-cadence"}`)
+	rec := httptest.NewRecorder()
+	h.CreatePreviewJSON(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	fo.waitForCall(t)
+	if fo.gotTTL != 0 {
+		t.Errorf("Up called with ttl = %v, want 0 (no expiry) when the field is absent", fo.gotTTL)
+	}
+}
+
+// TestCreatePreviewBadTTL covers every way a ttl can be rejected. Each must
+// 400 *before* the orchestrator is touched: a preview created with a
+// misunderstood expiry is worse than one not created at all.
+//
+// wantMsg is asserted, not just the status, because the three guards overlap
+// on status: an unparseable duration also yields a zero d, so dropping the
+// parse check would still 400 via the "must be positive" check and a
+// status-only assertion would pass for the wrong reason.
+func TestCreatePreviewBadTTL(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantMsg string
+	}{
+		{"unparseable", `{"branch":"hae-cadence","ttl":"eight hours"}`, "must be a Go duration"},
+		{"bare number, no unit", `{"branch":"hae-cadence","ttl":"8"}`, "must be a Go duration"},
+		{"zero", `{"branch":"hae-cadence","ttl":"0h"}`, "must be positive"},
+		{"negative", `{"branch":"hae-cadence","ttl":"-1h"}`, "must be positive"},
+		{"beyond the typo guard", `{"branch":"hae-cadence","ttl":"8760h"}`, "must be at most"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fo := newFakeOrchestration()
+			h, _ := newTestHandlers(t, &fakeKube{})
+			h.Orch = fo
+
+			rec := httptest.NewRecorder()
+			h.CreatePreviewJSON(rec, jsonPost("/api/previews", tc.body))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			var body struct {
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !strings.Contains(body.Error, tc.wantMsg) {
+				t.Errorf("error = %q, want it to mention %q", body.Error, tc.wantMsg)
+			}
+			fo.mustNotCall(t)
+		})
+	}
+}
+
+// TestCreatePreviewEmptyTTLIsNoExpiry: an explicit empty/whitespace ttl is
+// the CLI's natural rendering of "flag not passed", so it must mean no expiry
+// rather than 400.
+func TestCreatePreviewEmptyTTLIsNoExpiry(t *testing.T) {
+	fo := newFakeOrchestration()
+	h, _ := newTestHandlers(t, &fakeKube{})
+	h.Orch = fo
+
+	req := jsonPost("/api/previews", `{"branch":"hae-cadence","ttl":"  "}`)
+	rec := httptest.NewRecorder()
+	h.CreatePreviewJSON(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	fo.waitForCall(t)
+	if fo.gotTTL != 0 {
+		t.Errorf("Up called with ttl = %v, want 0", fo.gotTTL)
+	}
 }
 
 func TestCreatePreviewEmptyBranch(t *testing.T) {

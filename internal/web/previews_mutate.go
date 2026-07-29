@@ -17,7 +17,7 @@ import (
 // (Up/Down/Busy) rather than standing up a real Orchestrator, which needs
 // five real clients (kube, GitHub, Neon, Cloud Build) to even construct.
 type orchestration interface {
-	Up(ctx context.Context, branch string) error
+	Up(ctx context.Context, branch string, ttl time.Duration) error
 	Down(ctx context.Context, tag string) error
 	Busy(tag string) bool
 }
@@ -33,9 +33,19 @@ type orchestration interface {
 // mid-run still leaves the namespace correctly annotated failed.
 const asyncOrchestrationTimeout = 30 * time.Minute
 
-// createPreviewRequest is POST /api/previews's JSON body.
+// maxPreviewTTL caps the ttl POST /api/previews will accept. It is a typo
+// guard, not a policy limit: it exists so a fat-fingered "8760h" (a year)
+// reads as an error instead of quietly creating a preview that outlives
+// everyone's memory of it. Nothing enforces a maximum preview lifetime —
+// omitting ttl entirely still means "never expires".
+const maxPreviewTTL = 30 * 24 * time.Hour
+
+// createPreviewRequest is POST /api/previews's JSON body. TTL is an optional
+// Go duration string ("8h", "90m"); absent or empty means the preview never
+// expires, which is the default by design (see the plan's constraints).
 type createPreviewRequest struct {
 	Branch string `json:"branch"`
+	TTL    string `json:"ttl,omitempty"`
 }
 
 // CreatePreviewJSON serves POST /api/previews. It validates just enough to
@@ -81,6 +91,26 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "branch does not produce a usable preview tag")
 		return
 	}
+	// Rejected here, synchronously, rather than clamped or deferred to Up: a
+	// caller who mistyped their TTL should learn about it from the 400, not
+	// from a preview that vanishes (or doesn't) hours later.
+	var ttl time.Duration
+	if s := strings.TrimSpace(req.TTL); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "ttl must be a Go duration like 8h or 90m")
+			return
+		}
+		if d <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "ttl must be positive")
+			return
+		}
+		if d > maxPreviewTTL {
+			writeJSONError(w, http.StatusBadRequest, "ttl must be at most "+maxPreviewTTL.String())
+			return
+		}
+		ttl = d
+	}
 	if h.Orch.Busy(tag) {
 		writeJSONError(w, http.StatusConflict, "preview "+tag+" is busy")
 		return
@@ -93,7 +123,7 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 		// against a concurrent POST for the same tag (see the Busy(tag)
 		// pre-check note above) — that's a no-op loser, not a real failure,
 		// but it's still logged rather than silently discarded.
-		if err := h.Orch.Up(ctx, branch); err != nil {
+		if err := h.Orch.Up(ctx, branch, ttl); err != nil {
 			slog.Error("preview create failed", "tag", tag, "branch", branch, "err", err)
 			return
 		}
