@@ -994,11 +994,16 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 // ---- step progress reporting -------------------------------------------------
 
 // TestUpReportsStepsInOrder pins the sequence and wording of every
-// bifrost/step write across a full two-member happy-path Up: membership
-// resolution, each build (with its position), Neon branching, secret
-// copying, and manifest application — in that order, and nothing else in
-// between. Extracted from annotationHistory (not just the final state)
-// since every earlier step's annotation is overwritten by the next.
+// bifrost/step write across a full two-member happy-path Up: each build
+// (with its position), Neon branching, secret copying, and manifest
+// application — in that order, and nothing else in between. Extracted from
+// annotationHistory (not just the final state) since every earlier step's
+// annotation is overwritten by the next.
+//
+// Membership resolution is deliberately NOT narrated: it finishes before the
+// namespace exists (so there's nowhere to write it), and a step written after
+// its own work is done, then overwritten by the first build step
+// milliseconds later, is unobservable by any poller.
 func TestUpReportsStepsInOrder(t *testing.T) {
 	d := newTwoMemberDeps(t)
 
@@ -1017,7 +1022,7 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 		}
 	}
 	want := []string{
-		"resolving members: footstrike-api, footstrike-dashboard",
+		"", // cleared on entry, by EnsureNamespace's own write
 		"building footstrike-api (1/2)",
 		"building footstrike-dashboard (2/2)",
 		"branching databases",
@@ -1099,6 +1104,58 @@ func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
 	}
 	if ns.annotations["bifrost/step-since"] == "" {
 		t.Error("bifrost/step-since on a failed preview is empty, want the last step's timestamp retained")
+	}
+}
+
+// TestUpRetryDoesNotInheritPreviousRunsStepOrError covers the recovery path
+// the docs point operators at: fail a preview, then re-run `ib preview up`.
+// EnsureNamespace MERGES annotations, so unless Up's entry write clears them
+// explicitly, the previous run's bifrost/error and bifrost/step survive into
+// the retry — and since the retry's own builds take minutes, the UI and the
+// CLI would both show the OLD failure ("creating · building X — build ended
+// with status FAILURE") for that entire window, which reads as if the new run
+// had already failed.
+//
+// The assertion targets the retry's very first annotation snapshot (the
+// EnsureNamespace write itself), because that's the write responsible: later
+// snapshots legitimately carry this run's own fresh step text, which for an
+// identical failure would be indistinguishable from the stale one.
+func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err == nil {
+		t.Fatal("expected the first Up to fail (its build fails), got nil")
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	staleStep, staleErr := ns.annotations["bifrost/step"], ns.annotations["bifrost/error"]
+	if staleStep == "" || staleErr == "" {
+		t.Fatalf("precondition: a failed preview should retain a step (%q) and an error (%q)", staleStep, staleErr)
+	}
+	firstRunWrites := len(d.kube.annotationHistory)
+
+	// Retry: same branch, builds now succeed (an unconfigured build in
+	// fakeGCB succeeds immediately).
+	d.gcb.statuses = nil
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("retry Up failed: %v", err)
+	}
+	if len(d.kube.annotationHistory) <= firstRunWrites {
+		t.Fatalf("retry recorded no annotation writes (history stayed at %d)", firstRunWrites)
+	}
+
+	entry := d.kube.annotationHistory[firstRunWrites]
+	if entry["bifrost/phase"] != "creating" {
+		t.Fatalf("retry's first annotation write has phase %q, want creating — this test is looking at the wrong snapshot", entry["bifrost/phase"])
+	}
+	if got := entry["bifrost/error"]; got != "" {
+		t.Errorf("bifrost/error at the start of the retry = %q, want cleared (it's the previous run's failure)", got)
+	}
+	if got := entry["bifrost/step"]; got != "" {
+		t.Errorf("bifrost/step at the start of the retry = %q, want cleared (it's the previous run's last step)", got)
+	}
+	if got := entry["bifrost/step-since"]; got != "" {
+		t.Errorf("bifrost/step-since at the start of the retry = %q, want cleared (it would date the previous run's step)", got)
 	}
 }
 

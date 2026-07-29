@@ -152,12 +152,24 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 			"bifrost/branch": branch,
 			"bifrost/apps":   strings.Join(members, ","),
 			"bifrost/phase":  "creating",
+			// Cleared, not merely left alone: EnsureNamespace MERGES
+			// annotations onto whatever the namespace already carries, and
+			// re-running Up over a previously failed preview is the
+			// documented recovery path. Without these three, that retry
+			// would display the PREVIOUS run's error and last step for its
+			// entire duration ("creating · building X — build ended with
+			// status FAILURE") in both the UI and `ib preview up`. This
+			// write is Up's entry point, so it clears exactly what the ready
+			// write below clears on exit; fail() rewrites bifrost/error (and
+			// leaves this run's own step in place) if the retry fails too,
+			// so nothing diagnostic is lost.
+			"bifrost/error":      "",
+			"bifrost/step":       "",
+			"bifrost/step-since": "",
 		},
 	); err != nil {
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
 	}
-
-	o.step(ctx, ns, "resolving members: "+strings.Join(members, ", "))
 
 	shortSHAs, err := o.buildMembers(ctx, ns, branch, members)
 	if err != nil {
@@ -193,11 +205,23 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	return nil
 }
 
-// detachedAnnotateTimeout bounds fail's and step's detached compensating
-// writes — long enough for a real AnnotateNamespace call, short enough not
-// to hang a failure (or progress-narration) path indefinitely if the API
-// server is unreachable.
-const detachedAnnotateTimeout = 10 * time.Second
+// failAnnotateTimeout and stepAnnotateTimeout bound fail's and step's
+// detached writes. They differ because the two writes have opposite
+// priorities, not because one of them was tuned carelessly:
+//
+//   - fail's write MUST land — it's the only record that a preview failed and
+//     why — so it gets the generous bound, long enough to ride out a slow API
+//     server. Nothing is waiting on it: Up is already returning an error.
+//   - step's write is cosmetic and its error is swallowed, but it sits
+//     *inline* on the happy path, between the stages of the very flow this
+//     feature exists to make feel faster. A slow API server here adds latency
+//     to preview creation itself, so it gets the tight bound: better to lose
+//     one step annotation than to spend ten seconds per stage boundary
+//     narrating.
+const (
+	failAnnotateTimeout = 10 * time.Second
+	stepAnnotateTimeout = 3 * time.Second
+)
 
 // fail marks ns bifrost/phase=failed with a sanitized bifrost/error
 // annotation (cause's message only — never a secret value; callers are
@@ -215,7 +239,7 @@ const detachedAnnotateTimeout = 10 * time.Second
 // bifrost/error — silently violating the "every post-namespace failure
 // lands on failed" contract this whole function exists to uphold.
 func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
-	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedAnnotateTimeout)
+	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failAnnotateTimeout)
 	defer cancel()
 	if annErr := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
 		"bifrost/phase": "failed",
@@ -238,13 +262,13 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 //
 // Best-effort: like fail's compensating write, this runs on a context
 // detached from ctx's cancellation (context.WithoutCancel) with its own
-// short timeout, since ctx dying is exactly when a long-running stage's
-// step text is most useful to have already landed. Unlike fail, an
-// annotation failure here is logged and swallowed, never returned or
-// otherwise surfaced to the caller — narrating progress must never itself
-// become a reason Up fails.
+// short timeout (stepAnnotateTimeout — deliberately tighter than fail's, see
+// there), since ctx dying is exactly when a long-running stage's step text is
+// most useful to have already landed. Unlike fail, an annotation failure here
+// is logged and swallowed, never returned or otherwise surfaced to the
+// caller — narrating progress must never itself become a reason Up fails.
 func (o *Orchestrator) step(ctx context.Context, ns, text string) {
-	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), detachedAnnotateTimeout)
+	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepAnnotateTimeout)
 	defer cancel()
 	if err := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
 		"bifrost/step":       text,
