@@ -10,6 +10,7 @@ import (
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // TestPagesRenderRichScenario exercises every full page against a fleet that
@@ -24,14 +25,17 @@ func TestPagesRenderRichScenario(t *testing.T) {
 	defer func() { nextRun = orig }()
 
 	cfg := &config.Config{
-		Services:        []string{"api-gateway", "billing-worker", "auth-service", "search-indexer"},
 		SessionSecret:   []byte("12345678901234567890123456789012"),
 		ArgoCDNamespace: "argocd",
 		GitHubOrg:       "acme",
 		DisplayLocation: time.UTC,
-		StagingURLs:     map[string]string{"api-gateway": "https://api-staging.example"},
-		ProdURLs:        map[string]string{"api-gateway": "https://api.example"},
 		GCPProject:      "ethans-services",
+	}
+	reg := registry.Registry{
+		"api-gateway":    {URLs: registry.URLs{Staging: "https://api-staging.example", Prod: "https://api.example"}},
+		"billing-worker": {},
+		"auth-service":   {},
+		"search-indexer": {},
 	}
 	rend, err := LoadTemplates("../../templates")
 	if err != nil {
@@ -72,7 +76,7 @@ func TestPagesRenderRichScenario(t *testing.T) {
 			nsInfo("preview-hae-cadence", "hae-cadence", "api-gateway", "ready"),
 		},
 	}
-	h := &Handlers{Cfg: cfg, Kube: k, Renderer: rend, Builds: &fakeBuilds{builds: map[string]gcb.BuildStatus{
+	h := &Handlers{Cfg: cfg, Registry: reg, Kube: k, Renderer: rend, Builds: &fakeBuilds{builds: map[string]gcb.BuildStatus{
 		"api-gateway":    {Status: "SUCCESS", SHA: "b82e4d1", FinishTime: time.Now().Add(-2 * time.Hour), LogURL: "https://cb/1"},
 		"auth-service":   {Status: "WORKING", SHA: "e1f2a3b", StartTime: time.Now().Add(-2 * time.Minute), LogURL: "https://cb/2"},
 		"search-indexer": {Status: "FAILURE", SHA: "7d2c5f8", FinishTime: time.Now().Add(-30 * time.Minute), LogURL: "https://cb/3"},

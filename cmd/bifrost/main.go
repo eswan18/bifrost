@@ -118,8 +118,8 @@ func main() {
 		if names, err := gcb.TriggerIDs(context.Background(), cfg.GCPProject); err != nil {
 			log.Printf("cloud build triggers unavailable, pipeline links disabled: %v", err)
 		} else {
-			triggerIDs = make(map[string]string, len(cfg.Services))
-			for _, svc := range cfg.Services {
+			triggerIDs = make(map[string]string, len(fleet))
+			for _, svc := range fleet.Names() {
 				if id, ok := names[svc+"-build"]; ok {
 					triggerIDs[svc] = id
 				}
@@ -148,7 +148,7 @@ func main() {
 
 	sm := auth.NewSessionManager(cfg.SessionSecret, 12*time.Hour)
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
-	webH := &web.Handlers{Cfg: cfg, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
+	webH := &web.Handlers{Cfg: cfg, Registry: fleet, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
 	// The preview orchestrator needs every one of its dependencies present —
 	// partial config (e.g. a GitHub token but no Neon key, or an empty
@@ -163,6 +163,7 @@ func main() {
 			Builds:     builds,
 			TriggerIDs: previewTriggerIDs,
 			Registry:   reg,
+			Fleet:      fleet,
 		}
 	}
 

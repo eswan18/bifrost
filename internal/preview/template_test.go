@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // --- Cascade step 1: target is a preview member (or self) -> preview URL. ---
@@ -95,23 +96,22 @@ func TestEval_MemberCascade(t *testing.T) {
 
 // --- Cascade step 2: non-member WITH a baseline value -> that value, byte-for-byte. ---
 //
-// This is the whole point of the design: the baseline and cfg.StagingURLs are
-// set to deliberately DIFFERENT strings, so a regression back to the naive
-// "always look up StagingURLs" behavior fails loudly instead of silently
-// passing.
+// This is the whole point of the design: the baseline and the registry's
+// staging URL are set to deliberately DIFFERENT strings, so a regression back
+// to the naive "always look up the registry" behavior fails loudly instead of
+// silently passing.
 
 func TestEval_NonMemberWithBaseline(t *testing.T) {
 	tag := "hae-cadence"
 
-	t.Run("url: baseline wins over cfg.StagingURLs", func(t *testing.T) {
+	t.Run("url: baseline wins over the registry's staging URL", func(t *testing.T) {
 		ctx := EvalContext{
 			Service: "footstrike-api",
 			Tag:     tag,
 			Members: []string{"footstrike-api"}, // identity NOT a member
-			Cfg: &config.Config{
-				StagingURLs: map[string]string{
-					"identity": "https://staging-lookup.example.net", // must NOT win
-				},
+			Cfg:     &config.Config{},
+			Fleet: registry.Registry{
+				"identity": {URLs: registry.URLs{Staging: "https://staging-lookup.example.net"}}, // must NOT win
 			},
 			Baseline: map[string]string{
 				"JWT_ISSUER": "https://baseline-value.example.net", // must win
@@ -123,8 +123,8 @@ func TestEval_NonMemberWithBaseline(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if got != "https://baseline-value.example.net" {
-			t.Errorf("Eval(url identity) = %q, want baseline value %q (not the StagingURLs lookup %q)",
-				got, "https://baseline-value.example.net", ctx.Cfg.StagingURLs["identity"])
+			t.Errorf("Eval(url identity) = %q, want baseline value %q (not the registry lookup %q)",
+				got, "https://baseline-value.example.net", ctx.Fleet["identity"].URLs.Staging)
 		}
 	})
 
@@ -151,20 +151,19 @@ func TestEval_NonMemberWithBaseline(t *testing.T) {
 	})
 }
 
-// --- Cascade step 3: non-member, NO baseline -> StagingURLs / DNS convention. ---
+// --- Cascade step 3: non-member, NO baseline -> registry staging URL / DNS convention. ---
 
 func TestEval_NonMemberNoBaseline(t *testing.T) {
 	tag := "hae-cadence"
 
-	t.Run("url: falls back to cfg.StagingURLs", func(t *testing.T) {
+	t.Run("url: falls back to the registry's staging URL", func(t *testing.T) {
 		ctx := EvalContext{
 			Service: "footstrike-dashboard",
 			Tag:     tag,
 			Members: []string{"footstrike-dashboard"},
-			Cfg: &config.Config{
-				StagingURLs: map[string]string{
-					"footstrike-api": "https://api.staging.footstrike.run",
-				},
+			Cfg:     &config.Config{},
+			Fleet: registry.Registry{
+				"footstrike-api": {URLs: registry.URLs{Staging: "https://api.staging.footstrike.run"}},
 			},
 			Baseline: map[string]string{}, // no baseline at all
 			Key:      "APP_API_URL",
@@ -178,15 +177,14 @@ func TestEval_NonMemberNoBaseline(t *testing.T) {
 		}
 	})
 
-	t.Run("url: falls back to cfg.StagingURLs when baseline is missing the key (but has others)", func(t *testing.T) {
+	t.Run("url: falls back to the registry's staging URL when baseline is missing the key (but has others)", func(t *testing.T) {
 		ctx := EvalContext{
 			Service: "footstrike-dashboard",
 			Tag:     tag,
 			Members: []string{"footstrike-dashboard"},
-			Cfg: &config.Config{
-				StagingURLs: map[string]string{
-					"footstrike-api": "https://api.staging.footstrike.run",
-				},
+			Cfg:     &config.Config{},
+			Fleet: registry.Registry{
+				"footstrike-api": {URLs: registry.URLs{Staging: "https://api.staging.footstrike.run"}},
 			},
 			Baseline: map[string]string{"UNRELATED_KEY": "irrelevant"},
 			Key:      "APP_API_URL",
@@ -226,7 +224,7 @@ func TestEval_Unresolvable(t *testing.T) {
 		Service:  "footstrike-dashboard",
 		Tag:      "hae-cadence",
 		Members:  []string{"footstrike-dashboard"},
-		Cfg:      &config.Config{}, // no StagingURLs entry for footstrike-api
+		Cfg:      &config.Config{}, // no Fleet entry for footstrike-api
 		Baseline: map[string]string{},
 		Key:      "APP_API_URL",
 	}

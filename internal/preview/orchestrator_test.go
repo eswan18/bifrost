@@ -337,15 +337,11 @@ type testDeps struct {
 // newTwoMemberDeps sets up a preview whose branch exists for footstrike-api
 // and footstrike-dashboard but not identity — a realistic two-repo preview,
 // with the dashboard's mandatory triple resolvable via footstrike-api's
-// membership (preview URL) and identity's configured staging URL (fallback).
+// membership (preview URL) and identity's staging URL from the fleet
+// registry (fallback).
 func newTwoMemberDeps(t *testing.T) *testDeps {
 	t.Helper()
-	cfg := &config.Config{
-		PreviewOAuthClientID: "preview-client-id",
-		StagingURLs: map[string]string{
-			"identity": "https://identity-staging.tailc06f30.ts.net",
-		},
-	}
+	cfg := &config.Config{PreviewOAuthClientID: "preview-client-id"}
 	gh := &fakeGitHub{
 		members: map[string]bool{"footstrike-api": true, "footstrike-dashboard": true},
 		k8sFiles: map[string]map[string][]byte{
@@ -363,6 +359,7 @@ func newTwoMemberDeps(t *testing.T) *testDeps {
 		Neon:     nc,
 		Builds:   gc,
 		Registry: testRegistry(t),
+		Fleet:    testFleet(t),
 		TriggerIDs: map[string]string{
 			"footstrike-api-preview-build":       "trig-api",
 			"footstrike-dashboard-preview-build": "trig-dash",
@@ -698,15 +695,15 @@ func TestUpPollsMultipleTimesBeforeSucceeding(t *testing.T) {
 
 func TestUpDashboardWithoutClientIDErrors(t *testing.T) {
 	cfg := &config.Config{
-		StagingURLs: map[string]string{
-			"footstrike-api": "https://api.staging.footstrike.run",
-			"identity":       "https://identity-staging.tailc06f30.ts.net",
-		},
 		// PreviewOAuthClientID intentionally left empty.
 	}
 	gh := &fakeGitHub{members: map[string]bool{"footstrike-dashboard": true}}
 	kc := newFakeKube()
-	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}, Registry: testRegistry(t)}
+	// Fleet supplies footstrike-api's and identity's staging URLs (both are
+	// non-members here), matching what this test used to hardcode into
+	// cfg.StagingURLs -- both resolve fine, isolating the failure to the
+	// missing PreviewOAuthClientID.
+	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}, Registry: testRegistry(t), Fleet: testFleet(t)}
 
 	err := o.Up(context.Background(), "dash-only-branch")
 	if err == nil {

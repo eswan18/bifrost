@@ -277,8 +277,9 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 
 	raws := groupByNamespace(pods, rsets, cronjobs, jobs)
 
-	apps := make([]appView, len(h.Cfg.Services))
-	for i, svc := range h.Cfg.Services {
+	names := h.Registry.Names()
+	apps := make([]appView, len(names))
+	for i, svc := range names {
 		apps[i] = h.assembleApp(svc, now, argo, builds, raws[svc+"-staging"], raws[svc+"-prod"])
 	}
 
@@ -324,11 +325,12 @@ func groupByNamespace(pods []kube.PodInfo, rsets []kube.ReplicaSetInfo, cronjobs
 // reads. Pure derivation — all cluster I/O happens up front in assembleFleet.
 func (h *Handlers) assembleApp(svc string, now time.Time, argo map[string]kube.AppStatus, builds map[string]gcb.BuildStatus, sRaw, pRaw envRaw) appView {
 	org := h.Cfg.GitHubOrg
-	repo := h.Cfg.RepoFor(svc)
+	repo := h.Registry.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
+	urls := h.Registry[svc].URLs
 
-	staging := deriveEnv("staging", sRaw, argo[svc+"-staging"], org, repo, h.Cfg.StagingURLs[svc], now, loc)
-	prod := deriveEnv("prod", pRaw, argo[svc+"-prod"], org, repo, h.Cfg.ProdURLs[svc], now, loc)
+	staging := deriveEnv("staging", sRaw, argo[svc+"-staging"], org, repo, urls.Staging, now, loc)
+	prod := deriveEnv("prod", pRaw, argo[svc+"-prod"], org, repo, urls.Prod, now, loc)
 
 	ps := promote.StatusOf(kube.Images(sRaw.pods), kube.Images(pRaw.pods))
 	overall := deriveOverall(staging, prod, ps)

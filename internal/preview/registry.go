@@ -50,12 +50,13 @@ func LoadRegistry() (Registry, error) {
 // sourced from the fleet-wide registry.yaml instead of one of its own.
 // Services with no preview block are dropped, matching the old registry's
 // contents exactly (it only ever held the three previewable services).
+// PreviewNames is the single source of truth for "previewable" -- this
+// reuses it rather than re-testing svc.Preview != nil itself.
 func FromFleet(fleet registry.Registry) Registry {
-	reg := make(Registry, len(fleet))
-	for name, svc := range fleet {
-		if svc.Preview != nil {
-			reg[name] = *svc.Preview
-		}
+	names := fleet.PreviewNames()
+	reg := make(Registry, len(names))
+	for _, name := range names {
+		reg[name] = *fleet[name].Preview
 	}
 	return reg
 }

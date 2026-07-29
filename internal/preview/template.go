@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // EvalContext is what a registry env template (registry.yaml's Service.Env
@@ -19,8 +20,15 @@ type EvalContext struct {
 	// Members is the full set of services in this preview (Service is
 	// usually, but need not be, included in it explicitly -- see resolveURL).
 	Members []string
-	// Cfg is bifrost's static config: StagingURLs and PreviewOAuthClientID.
+	// Cfg is bifrost's static config: PreviewOAuthClientID.
 	Cfg *config.Config
+	// Fleet is the fleet-wide registry (internal/registry), consulted by
+	// resolveURL's cascade step 3 for a non-member service's staging URL
+	// (registry.yaml's Service.URLs.Staging) -- the fallback a service with
+	// no staging ConfigMap of its own takes (e.g. footstrike-dashboard's
+	// APP_API_URL when footstrike-api isn't a preview member). A nil/zero
+	// Fleet just means every such lookup misses, same as an absent entry.
+	Fleet registry.Registry
 	// Baseline is the staging ConfigMap data of the app being rendered (NOT of
 	// the service named in the template). Cascade step
 	// 2 defers to it: if Key already has a value here, that value wins, so
@@ -92,14 +100,14 @@ func Eval(tmpl string, ctx EvalContext) (string, error) {
 //     URL shape, shared with render.go).
 //  2. Else, if ctx.Key already has a value in the rendered app's own staging
 //     ConfigMap (ctx.Baseline) -> that value, untouched. This is the point
-//     of the whole cascade: resolving to cfg.StagingURLs instead would give
-//     bifrost a second, independently-maintained copy of a fact the app
+//     of the whole cascade: resolving to the registry's URL instead would
+//     give bifrost a second, independently-maintained copy of a fact the app
 //     already states, and the two would silently drift. Deferring to the
 //     baseline means bifrost has no opinion where the app already has one.
-//  3. Else -> cfg.StagingURLs[svc] for url, or the
+//  3. Else -> ctx.Fleet[svc].URLs.Staging for url, or the
 //     "http://svc.svc-staging.svc.cluster.local" convention for
 //     internalUrl. The DNS convention is a pure string formula, so it
-//     always succeeds; only url's StagingURLs lookup can miss.
+//     always succeeds; only url's registry lookup can miss.
 //  4. Else (only reachable for url) -> an error naming ctx.Key and the
 //     unresolvable service.
 func resolveURL(tmpl, arg string, ctx EvalContext, internal bool) (string, error) {
@@ -122,11 +130,7 @@ func resolveURL(tmpl, arg string, ctx EvalContext, internal bool) (string, error
 	if internal {
 		return fmt.Sprintf("http://%s.%s-staging.svc.cluster.local", svc, svc), nil
 	}
-	var stagingURLs map[string]string
-	if ctx.Cfg != nil {
-		stagingURLs = ctx.Cfg.StagingURLs
-	}
-	if url := stagingURLs[svc]; url != "" {
+	if url := ctx.Fleet[svc].URLs.Staging; url != "" {
 		return url, nil
 	}
 	return "", fmt.Errorf(

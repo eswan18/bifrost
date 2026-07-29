@@ -18,6 +18,7 @@ import (
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // fakeKube serves per-namespace fixtures. imgs is a shorthand that expands each
@@ -187,19 +188,18 @@ func i32(v int32) *int32 { return &v }
 func newTestHandlers(t *testing.T, k *fakeKube) (*Handlers, *auth.Session) {
 	t.Helper()
 	cfg := &config.Config{
-		Services:        []string{"foo"},
 		SessionSecret:   []byte("12345678901234567890123456789012"),
 		ArgoCDNamespace: "argocd",
 		GitHubOrg:       "eswan18",
-		RepoOverrides:   map[string]string{"foo": "foo_repo"},
 		DisplayLocation: time.UTC,
 	}
+	reg := registry.Registry{"foo": {Repo: "foo_repo"}}
 	rend, err := LoadTemplates("../../templates")
 	if err != nil {
 		t.Fatalf("templates: %v", err)
 	}
 	sess := &auth.Session{Email: "me@example.com", IssuedAt: time.Now(), ID: "sid1"}
-	return &Handlers{Cfg: cfg, Kube: k, Renderer: rend}, sess
+	return &Handlers{Cfg: cfg, Registry: reg, Kube: k, Renderer: rend}, sess
 }
 
 func authed(t *testing.T, method, target string, body string, sess *auth.Session) *http.Request {
@@ -762,7 +762,7 @@ func TestAppsRendersOpenLinks(t *testing.T) {
 		"foo-prod":    {"reg/foo:abc1234"},
 	}}
 	h, sess := newTestHandlers(t, k)
-	h.Cfg.ProdURLs = map[string]string{"foo": "https://foo.example.com"}
+	h.Registry = registry.Registry{"foo": {URLs: registry.URLs{Prod: "https://foo.example.com"}}}
 	req := authed(t, "GET", "/apps", "", sess)
 	rec := httptest.NewRecorder()
 	h.Apps(rec, req)
@@ -772,7 +772,7 @@ func TestAppsRendersOpenLinks(t *testing.T) {
 		t.Error("prod open link missing")
 	}
 	if strings.Contains(body, `aria-label="open staging app"`) {
-		t.Error("no staging open link should render when STAGING_URLS lacks the service")
+		t.Error("no staging open link should render when the registry's staging URL is empty")
 	}
 }
 

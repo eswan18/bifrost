@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // testRegistry loads the real embedded fleet registry.yaml (via
@@ -21,6 +22,24 @@ func testRegistry(t *testing.T) Registry {
 		t.Fatalf("LoadRegistry() error = %v", err)
 	}
 	return reg
+}
+
+// testFleet loads the real embedded fleet-wide registry.yaml (the
+// un-narrowed registry.Registry, carrying every service's repo/URLs, not
+// just the previewable subset testRegistry returns) -- what cascade step 3
+// (resolveURL's non-member/no-baseline fallback) now consults instead of
+// the old operator-configured config.Config.StagingURLs. Its footstrike-api/
+// footstrike-dashboard/identity staging URLs are exactly the values these
+// tests used to hardcode into StagingURLs maps (Task 1 verified them
+// field-by-field against k8s/base/configmap.yaml), so swapping to the real
+// fleet here changes nothing about what resolves.
+func testFleet(t *testing.T) registry.Registry {
+	t.Helper()
+	fleet, err := registry.Load()
+	if err != nil {
+		t.Fatalf("registry.Load() error = %v", err)
+	}
+	return fleet
 }
 
 func TestParseStagingEnv(t *testing.T) {
@@ -91,7 +110,7 @@ func stagingFixture() map[string]string {
 func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 	t.Run("identity not in members: identity URLs pass through from staging", func(t *testing.T) {
 		staging := stagingFixture()
-		got, err := envConfigFor("footstrike-api", "hae-cadence", []string{"footstrike-api"}, staging, &config.Config{}, testRegistry(t))
+		got, err := envConfigFor("footstrike-api", "hae-cadence", []string{"footstrike-api"}, staging, &config.Config{}, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -128,7 +147,7 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 
 	t.Run("identity in members: identity URLs repoint at preview identity", func(t *testing.T) {
 		staging := stagingFixture()
-		got, err := envConfigFor("footstrike-api", "hae-cadence", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t))
+		got, err := envConfigFor("footstrike-api", "hae-cadence", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -143,7 +162,7 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 	t.Run("does not mutate the input staging map", func(t *testing.T) {
 		staging := stagingFixture()
 		before := copyStringMap(staging)
-		if _, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t)); err != nil {
+		if _, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t), nil); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if !reflect.DeepEqual(staging, before) {
@@ -155,18 +174,16 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 	// and JWT_ISSUER have nowhere to fall back to without a staging fixture,
 	// so -- unlike the old hardcoded implementation, which had no error
 	// return path at all and could never fail here -- the cascade now needs
-	// an operator-configured StagingURLs fallback (exactly the config field
-	// that exists for this purpose) to still resolve when the real staging
-	// configmap is unavailable and dashboard/identity aren't members. See the
-	// sibling subtest below for the case with no such fallback configured,
-	// which is the divergence itself: old code always produced *something*;
-	// the cascade instead errors, naming the exact unresolvable key.
-	t.Run("absent staging file (empty map) still yields the mandatory overrides, given a StagingURLs fallback", func(t *testing.T) {
-		cfg := &config.Config{StagingURLs: map[string]string{
-			"footstrike-dashboard": "https://staging.footstrike.run",
-			"identity":             "https://identity-staging.tailc06f30.ts.net",
-		}}
-		got, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api"}, map[string]string{}, cfg, testRegistry(t))
+	// the registry's staging URL fallback (Task 2 moved this from an
+	// operator-configured config.Config.StagingURLs to
+	// registry.yaml's Service.URLs.Staging) to still resolve when the real
+	// staging configmap is unavailable and dashboard/identity aren't
+	// members. See the sibling subtest below for the case with no such
+	// fallback available, which is the divergence itself: old code always
+	// produced *something*; the cascade instead errors, naming the exact
+	// unresolvable key.
+	t.Run("absent staging file (empty map) still yields the mandatory overrides, given the registry's staging URL fallback", func(t *testing.T) {
+		got, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api"}, map[string]string{}, &config.Config{}, testRegistry(t), testFleet(t))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -176,25 +193,28 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 	})
 
 	// SANCTIONED DIVERGENCE (decided 2026-07-28): the actual divergence the
-	// subtest above works around by configuring a StagingURLs fallback. Old
-	// footstrikeAPIEnvConfig had no error return path whatsoever -- given a
-	// completely empty stagingData and an unconfigured cfg, it still
-	// hardcoded PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER to preview or staging
-	// URLs unconditionally. The registry-driven cascade instead exhausts
-	// (footstrike-dashboard/identity aren't members, there's no baseline
-	// entry to defer to, and no cfg.StagingURLs fallback) and errors, naming
-	// the unresolvable key. This is data-reachable in production: an api
-	// branch whose k8s/ ships no staging/configmap-env.yaml at all, previewed
-	// without an operator-configured StagingURLs fallback. Controller ruling:
-	// sanctioned as correct and better -- the old path would deploy a pod
-	// with a broken/dead PUBLIC_DASHBOARD_BASE_URL or JWT_ISSUER that
-	// crash-loops or fails silently at runtime; the new cascade fails loudly
-	// at preview-creation time, before the cluster is ever touched, naming
-	// exactly which key and service is unresolvable.
-	t.Run("SANCTIONED DIVERGENCE (decided 2026-07-28): no staging baseline and no StagingURLs fallback now errors, where old code never could", func(t *testing.T) {
-		_, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api"}, map[string]string{}, &config.Config{}, testRegistry(t))
+	// subtest above works around by supplying the registry's staging URL
+	// fallback. Old footstrikeAPIEnvConfig had no error return path
+	// whatsoever -- given a completely empty stagingData and an unconfigured
+	// cfg, it still hardcoded PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER to preview
+	// or staging URLs unconditionally. The registry-driven cascade instead
+	// exhausts (footstrike-dashboard/identity aren't members, there's no
+	// baseline entry to defer to, and fleet is nil here so there's no
+	// registry staging URL fallback either) and errors, naming the
+	// unresolvable key. This is data-reachable in production only in the
+	// sense that a nil Fleet never happens in practice (main.go always wires
+	// Orchestrator.Fleet to the loaded registry, which has a staging URL for
+	// every previewable service) -- this subtest isolates cascade step 4
+	// itself, not a real production gap. Controller ruling: sanctioned as
+	// correct and better -- the old path would deploy a pod with a broken/
+	// dead PUBLIC_DASHBOARD_BASE_URL or JWT_ISSUER that crash-loops or fails
+	// silently at runtime; the new cascade fails loudly at preview-creation
+	// time, before the cluster is ever touched, naming exactly which key and
+	// service is unresolvable.
+	t.Run("SANCTIONED DIVERGENCE (decided 2026-07-28): no staging baseline and no registry staging URL fallback now errors, where old code never could", func(t *testing.T) {
+		_, err := envConfigFor("footstrike-api", "t", []string{"footstrike-api"}, map[string]string{}, &config.Config{}, testRegistry(t), nil)
 		if err == nil {
-			t.Fatal("expected an error when PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER have no member, baseline, or StagingURLs fallback, got nil")
+			t.Fatal("expected an error when PUBLIC_DASHBOARD_BASE_URL/JWT_ISSUER have no member, baseline, or registry staging URL fallback, got nil")
 		}
 	})
 }
@@ -202,7 +222,7 @@ func TestEnvConfigForFootstrikeAPI(t *testing.T) {
 func TestEnvConfigForIdentity(t *testing.T) {
 	t.Run("identity in members: JWT_ISSUER repoints at its own preview URL", func(t *testing.T) {
 		staging := stagingFixture()
-		got, err := envConfigFor("identity", "hae-cadence", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t))
+		got, err := envConfigFor("identity", "hae-cadence", []string{"footstrike-api", "identity"}, staging, &config.Config{}, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -229,7 +249,7 @@ func TestEnvConfigForIdentity(t *testing.T) {
 	// only to document the synthetic edge case's new behavior explicitly.
 	t.Run("identity NOT in members (unreachable via Up(); self still resolves)", func(t *testing.T) {
 		staging := stagingFixture()
-		got, err := envConfigFor("identity", "hae-cadence", []string{"footstrike-api"}, staging, &config.Config{}, testRegistry(t))
+		got, err := envConfigFor("identity", "hae-cadence", []string{"footstrike-api"}, staging, &config.Config{}, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -244,7 +264,7 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 
 	t.Run("both api and identity members: both URLs are preview URLs", func(t *testing.T) {
 		got, err := envConfigFor("footstrike-dashboard", "hae-cadence",
-			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, nil, baseCfg, testRegistry(t))
+			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, nil, baseCfg, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -258,15 +278,9 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 		}
 	})
 
-	t.Run("neither member: falls back to configured staging URLs", func(t *testing.T) {
-		cfg := &config.Config{
-			PreviewOAuthClientID: "preview-client-id",
-			StagingURLs: map[string]string{
-				"footstrike-api": "https://api.staging.footstrike.run",
-				"identity":       "https://identity-staging.tailc06f30.ts.net",
-			},
-		}
-		got, err := envConfigFor("footstrike-dashboard", "hae-cadence", []string{"footstrike-dashboard"}, nil, cfg, testRegistry(t))
+	t.Run("neither member: falls back to the registry's staging URLs", func(t *testing.T) {
+		cfg := &config.Config{PreviewOAuthClientID: "preview-client-id"}
+		got, err := envConfigFor("footstrike-dashboard", "hae-cadence", []string{"footstrike-dashboard"}, nil, cfg, testRegistry(t), testFleet(t))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -279,18 +293,24 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 	})
 
 	t.Run("api unresolvable (not a member, no staging URL) errors", func(t *testing.T) {
-		_, err := envConfigFor("footstrike-dashboard", "t", []string{"footstrike-dashboard"}, nil, baseCfg, testRegistry(t))
+		// fleet: nil -- no registry staging URL fallback available, so
+		// footstrike-api (not a member, no baseline) stays unresolvable.
+		_, err := envConfigFor("footstrike-dashboard", "t", []string{"footstrike-dashboard"}, nil, baseCfg, testRegistry(t), nil)
 		if err == nil {
 			t.Fatal("expected an error when APP_API_URL is unresolvable, got nil")
 		}
 	})
 
 	t.Run("identity unresolvable (not a member, no staging URL) errors", func(t *testing.T) {
-		cfg := &config.Config{
-			PreviewOAuthClientID: "preview-client-id",
-			StagingURLs:          map[string]string{"footstrike-api": "https://api.staging.footstrike.run"},
+		cfg := &config.Config{PreviewOAuthClientID: "preview-client-id"}
+		// A synthetic fleet with a staging URL for footstrike-api but none for
+		// identity -- footstrike-api resolves (proving the fallback path
+		// works at all), identity deliberately has no registry entry to fall
+		// back to, so APP_IDENTITY_URL stays unresolvable.
+		fleet := registry.Registry{
+			"footstrike-api": {URLs: registry.URLs{Staging: "https://api.staging.footstrike.run"}},
 		}
-		_, err := envConfigFor("footstrike-dashboard", "t", []string{"footstrike-dashboard", "footstrike-api"}, nil, cfg, testRegistry(t))
+		_, err := envConfigFor("footstrike-dashboard", "t", []string{"footstrike-dashboard", "footstrike-api"}, nil, cfg, testRegistry(t), fleet)
 		if err == nil {
 			t.Fatal("expected an error when APP_IDENTITY_URL is unresolvable, got nil")
 		}
@@ -299,7 +319,7 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 	t.Run("missing PreviewOAuthClientID errors even when both URLs resolve", func(t *testing.T) {
 		cfg := &config.Config{} // PreviewOAuthClientID empty
 		_, err := envConfigFor("footstrike-dashboard", "t",
-			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, nil, cfg, testRegistry(t))
+			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, nil, cfg, testRegistry(t), nil)
 		if err == nil {
 			t.Fatal("expected an error for missing PreviewOAuthClientID, got nil")
 		}
@@ -320,7 +340,7 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 	t.Run("stagingData is copied like every other service (dashboard's real fetch is always empty, so this is inert in production)", func(t *testing.T) {
 		staging := map[string]string{"SOME_STALE_KEY": "passes through now"}
 		got, err := envConfigFor("footstrike-dashboard", "t",
-			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, staging, baseCfg, testRegistry(t))
+			[]string{"footstrike-api", "footstrike-dashboard", "identity"}, staging, baseCfg, testRegistry(t), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -343,13 +363,14 @@ func TestEnvConfigForDashboardSynthesis(t *testing.T) {
 func TestEnvConfigForRegistryEquivalence(t *testing.T) {
 	tag := "hae-cadence"
 	staging := stagingFixture()
-	cfgFull := &config.Config{
-		PreviewOAuthClientID: "preview-client-id",
-		StagingURLs: map[string]string{
-			"footstrike-api": "https://api.staging.footstrike.run",
-			"identity":       "https://identity-staging.tailc06f30.ts.net",
-		},
-	}
+	cfgFull := &config.Config{PreviewOAuthClientID: "preview-client-id"}
+	// fleetFull is the real embedded fleet registry: it carries the same
+	// footstrike-api/identity staging URLs cfgFull.StagingURLs used to
+	// hardcode (Task 1 verified them field-by-field against
+	// k8s/base/configmap.yaml), so every table entry below resolves
+	// identically to before Task 2 moved cascade step 3's fallback off
+	// config.Config and onto the registry.
+	fleetFull := testFleet(t)
 
 	tests := []struct {
 		name    string
@@ -513,7 +534,7 @@ func TestEnvConfigForRegistryEquivalence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := envConfigFor(tt.svc, tag, tt.members, tt.staging, tt.cfg, testRegistry(t))
+			got, err := envConfigFor(tt.svc, tag, tt.members, tt.staging, tt.cfg, testRegistry(t), fleetFull)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -526,7 +547,7 @@ func TestEnvConfigForRegistryEquivalence(t *testing.T) {
 
 func TestEnvConfigForUnknownServicePassesThroughStagingData(t *testing.T) {
 	staging := map[string]string{"SOME_KEY": "some-value", "OTHER_KEY": "other-value"}
-	got, err := envConfigFor("some-other-service", "t", []string{"some-other-service"}, staging, &config.Config{}, testRegistry(t))
+	got, err := envConfigFor("some-other-service", "t", []string{"some-other-service"}, staging, &config.Config{}, testRegistry(t), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -556,7 +577,7 @@ func TestEnvConfigForRequiredKeyRenderedEmptyErrors(t *testing.T) {
 			Required: []string{"MUST_BE_SET"},
 		},
 	}
-	_, err := envConfigFor("svc", "t", []string{"svc"}, nil, &config.Config{}, reg)
+	_, err := envConfigFor("svc", "t", []string{"svc"}, nil, &config.Config{}, reg, nil)
 	if err == nil {
 		t.Fatal("expected an error when a required key renders empty, got nil")
 	}

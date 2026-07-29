@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/eswan18/bifrost/internal/config"
+	"github.com/eswan18/bifrost/internal/registry"
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
@@ -36,8 +37,9 @@ func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
 // envConfigFor computes the final preview ConfigMap data for one member
 // service. It is a pure function: stagingData is never mutated, and the same
 // inputs always produce the same output — everything needed (the preview's
-// tag, its full member list, and the registry describing every previewable
-// service's env wiring) is passed in explicitly rather than read from shared
+// tag, its full member list, the registry describing every previewable
+// service's env wiring, and the fleet-wide registry backing cascade step 3's
+// staging URL fallback) is passed in explicitly rather than read from shared
 // state.
 //
 // The result is stagingData copied verbatim, then reg[svc]'s env templates
@@ -63,7 +65,7 @@ func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
 // (see EvalContext.Members and resolveURL in template.go). Calling this with
 // svc absent from members would silently change that service's own "self"
 // URL semantics rather than erroring.
-func envConfigFor(svc, tag string, members []string, stagingData map[string]string, cfg *config.Config, reg Registry) (map[string]string, error) {
+func envConfigFor(svc, tag string, members []string, stagingData map[string]string, cfg *config.Config, reg Registry, fleet registry.Registry) (map[string]string, error) {
 	data := copyStringMap(stagingData)
 
 	entry, ok := reg[svc]
@@ -76,6 +78,7 @@ func envConfigFor(svc, tag string, members []string, stagingData map[string]stri
 		Tag:      tag,
 		Members:  members,
 		Cfg:      cfg,
+		Fleet:    fleet,
 		Baseline: stagingData,
 	}
 

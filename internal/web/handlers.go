@@ -15,10 +15,17 @@ import (
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/promote"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 type Handlers struct {
-	Cfg        *config.Config
+	Cfg *config.Config
+	// Registry is the fleet-wide service inventory (internal/registry) —
+	// every service bifrost operates on, its repo name, and its public
+	// staging/prod URLs. assembleFleet iterates Registry.Names() (replacing
+	// the old Cfg.Services) and looks up each service's repo/URLs from it
+	// (replacing Cfg.RepoFor/StagingURLs/ProdURLs).
+	Registry   registry.Registry
 	Kube       kube.Client
 	Builds     gcb.Client        // nil → build badges disabled
 	TriggerIDs map[string]string // service → Cloud Build trigger ID, for pipeline links; nil → links omitted
@@ -265,7 +272,7 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown service", http.StatusNotFound)
 		return
 	}
-	org, repo := h.Cfg.GitHubOrg, h.Cfg.RepoFor(svc)
+	org, repo := h.Cfg.GitHubOrg, h.Registry.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
 
 	var sRaw, pRaw envRaw
@@ -483,12 +490,8 @@ func wantsJSON(r *http.Request) bool {
 }
 
 func (h *Handlers) knownService(name string) bool {
-	for _, s := range h.Cfg.Services {
-		if s == name {
-			return true
-		}
-	}
-	return false
+	_, ok := h.Registry[name]
+	return ok
 }
 
 func themeFrom(r *http.Request) string {
