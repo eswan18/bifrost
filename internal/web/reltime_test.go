@@ -40,6 +40,46 @@ func TestRelativeTime(t *testing.T) {
 	}
 }
 
+// TestExpiresIn is TestRelativeTime's mirror, for the mirror function: the
+// Previews tab's remaining-time label. The two boundaries worth naming are the
+// ends of the ladder — anything already past due reads "expired" rather than a
+// negative duration (the sweep can take up to an hour to actually reclaim it,
+// so that state is real and lasting, not a rendering glitch), and anything
+// under a minute reads "<1m" rather than counting seconds down.
+func TestExpiresIn(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		t    time.Time
+		want string
+	}{
+		{"zero time renders nothing", time.Time{}, ""},
+		{"long past due", now.Add(-8 * time.Hour), "expired"},
+		{"just past due", now.Add(-time.Second), "expired"},
+		{"exactly now", now, "expired"},
+		{"seconds left", now.Add(30 * time.Second), "expires in <1m"},
+		{"just under a minute", now.Add(59 * time.Second), "expires in <1m"},
+		{"exactly one minute", now.Add(time.Minute), "expires in 1m"},
+		{"minutes", now.Add(45 * time.Minute), "expires in 45m"},
+		{"just under an hour", now.Add(59 * time.Minute), "expires in 59m"},
+		{"one hour", now.Add(time.Hour), "expires in 1h"},
+		{"hours round down", now.Add(90 * time.Minute), "expires in 1h"},
+		{"just under a day", now.Add(23 * time.Hour), "expires in 23h"},
+		{"one day", now.Add(24 * time.Hour), "expires in 1d"},
+		{"days", now.Add(5 * 24 * time.Hour), "expires in 5d"},
+		// The largest TTL the API accepts (maxPreviewTTL, 720h) — the top of
+		// the ladder, with no week/month rung above it.
+		{"the maximum TTL", now.Add(30 * 24 * time.Hour), "expires in 30d"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := expiresIn(tc.t, now); got != tc.want {
+				t.Errorf("expiresIn(%v) = %q, want %q", tc.t, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDayRelative covers the day-relative wall-clock formatter used for build
 // and job times. 2026-06-15 is a Monday, so a Friday 3 days back and a Friday 4
 // days ahead both render as "Friday".

@@ -144,7 +144,11 @@ func (o *Orchestrator) Busy(tag string) bool {
 // deliberate re-POST once the branch has new commits) is the recovery path:
 // EnsureNamespace, CopySecret, and ApplyObjects all merge/replace rather than
 // erroring on "already exists", and Neon branch creation is scan-then-create.
-func (o *Orchestrator) Up(ctx context.Context, branch string) error {
+//
+// ttl is optional: a positive ttl records an absolute bifrost/expires-at for
+// the sweeper to reclaim later, and ttl <= 0 means the preview never expires
+// (and clears any expiry a previous run set — see expiresAtAnnotation).
+func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration) error {
 	if strings.TrimSpace(branch) == "" {
 		return errors.New("preview: Up: branch is required")
 	}
@@ -196,9 +200,9 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	if err := o.Kube.EnsureNamespace(ctx, ns,
 		map[string]string{"bifrost/preview": "true"},
 		map[string]string{
-			"bifrost/branch": branch,
-			"bifrost/apps":   strings.Join(members, ","),
-			"bifrost/phase":  "creating",
+			"bifrost/branch":   branch,
+			"bifrost/apps":     strings.Join(members, ","),
+			phaseAnnotationKey: "creating",
 			// Cleared, not merely left alone: EnsureNamespace MERGES
 			// annotations onto whatever the namespace already carries, and
 			// re-running Up over a previously failed preview is the
@@ -213,6 +217,9 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 			"bifrost/error":      "",
 			"bifrost/step":       "",
 			"bifrost/step-since": "",
+			// Written unconditionally, "" and all, for the same merge reason
+			// the three above are cleared; see expiresAtAnnotation.
+			expiresAtAnnotationKey: expiresAtAnnotation(ttl),
 		},
 	); err != nil {
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
@@ -247,7 +254,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 	// above) deliberately never does this — its last step is the
 	// diagnostic ("failed while building footstrike-api").
 	if err := o.Kube.AnnotateNamespace(ctx, ns, map[string]string{
-		"bifrost/phase":      "ready",
+		phaseAnnotationKey:   "ready",
 		"bifrost/error":      "",
 		"bifrost/step":       "",
 		"bifrost/step-since": "",
@@ -255,6 +262,28 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 		return fmt.Errorf("preview: Up: mark ready: %w", err)
 	}
 	return nil
+}
+
+// The two namespace-annotation keys that are both written here and read back
+// elsewhere in this package (by the expiry sweep) are named, so the writer and
+// the reader cannot drift apart. The rest of the bifrost/* family
+// (branch/apps/error/step/step-since) is written here and read only outside
+// this package, so those stay literals at their single point of use.
+const (
+	phaseAnnotationKey     = "bifrost/phase"
+	expiresAtAnnotationKey = "bifrost/expires-at"
+)
+
+// expiresAtAnnotation renders ttl as an absolute RFC3339 instant, or "" for
+// no expiry. Absolute rather than a duration so the reaper never has to know
+// when the preview was created, and "" rather than an omitted key because
+// EnsureNamespace merges: a re-run without --ttl must drop a previous
+// expiry, exactly as it drops the previous run's error and step above.
+func expiresAtAnnotation(ttl time.Duration) string {
+	if ttl <= 0 {
+		return ""
+	}
+	return time.Now().UTC().Add(ttl).Format(time.RFC3339)
 }
 
 // failAnnotateTimeout and stepAnnotateTimeout bound fail's and step's
@@ -294,8 +323,8 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failAnnotateTimeout)
 	defer cancel()
 	if annErr := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
-		"bifrost/phase": "failed",
-		"bifrost/error": cause.Error(),
+		phaseAnnotationKey: "failed",
+		"bifrost/error":    cause.Error(),
 	}); annErr != nil {
 		return fmt.Errorf("%w (additionally failed to annotate failure: %v)", cause, annErr)
 	}

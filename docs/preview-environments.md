@@ -29,9 +29,23 @@ token (Secret Manager secret `bifrost_prod_preview_api_token`) against:
 ```
 GET    /api/previews          # list
 GET    /api/previews/{tag}    # one preview's record — ib.py polls this from `up`
-POST   /api/previews          # {"branch": "..."} -> create/update, returns {tag, phase}
+POST   /api/previews          # {"branch": "...", "ttl": "8h"} -> create/update, returns {tag, phase}
 DELETE /api/previews/{tag}    # tear down
 ```
+
+`ttl`, on the create request, is an optional Go duration string (`"8h"`,
+`"90m"`) — absent or empty means the preview never expires, which is the
+default: **there is no implicit default TTL.** A caller-supplied `ttl` is
+validated synchronously, before anything else happens, so a mistake comes
+back as a 400 instead of a preview that vanishes (or doesn't) hours later:
+
+- fails to parse as a Go duration → 400 `ttl must be a Go duration like 8h or 90m`
+- zero or negative → 400 `ttl must be positive`
+- over 720h (30 days) → 400 `ttl must be at most 720h0m0s`
+
+That 720h cap is a typo guard (a fat-fingered `8760h` — a year — instead of
+`8h`), not a policy limit: nothing enforces a maximum preview lifetime, and
+omitting `ttl` entirely still means "never expires."
 
 A record carries `tag`, `branch`, `apps`, `phase`, `health`, `createdAt`,
 `urls`, plus the progress trio: `step` (what `Up` is doing right now, e.g.
@@ -42,6 +56,11 @@ stale between polls), and `error` (the failure cause, same string as the
 so a consumer must treat a missing key as "". `step` without `stepSince` is a
 legal combination: a `bifrost/step-since` annotation that's absent or doesn't
 parse as RFC3339 is dropped rather than failing the read.
+
+`expiresAt` (RFC3339) is the preview's reclaim time, set only when it was
+created with a `ttl`; it's omitted from the JSON entirely (`omitzero`) for
+the common case of a preview with no expiry. See "Automatic expiry" below
+for how and when it's actually enforced.
 
 A tag mid-`Up`/`Down` is claimed by an in-memory busy set; a concurrent call
 for the same tag gets `409` (`ib.py`: "That preview is busy").
@@ -71,6 +90,20 @@ ingress class staging uses.
    already has: re-running `up` over a previously failed preview (the recovery
    path below) would otherwise show the old run's error and last step for the
    whole retry.
+
+   The same write also sets `bifrost/expires-at`: an absolute RFC3339 instant
+   (`now + ttl`, where `now` is *this* step — so the clock starts when `up`
+   begins, not when the preview becomes usable, and a `--ttl 90m` preview
+   whose builds take 25 minutes has 65 minutes of ready life) if `ttl` was
+   given, or `""` if it wasn't — written
+   unconditionally either way, for the identical merge reason the error/step
+   fields above are cleared unconditionally. **This means re-running `up`
+   (a fresh `POST /api/previews` for the same tag) *without* a `ttl` clears
+   any expiry a previous run set for that tag** — there is no way to "leave
+   it alone." That's deliberate: the alternative (omit the key when there's
+   no `ttl`) would let a stale expiry silently survive a retry, which is a
+   worse failure mode than a caller needing to resend the same `ttl` to keep
+   it.
 4. **Build**: run each member's `{service}-preview-build` Cloud Build trigger and
    wait for it (`buildPollInterval`, 10s), collecting the resulting short SHA.
    Every member's build runs, every time — there is no check for "this SHA
@@ -165,6 +198,54 @@ preview may have changed membership since its branch was created, and this is
 the only record `Down` has) — best-effort deletes a `preview-<tag>` Neon
 branch if one exists. Every step runs regardless of earlier failures; all
 errors are joined and returned together.
+
+## Automatic expiry
+
+A preview created with a `ttl` carries `bifrost/expires-at`; a goroutine
+inside prod bifrost (`Orchestrator.RunReaper`, started in `cmd/bifrost/main.go`
+next to the signal-handling setup, gated on preview config being present)
+wakes every `previewReapInterval` (one hour) and calls `PurgeExpired`
+(`internal/preview/reaper.go`), which reclaims each past-due preview through
+the same `Orchestrator.Down` a manual `ib preview down` would use — namespace
+and any Neon branch both go, and Down's own idempotency means a preview
+double-swept (e.g. by two `bifrost` replicas) is harmless.
+
+The sweep runs a full interval after bifrost starts, never immediately: a
+purge firing on every restart (spot-node preemptions are routine in this
+cluster) would be surprising and isn't needed for correctness.
+
+`PurgeExpired` reclaims only on unambiguous evidence a preview is past due.
+Every other case is skipped — silently, and never logged as an error:
+
+- `bifrost/expires-at` is absent, empty, or doesn't parse as RFC3339 — a
+  value bifrost can't read means "no expiry," never "expired."
+- the expiry is still in the future.
+- the namespace is already `Terminating` — its teardown is already underway.
+- `bifrost/phase` is `creating` — an `Up` is still running; deleting the
+  namespace out from under it would race a create that may be minutes from
+  finishing. See the first Gotcha below for what this means for a preview
+  stuck in `creating`.
+- the tag is currently `Busy` — an `Up` or `Down` already holds it.
+- the namespace is labelled `bifrost/preview=true` but its name doesn't have
+  the `preview-` prefix — off-convention, so there's no tag to safely derive
+  (logged as a warning, but still never acted on).
+
+Those rules are judged **twice**: once against the namespace list the sweep
+starts from, and again against a fresh `GetNamespace` taken immediately before
+each teardown. A sweep isn't instantaneous, and an `up` that starts *and
+finishes* while it works through earlier namespaces would otherwise be
+reclaimed on the strength of the expiry it had when the sweep began — the busy
+set covers an `up` still running, not one that has already completed. A preview
+whose fresh copy has a renewed (or cleared) expiry, or is back in `creating`,
+is left alone; one whose namespace has vanished by then is skipped silently
+(something else tore it down). A namespace that can't be re-read at all is
+skipped too, but that failure *is* reported — an unreadable namespace is no
+evidence of anything, least of all a reason to delete it.
+
+One preview's teardown failing doesn't abort the sweep — errors accumulate
+across the whole pass and are joined, the same way `Down` itself accumulates
+Neon errors — and every reclaimed tag is logged with how long it had been
+overdue; a sweep that reclaims nothing logs at debug level only.
 
 ## The registry (`internal/registry/registry.yaml`)
 
@@ -294,7 +375,56 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   by re-running `ib preview up <branch>` — safe, since every stage is
   idempotent — but it **always re-runs every member's preview build** (no
   skip-if-image-exists check), so recovery costs a full rebuild of every app
-  in the preview, not just the one that was mid-flight.
+  in the preview, not just the one that was mid-flight. The expiry sweep does
+  not help here either: `PurgeExpired` treats `phase: creating` as "still in
+  flight" and skips it unconditionally — not merely defers it — so a preview
+  whose `Up` died with the process (a spot-node preemption is the routine
+  cause) sits at `creating` forever, however far past its `expiresAt`, until
+  a human intervenes. It's visible as such in the UI and `ib preview list`;
+  `ib preview down` (which doesn't consult phase at all) clears it either
+  way.
+- **Expiry is strictly opt-in.** A preview created without a `ttl` never
+  expires — there's no implicit default — so most previews, including every
+  one that predates this feature, simply carry no `bifrost/expires-at` and
+  sit until someone runs `ib preview down`.
+- **A preview can outlive its recorded expiry by up to an hour.** The sweep
+  (`PurgeExpired`) runs once per `previewReapInterval` (an hour), and the
+  first sweep after any bifrost start or restart is delayed a full interval
+  rather than firing immediately (see "Automatic expiry" above) — so a
+  preview reading "expired" in the UI or past its `expiresAt` in the API
+  hasn't necessarily been torn down yet.
+- **A teardown that dies after the namespace delete orphans the Neon branch,
+  and nothing ever retries it.** `Down` deletes the namespace first and the
+  `preview-<tag>` Neon branches second. Once the namespace is gone the preview
+  is no longer in `ListNamespaces`, so no later sweep can see it and no `ib
+  preview down` can name it — whatever the second half didn't finish stays
+  unfinished forever. A Neon list/delete API error does it; so does the process
+  exiting mid-teardown (`RunReaper` runs each sweep on a context detached from
+  shutdown to narrow that window, but nothing waits on the goroutine, so a fast
+  exit can still cut one short). What's left behind is a live Neon branch:
+  billed, and invisible to the UI, `ib preview list` and bifrost generally,
+  since all three list *namespaces*. Nor is there much of a signal — teardown
+  runs in a background goroutine and `DELETE /api/previews/{tag}` answers `202`
+  before it starts, so `ib preview down` reports success either way; the only
+  trace is in bifrost's own logs (`preview delete failed`, or `preview: expiry
+  sweep had failures`). To check for strays, list the branches of every Neon
+  project in `internal/registry/registry.yaml` (the `preview.neon.project`
+  keys — today `footstrike-api`'s and `identity`'s) and look for `preview-*`
+  branches with no matching `preview-<tag>` namespace; delete those by hand.
+- **A `failed` preview still expires, on schedule.** Marking a preview failed
+  writes only `bifrost/phase` and `bifrost/error` — `bifrost/expires-at`
+  survives untouched — and the only phase the sweep skips is `creating`, so a
+  preview created with a `ttl` that then failed to build is reclaimed exactly
+  like a healthy one, Neon branch included. Usually that's the best case (a broken
+  preview is the one least worth keeping), but if you're debugging a failed
+  build, note that the namespace you're reading `kubectl` output from will
+  disappear at its `expiresAt`. Re-running `up` without a `ttl` clears the
+  expiry (see below) at the cost of a full rebuild.
+- **Re-running `up` without a `ttl` clears any expiry the tag already
+  had** — it does not leave a previous run's `bifrost/expires-at` in place.
+  See step 3 of the `Up` lifecycle above for why. Recovering a stuck or
+  failed preview that you want to keep expiring on schedule means resending
+  the same `ttl`, not omitting it.
 - **A `failed` preview keeps showing its last step, on purpose.** `bifrost/step`
   is cleared on `ready` but retained on `failed`, so the row reads "failed ·
   building footstrike-api (1/2) — build ended with status FAILURE" for as long

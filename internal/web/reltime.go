@@ -34,6 +34,33 @@ func relativeTime(t, now time.Time) string {
 	}
 }
 
+// expiresIn renders how long remains until t, the future-facing mirror of
+// relativeTime above: "" for the zero time (previewRecord.ExpiresAt is zero
+// for the common no-TTL preview, and the Previews tab must render nothing
+// for it — no separator, no placeholder), and "expired" once t has passed
+// rather than a negative duration. The hourly sweep (internal/preview's
+// RunReaper) can take up to an interval to actually reclaim a past-due
+// preview, so "expired" is the accurate state for that whole window, not a
+// display bug to paper over.
+func expiresIn(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := t.Sub(now)
+	switch {
+	case d <= 0:
+		return "expired"
+	case d < time.Minute:
+		return "expires in <1m"
+	case d < time.Hour:
+		return fmt.Sprintf("expires in %dm", d/time.Minute)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("expires in %dh", d/time.Hour)
+	default:
+		return fmt.Sprintf("expires in %dd", d/(24*time.Hour))
+	}
+}
+
 // dayRelative renders a wall-clock timestamp in the operator's display
 // timezone with a day-relative prefix, matching the design's build/job times:
 //

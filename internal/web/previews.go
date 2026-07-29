@@ -42,6 +42,11 @@ type previewRecord struct {
 	// so a failed preview's cause is visible to API consumers instead of
 	// only the cluster-side annotation.
 	Error string `json:"error,omitempty"`
+	// ExpiresAt is the optional reclaim time recorded at creation
+	// (bifrost/expires-at — see internal/preview's expiresAtAnnotation).
+	// Zero, and so omitted from the JSON, means the preview never expires:
+	// most previews carry no TTL, and that is the default by design.
+	ExpiresAt time.Time `json:"expiresAt,omitzero"`
 }
 
 // recordFromNamespace derives everything derivable without extra cluster
@@ -61,6 +66,15 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 	if since := ns.Annotations["bifrost/step-since"]; since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			rec.StepSince = t
+		}
+	}
+	// Same swallow-the-parse-error shape as step-since directly above, for the
+	// same reason: one malformed annotation must not fail the whole read. Here
+	// it also fails safe — an unreadable expiry leaves ExpiresAt zero, which
+	// everything downstream reads as "no expiry", never "expired long ago".
+	if expires := ns.Annotations["bifrost/expires-at"]; expires != "" {
+		if t, err := time.Parse(time.RFC3339, expires); err == nil {
+			rec.ExpiresAt = t
 		}
 	}
 	for _, app := range strings.Split(ns.Annotations["bifrost/apps"], ",") {
