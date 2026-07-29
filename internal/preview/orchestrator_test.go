@@ -330,6 +330,16 @@ func (f *fakeKube) annotations(name string) map[string]string {
 	return copyStringMap(ns.annotations)
 }
 
+// hasNamespace reports whether name still exists, under the fake's lock —
+// the accessor a test polling against a live background goroutine (the expiry
+// sweep) has to use instead of reading the map directly.
+func (f *fakeKube) hasNamespace(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.namespaces[name]
+	return ok
+}
+
 func (f *fakeKube) ApplyObjects(_ context.Context, _ string, objs []*unstructured.Unstructured) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -465,9 +475,17 @@ func initializingPod(deployment, image string, init ...kube.ContainerInfo) kube.
 // everything) — enough to prove the sweep filters on bifrost/preview rather
 // than reaching for every namespace in the cluster. Results are sorted by
 // name so a multi-namespace sweep processes them in a fixed order.
-func (f *fakeKube) ListNamespaces(_ context.Context, selector string) ([]kube.NamespaceInfo, error) {
+//
+// Context-respecting, like AnnotateNamespace and unlike the rest of the fake,
+// and for the same kind of reason: a real List against a dead context fails,
+// which is what makes a test of the sweep's detachment from shutdown
+// cancellation mean anything.
+func (f *fakeKube) ListNamespaces(ctx context.Context, selector string) ([]kube.NamespaceInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key, value, hasSelector := strings.Cut(selector, "=")
 	var out []kube.NamespaceInfo
 	for name, ns := range f.namespaces {

@@ -204,11 +204,12 @@ func TestPurgeExpiredSkipsBusyTags(t *testing.T) {
 	defer d.orch.release("in-flight")
 
 	reclaimed, err := d.orch.PurgeExpired(context.Background(), sweepNow)
-	// The nil error matters as much as the untouched namespace. Without the
-	// Busy check the sweep would still leave in-flight standing — Down
-	// refuses a busy tag with ErrBusy — but it would report that refusal as a
-	// sweep failure. Asserting only "untouched" would pass for that wrong
-	// reason.
+	// The nil error matters as much as the untouched namespace: a busy tag is
+	// the sweep deferring, not failing. With neither half of the busy rule in
+	// place the namespace would still be left standing — Down refuses a busy
+	// tag with ErrBusy — so asserting only "untouched" would pass for that
+	// wrong reason. (The pre-check and the ErrBusy arm are behaviorally
+	// identical by construction, so this covers the rule, not either line.)
 	if err != nil {
 		t.Fatalf("PurgeExpired failed: %v", err)
 	}
@@ -266,6 +267,74 @@ func TestPurgeExpiredSkipsNamespacesOutsideThePreviewPrefix(t *testing.T) {
 }
 
 // ---- RunReaper ---------------------------------------------------------------
+
+// TestRunReaperSweepsOnEveryTick is the test that keeps the whole feature from
+// shipping inert: everything else here calls PurgeExpired directly, so a
+// RunReaper whose tick case did nothing at all would still pass every one of
+// them. It asserts on the fake cluster — the namespace gone and its Neon
+// branch with it — after a tick, not on any return value.
+func TestRunReaperSweepsOnEveryTick(t *testing.T) {
+	d := newReaperDeps()
+	// Past due against the real clock, since RunReaper judges each sweep by
+	// its own time.Now().
+	d.addPreview("stale", map[string]string{
+		"bifrost/expires-at": time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.orch.RunReaper(ctx, 10*time.Millisecond)
+	}()
+
+	// Poll through the fake's lock: the sweep is running concurrently, so
+	// reading its maps directly would be a data race.
+	deadline := time.Now().Add(5 * time.Second)
+	for d.kube.hasNamespace(previewNamespace("stale")) {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("preview-stale survived 5s of 10ms ticks: RunReaper never swept")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunReaper did not return after its context was cancelled")
+	}
+	// Safe to read unlocked now that the goroutine has returned. The
+	// namespace going is only half of a teardown; the Neon branch is the
+	// half that proves the tick reached Down rather than some delete of its
+	// own.
+	d.assertTornDown(t, "stale")
+}
+
+// TestSweepDetachesFromShutdownCancellation models the SIGTERM case: the
+// loop's context is already dead, and the sweep must still run to completion.
+// Down deletes the namespace before the Neon branches, and a preview whose
+// namespace is gone never appears in ListNamespaces again — so a teardown cut
+// off in that window orphans the branch permanently, with nothing left to
+// retry it.
+func TestSweepDetachesFromShutdownCancellation(t *testing.T) {
+	d := newReaperDeps()
+	d.addPreview("stale", map[string]string{
+		"bifrost/expires-at": time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the shutdown signal has already landed
+
+	reclaimed, err := d.orch.sweep(ctx)
+	if err != nil {
+		t.Fatalf("sweep failed on an already-cancelled parent context: %v", err)
+	}
+	assertReclaimed(t, reclaimed, "stale")
+	d.assertTornDown(t, "stale")
+}
 
 func TestRunReaperStopsOnContextCancel(t *testing.T) {
 	d := newReaperDeps()

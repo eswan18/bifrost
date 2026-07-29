@@ -200,9 +200,9 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	if err := o.Kube.EnsureNamespace(ctx, ns,
 		map[string]string{"bifrost/preview": "true"},
 		map[string]string{
-			"bifrost/branch": branch,
-			"bifrost/apps":   strings.Join(members, ","),
-			"bifrost/phase":  "creating",
+			"bifrost/branch":   branch,
+			"bifrost/apps":     strings.Join(members, ","),
+			phaseAnnotationKey: "creating",
 			// Cleared, not merely left alone: EnsureNamespace MERGES
 			// annotations onto whatever the namespace already carries, and
 			// re-running Up over a previously failed preview is the
@@ -219,7 +219,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 			"bifrost/step-since": "",
 			// Written unconditionally, "" and all, for the same merge reason
 			// the three above are cleared; see expiresAtAnnotation.
-			"bifrost/expires-at": expiresAtAnnotation(ttl),
+			expiresAtAnnotationKey: expiresAtAnnotation(ttl),
 		},
 	); err != nil {
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
@@ -254,7 +254,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	// above) deliberately never does this — its last step is the
 	// diagnostic ("failed while building footstrike-api").
 	if err := o.Kube.AnnotateNamespace(ctx, ns, map[string]string{
-		"bifrost/phase":      "ready",
+		phaseAnnotationKey:   "ready",
 		"bifrost/error":      "",
 		"bifrost/step":       "",
 		"bifrost/step-since": "",
@@ -263,6 +263,16 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	}
 	return nil
 }
+
+// The two namespace-annotation keys that are both written here and read back
+// elsewhere in this package (by the expiry sweep) are named, so the writer and
+// the reader cannot drift apart. The rest of the bifrost/* family
+// (branch/apps/error/step/step-since) is written here and read only outside
+// this package, so those stay literals at their single point of use.
+const (
+	phaseAnnotationKey     = "bifrost/phase"
+	expiresAtAnnotationKey = "bifrost/expires-at"
+)
 
 // expiresAtAnnotation renders ttl as an absolute RFC3339 instant, or "" for
 // no expiry. Absolute rather than a duration so the reaper never has to know
@@ -313,8 +323,8 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failAnnotateTimeout)
 	defer cancel()
 	if annErr := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
-		"bifrost/phase": "failed",
-		"bifrost/error": cause.Error(),
+		phaseAnnotationKey: "failed",
+		"bifrost/error":    cause.Error(),
 	}); annErr != nil {
 		return fmt.Errorf("%w (additionally failed to annotate failure: %v)", cause, annErr)
 	}
