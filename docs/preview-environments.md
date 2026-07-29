@@ -199,6 +199,12 @@ the only record `Down` has) — best-effort deletes a `preview-<tag>` Neon
 branch if one exists. Every step runs regardless of earlier failures; all
 errors are joined and returned together.
 
+The namespace-then-Neon order is kept deliberately: the reverse would leave a
+window where a preview's pods run against a database that's already gone. The
+cost of keeping it — a teardown interrupted between the two halves leaves a
+branch nothing can name — is covered from the other side, by the orphan sweep
+below.
+
 ## Automatic expiry
 
 A preview created with a `ttl` carries `bifrost/expires-at`; a goroutine
@@ -246,6 +252,66 @@ One preview's teardown failing doesn't abort the sweep — errors accumulate
 across the whole pass and are joined, the same way `Down` itself accumulates
 Neon errors — and every reclaimed tag is logged with how long it had been
 overdue; a sweep that reclaims nothing logs at debug level only.
+
+## Orphaned Neon branches
+
+Each tick of that same hourly loop runs a second pass —
+`Orchestrator.PurgeOrphanedBranches`, immediately after `PurgeExpired`, on the
+same detached `sweepBudget`-bounded context — that deletes `preview-<tag>` Neon
+branches which no longer have a preview namespace to belong to.
+
+It exists for the one failure `Down` can't recover from itself. `Down` deletes
+the namespace first and the Neon branches second, so an interruption in between
+(the process exiting on a spot-node preemption; `sweepBudget` firing
+mid-teardown; a Neon API error) leaves a branch **nothing can ever find again**
+— the preview is gone from `ListNamespaces`, so no later expiry sweep and no
+repeat `ib preview down` can name it. What's left is billed and invisible. The
+fix reclaims from the Neon side rather than reversing `Down`'s order, which
+would trade this for a window where a preview's pods run against a database
+that has already been deleted.
+
+It's cheap: the work is O(distinct Neon projects), not O(previews).
+`ListBranches` returns a whole project in one call, and `registry.yaml` names
+two distinct projects today (`footstrike-api`'s and `identity`'s), so a full
+orphan check is **two extra HTTP calls per sweep** however many previews exist.
+Projects are de-duplicated by ID, so two services sharing one Neon project
+still cost one call.
+
+A branch is deleted only when every one of these holds. Each miss is skipped
+silently and none is an error, matching `PurgeExpired`:
+
+- its name starts with `preview-` and has something after it. A branch named
+  `main`, `dev`, or exactly `preview-` is never touched.
+- the derived tag has **no** preview namespace. `Terminating` namespaces count
+  as live — the namespace still exists, so the branch still belongs to the
+  teardown that's removing it.
+- the tag isn't `Busy` — an `Up` or `Down` holding it means a teardown in
+  flight, not one that died.
+- the branch is at least **one hour old** (`minOrphanAge`).
+
+Every deletion is logged at info with its project, branch name and age; this
+deletes a database branch, so it is never silent. A project whose
+`ListBranches` fails is reported and skipped, and the remaining projects are
+still swept. A failure to list *namespaces*, by contrast, aborts the whole pass
+without deleting anything — an empty live set alongside a full branch list is
+indistinguishable from "every preview is an orphan."
+
+**The ordering invariant this rests on.** "A branch with no namespace is an
+orphan" is only true because `Up` calls `EnsureNamespace` **before**
+`branchNeonDatabases`: a preview gets its namespace before it gets its Neon
+branch, so there is no window in which the branch exists alone and an in-flight
+create can never look like an orphan. **Reordering those two stages of `Up`
+would turn this sweep into a data-destroying bug**, and the one-hour age floor
+is the only thing that would slow it down. That floor is insurance for exactly
+that, not a fix for any race that exists today — there's a comment saying so at
+the detection site in `reaper.go`.
+
+**It will collect a branch you made by hand.** The sweep has no way to tell a
+branch bifrost created from one a human created: any branch named `preview-*`
+in `footstrike-api`'s or `identity`'s Neon project, older than an hour, with no
+matching `preview-<tag>` namespace in the cluster, is deleted on the next tick.
+If you need a scratch branch in one of those projects to survive, **do not name
+it `preview-something`** — any other prefix is ignored entirely.
 
 ## The registry (`internal/registry/registry.yaml`)
 
@@ -394,23 +460,30 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   preview reading "expired" in the UI or past its `expiresAt` in the API
   hasn't necessarily been torn down yet.
 - **A teardown that dies after the namespace delete orphans the Neon branch,
-  and nothing ever retries it.** `Down` deletes the namespace first and the
-  `preview-<tag>` Neon branches second. Once the namespace is gone the preview
-  is no longer in `ListNamespaces`, so no later sweep can see it and no `ib
-  preview down` can name it — whatever the second half didn't finish stays
-  unfinished forever. A Neon list/delete API error does it; so does the process
-  exiting mid-teardown (`RunReaper` runs each sweep on a context detached from
-  shutdown to narrow that window, but nothing waits on the goroutine, so a fast
-  exit can still cut one short). What's left behind is a live Neon branch:
-  billed, and invisible to the UI, `ib preview list` and bifrost generally,
-  since all three list *namespaces*. Nor is there much of a signal — teardown
-  runs in a background goroutine and `DELETE /api/previews/{tag}` answers `202`
-  before it starts, so `ib preview down` reports success either way; the only
-  trace is in bifrost's own logs (`preview delete failed`, or `preview: expiry
-  sweep had failures`). To check for strays, list the branches of every Neon
-  project in `internal/registry/registry.yaml` (the `preview.neon.project`
-  keys — today `footstrike-api`'s and `identity`'s) and look for `preview-*`
-  branches with no matching `preview-<tag>` namespace; delete those by hand.
+  and only the hourly orphan sweep will find it.** `Down` deletes the namespace
+  first and the `preview-<tag>` Neon branches second. Once the namespace is gone
+  the preview is no longer in `ListNamespaces`, so no expiry sweep can see it
+  and no `ib preview down` can name it — whatever the second half didn't finish
+  stays unfinished as far as *that* path is concerned. A Neon list/delete API
+  error does it; so does the process exiting mid-teardown (`RunReaper` runs each
+  sweep on a context detached from shutdown to narrow that window, but nothing
+  waits on the goroutine, so a fast exit can still cut one short). What's left
+  behind is a live Neon branch: billed, and invisible to the UI, `ib preview
+  list` and bifrost generally, since all three list *namespaces*. Nor is there
+  much of a signal — teardown runs in a background goroutine and `DELETE
+  /api/previews/{tag}` answers `202` before it starts, so `ib preview down`
+  reports success either way. What closes the loop is `PurgeOrphanedBranches`
+  (see "Orphaned Neon branches" above): it reclaims the branch from the Neon
+  side on the next hourly tick, up to an hour later, and logs it. It is not
+  instant, and it is deliberately conservative — a branch younger than an hour
+  is left for the next pass. To check for strays yourself, list the branches of
+  every Neon project in `internal/registry/registry.yaml` (the
+  `preview.neon.project` keys — today `footstrike-api`'s and `identity`'s) and
+  look for `preview-*` branches with no matching `preview-<tag>` namespace.
+- **The orphan sweep will delete a hand-made `preview-*` Neon branch.** It
+  can't distinguish one bifrost created from one you created; the name and the
+  absent namespace are all it goes on. Name scratch branches in those two
+  projects anything that doesn't start with `preview-`.
 - **A `failed` preview still expires, on schedule.** Marking a preview failed
   writes only `bifrost/phase` and `bifrost/error` — `bifrost/expires-at`
   survives untouched — and the only phase the sweep skips is `creating`, so a

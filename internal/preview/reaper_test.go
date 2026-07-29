@@ -373,6 +373,291 @@ func TestPurgeExpiredReportsAFailedRecheck(t *testing.T) {
 	d.assertUntouched(t, "aaa-unreadable")
 }
 
+// ---- PurgeOrphanedBranches --------------------------------------------------
+
+// The orphan sweep's two Neon projects. proj-api is shared by two registry
+// services below — a single Neon project holds many databases, so nothing stops
+// that, and the sweep must still list it once.
+const (
+	orphanProjAPI      = "proj-api"
+	orphanProjIdentity = "proj-identity"
+)
+
+// orphanDeps is the slice of the orchestrator an orphan sweep touches: a fake
+// cluster whose preview namespaces are the live set, and a fake Neon whose
+// branches are the candidates. Its registry deliberately covers all three
+// shapes the real one can have — two services sharing a project, a service
+// with a project of its own, and a previewable service with no Neon reference
+// at all (footstrike-dashboard, exactly as in registry.yaml).
+type orphanDeps struct {
+	orch *Orchestrator
+	kube *fakeKube
+	neon *fakeNeon
+}
+
+func newOrphanDeps() *orphanDeps {
+	kc := newFakeKube()
+	nc := &fakeNeon{branches: map[string][]neon.Branch{}}
+	o := &Orchestrator{
+		Kube: kc,
+		Neon: nc,
+		Registry: Registry{
+			"footstrike-api":       {Neon: &NeonRef{Project: orphanProjAPI, Database: "fitnessdb", Role: "fitness_owner"}},
+			"footstrike-reporting": {Neon: &NeonRef{Project: orphanProjAPI, Database: "reportingdb", Role: "fitness_owner"}},
+			"identity":             {Neon: &NeonRef{Project: orphanProjIdentity, Database: "identitydb", Role: "identity_owner"}},
+			"footstrike-dashboard": {},
+		},
+	}
+	return &orphanDeps{orch: o, kube: kc, neon: nc}
+}
+
+// addBranch registers a Neon branch created at createdAt. Every orphan test
+// states a branch's age explicitly: the age floor is one of the rules under
+// test, and a fixture defaulting to the zero time would make every branch look
+// ancient without saying so.
+func (d *orphanDeps) addBranch(project, name string, createdAt time.Time) {
+	d.neon.branches[project] = append(d.neon.branches[project],
+		neon.Branch{ID: "br-" + project + "-" + name, Name: name, CreatedAt: createdAt})
+}
+
+// addOrphan is the control every test below carries: a day-old preview-<tag>
+// branch with no namespace anywhere, which the sweep must reclaim. Without it,
+// an assertion that some OTHER branch survived would pass just as happily
+// against a sweep that listed nothing and deleted nothing at all.
+func (d *orphanDeps) addOrphan(tag string) {
+	d.addBranch(orphanProjAPI, previewBranchName(tag), sweepNow.Add(-24*time.Hour))
+}
+
+// addNamespace gives tag a preview namespace in a Kubernetes status phase
+// ("Active" | "Terminating"), labelled the way Up labels one.
+func (d *orphanDeps) addNamespace(tag, nsPhase string) {
+	d.kube.namespaces[previewNamespace(tag)] = &fakeNamespace{
+		labels:      map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{"bifrost/phase": "ready"},
+		phase:       nsPhase,
+	}
+}
+
+func (d *orphanDeps) assertBranchGone(t *testing.T, project, name string) {
+	t.Helper()
+	if d.neon.hasBranch(project, name) {
+		t.Errorf("branch %s/%s still present, want it deleted", project, name)
+	}
+}
+
+func (d *orphanDeps) assertBranchKept(t *testing.T, project, name string) {
+	t.Helper()
+	if !d.neon.hasBranch(project, name) {
+		t.Errorf("branch %s/%s was deleted, want it left alone", project, name)
+	}
+}
+
+func assertPurged(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Errorf("PurgeOrphanedBranches deleted %v, want %v", got, want)
+	}
+}
+
+// TestPurgeOrphanedBranchesDeletesABranchWithNoNamespace is the base case: the
+// exact residue of a teardown that died between its namespace delete and its
+// Neon delete. Nothing else in bifrost can see this branch — it is absent from
+// ListNamespaces, so no expiry sweep and no `ib preview down` can name it.
+func TestPurgeOrphanedBranchesDeletesABranchWithNoNamespace(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone")
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone")
+	d.assertBranchGone(t, orphanProjAPI, "preview-gone")
+}
+
+// TestPurgeOrphanedBranchesKeepsBranchesWithALiveNamespace is the rule the
+// whole feature turns on, in its most consequential direction: this is a
+// working preview's database.
+func TestPurgeOrphanedBranchesKeepsBranchesWithALiveNamespace(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone") // control: this one must go
+	d.addBranch(orphanProjAPI, "preview-live", sweepNow.Add(-24*time.Hour))
+	d.addNamespace("live", "Active")
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone")
+	d.assertBranchGone(t, orphanProjAPI, "preview-gone")
+	d.assertBranchKept(t, orphanProjAPI, "preview-live")
+}
+
+// TestPurgeOrphanedBranchesKeepsBranchesWhoseNamespaceIsTerminating covers the
+// state a real cluster spends seconds to minutes in after every teardown. The
+// namespace still EXISTS — it is still in ListNamespaces, so the preview is
+// still visible to bifrost and its branch still belongs to the Down that is
+// removing it. Filtering Terminating out of the live set would make every
+// ordinary teardown briefly look like an orphan.
+func TestPurgeOrphanedBranchesKeepsBranchesWhoseNamespaceIsTerminating(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone") // control: this one must go
+	d.addBranch(orphanProjAPI, "preview-dying", sweepNow.Add(-24*time.Hour))
+	d.addNamespace("dying", "Terminating")
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone")
+	d.assertBranchGone(t, orphanProjAPI, "preview-gone")
+	d.assertBranchKept(t, orphanProjAPI, "preview-dying")
+}
+
+// TestPurgeOrphanedBranchesSkipsBusyTags covers the one transient that really
+// does produce a branch with no namespace: Down, caught between its two halves.
+// A sweep firing during a teardown would race the delete it is duplicating —
+// and, worse, is indistinguishable from the sweep deleting a branch out from
+// under an Up if Up's ordering ever changes.
+func TestPurgeOrphanedBranchesSkipsBusyTags(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone") // control: this one must go
+	d.addBranch(orphanProjAPI, "preview-teardown", sweepNow.Add(-24*time.Hour))
+	if !d.orch.acquire("teardown") {
+		t.Fatal("acquire(teardown) = false on a fresh orchestrator")
+	}
+	defer d.orch.release("teardown")
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	// The nil error matters as much as the surviving branch: a busy tag is the
+	// sweep deferring, not failing.
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone")
+	d.assertBranchGone(t, orphanProjAPI, "preview-gone")
+	d.assertBranchKept(t, orphanProjAPI, "preview-teardown")
+}
+
+// TestPurgeOrphanedBranchesSkipsBranchesYoungerThanMinOrphanAge pins the age
+// floor and its boundary in both directions. The floor is insurance rather
+// than a fix for a live race (Up creates the namespace before the branch, so a
+// create in flight never looks like an orphan at any age) — but a floor that
+// silently didn't apply would be no insurance at all.
+func TestPurgeOrphanedBranchesSkipsBranchesYoungerThanMinOrphanAge(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone") // control: this one must go
+	d.addBranch(orphanProjAPI, "preview-justmade", sweepNow.Add(-30*time.Minute))
+	// Exactly at the floor, so the comparison's direction is pinned too:
+	// "younger than minOrphanAge" is skipped, "exactly minOrphanAge" is not.
+	d.addBranch(orphanProjAPI, "preview-onthedot", sweepNow.Add(-minOrphanAge))
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone", orphanProjAPI+"/preview-onthedot")
+	d.assertBranchGone(t, orphanProjAPI, "preview-gone")
+	d.assertBranchGone(t, orphanProjAPI, "preview-onthedot")
+	d.assertBranchKept(t, orphanProjAPI, "preview-justmade")
+}
+
+// TestPurgeOrphanedBranchesIgnoresBranchesOutsideTheConvention is the blast
+// radius test. These projects are not bifrost's alone: main is the branch
+// every preview branches FROM, and losing it would take the staging database
+// with it. A branch named exactly "preview-" yields an empty tag, which would
+// match a namespace-less "" and be deleted by a sweep that trimmed the prefix
+// without checking what was left.
+func TestPurgeOrphanedBranchesIgnoresBranchesOutsideTheConvention(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone") // control: this one must go
+	for _, name := range []string{"main", "dev", "staging-restore", "preview", "preview-"} {
+		d.addBranch(orphanProjAPI, name, sweepNow.Add(-30*24*time.Hour))
+	}
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone")
+	for _, name := range []string{"main", "dev", "staging-restore", "preview", "preview-"} {
+		d.assertBranchKept(t, orphanProjAPI, name)
+	}
+}
+
+// TestPurgeOrphanedBranchesListsEachProjectOnce pins the deduplication. Two
+// registry services sharing one Neon project is legal (a project holds many
+// databases), and the sweep's whole cost argument — O(distinct projects), not
+// O(services or previews) — depends on not listing the same one twice. No
+// assertion on the resulting deletions can see this: a second pass over the
+// same project finds the branches already gone and deletes nothing either way,
+// so the call count is the only witness.
+func TestPurgeOrphanedBranchesListsEachProjectOnce(t *testing.T) {
+	d := newOrphanDeps()
+	d.addOrphan("gone")
+	d.addBranch(orphanProjIdentity, "preview-gone-too", sweepNow.Add(-24*time.Hour))
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+	// Ordered by service name (footstrike-api, then identity), which is what
+	// makes both this and the log output deterministic.
+	assertPurged(t, purged, orphanProjAPI+"/preview-gone", orphanProjIdentity+"/preview-gone-too")
+	if got := d.neon.listCallsFor(orphanProjAPI); got != 1 {
+		t.Errorf("ListBranches(%s) called %d times, want 1 — footstrike-api and footstrike-reporting share that project", orphanProjAPI, got)
+	}
+	if got := d.neon.listCallsFor(orphanProjIdentity); got != 1 {
+		t.Errorf("ListBranches(%s) called %d times, want 1", orphanProjIdentity, got)
+	}
+}
+
+// TestPurgeOrphanedBranchesContinuesPastAFailedList mirrors Down's own
+// best-effort shape: one project's Neon API being unavailable must not leave
+// the other project's orphans billing for another hour.
+func TestPurgeOrphanedBranchesContinuesPastAFailedList(t *testing.T) {
+	d := newOrphanDeps()
+	// proj-api is swept first (footstrike-api sorts before identity), so its
+	// failure lands before proj-identity is even looked at.
+	d.neon.listErr = map[string]error{orphanProjAPI: errors.New("neon: proj-api unavailable")}
+	d.addBranch(orphanProjIdentity, "preview-gone", sweepNow.Add(-24*time.Hour))
+
+	purged, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow)
+	if err == nil {
+		t.Fatal("expected the failed list to be reported, got nil")
+	}
+	if !strings.Contains(err.Error(), orphanProjAPI) || !strings.Contains(err.Error(), "unavailable") {
+		t.Errorf("error = %q, want it to name both the project and the cause", err)
+	}
+	assertPurged(t, purged, orphanProjIdentity+"/preview-gone")
+	d.assertBranchGone(t, orphanProjIdentity, "preview-gone")
+}
+
+// TestPurgeOrphanedBranchesDeletesNothingWhenNamespacesCannotBeListed is the
+// fail-closed direction, and the most dangerous failure this function has: an
+// empty live set alongside a full branch list is indistinguishable from "every
+// preview is an orphan". A pass that ignored the ListNamespaces error would
+// delete every preview database in the fleet in one tick.
+//
+// The dead context is what fails the list — fakeKube.ListNamespaces is
+// context-respecting, as a real List is, while the Neon fake is not, so an
+// implementation that carried on regardless really would reach the deletes.
+func TestPurgeOrphanedBranchesDeletesNothingWhenNamespacesCannotBeListed(t *testing.T) {
+	d := newOrphanDeps()
+	d.addBranch(orphanProjAPI, "preview-live", sweepNow.Add(-24*time.Hour))
+	d.addNamespace("live", "Active")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	purged, err := d.orch.PurgeOrphanedBranches(ctx, sweepNow)
+	if err == nil {
+		t.Fatal("expected the failed namespace list to be reported, got nil")
+	}
+	assertPurged(t, purged)
+	d.assertBranchKept(t, orphanProjAPI, "preview-live")
+}
+
 // ---- RunReaper ---------------------------------------------------------------
 
 // TestRunReaperSweepsOnEveryTick is the test that keeps the whole feature from
@@ -435,12 +720,102 @@ func TestSweepDetachesFromShutdownCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the shutdown signal has already landed
 
-	reclaimed, err := d.orch.sweep(ctx)
+	reclaimed, _, err := d.orch.sweep(ctx)
 	if err != nil {
 		t.Fatalf("sweep failed on an already-cancelled parent context: %v", err)
 	}
 	assertReclaimed(t, reclaimed, "stale")
 	d.assertTornDown(t, "stale")
+}
+
+// TestSweepPurgesOrphansAfterExpiry covers the wiring and the ordering in one
+// scenario, because they are the same fact: the orphan pass runs on the state
+// PurgeExpired has just left behind.
+//
+// The staging is the real failure this feature exists for, reproduced exactly:
+// a teardown whose namespace delete succeeded and whose Neon delete then
+// failed. Nothing can ever see that branch again — the namespace it was
+// derived from is gone — and before this change it billed forever.
+//
+// The ordering is what the assertion turns on. Run the orphan pass FIRST and
+// preview-stale still has its namespace, so it is correctly skipped as a live
+// preview, and the branch survives the tick. Run it second, as sweep does, and
+// the same branch is reclaimed on the same tick rather than an hour later.
+func TestSweepPurgesOrphansAfterExpiry(t *testing.T) {
+	d := newOrphanDeps()
+	// Judged against the real clock, since sweep supplies its own time.Now().
+	d.kube.namespaces[previewNamespace("stale")] = &fakeNamespace{
+		labels: map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{
+			"bifrost/phase":      "ready",
+			"bifrost/expires-at": time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+		},
+	}
+	// proj-identity, not proj-api: only one registry service references it, so
+	// Down makes exactly one delete attempt for this branch. (Down does not
+	// deduplicate projects, so a branch in proj-api would get a second attempt
+	// from footstrike-reporting and succeed on it, leaving nothing orphaned.)
+	d.addBranch(orphanProjIdentity, previewBranchName("stale"), time.Now().UTC().Add(-24*time.Hour))
+	// Down's Neon half fails once — the process-exit case, without needing a
+	// process to exit. The orphan pass's own delete then succeeds.
+	d.neon.deleteErrOnce = map[string]error{orphanProjIdentity: errors.New("neon: connection reset")}
+
+	reclaimed, orphans, err := d.orch.sweep(context.Background())
+	if err == nil {
+		t.Fatal("expected the failed Neon delete to be reported by the expiry pass, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("error = %q, want it to carry the Neon failure", err)
+	}
+	// Nothing "reclaimed": PurgeExpired counts only a Down that fully
+	// succeeded, and this one didn't. That is the shape of the bug — an
+	// operator gets one error line, and until this change the branch behind it
+	// was unreachable forever after.
+	assertReclaimed(t, reclaimed)
+	if _, present := d.kube.namespaces[previewNamespace("stale")]; present {
+		t.Error("namespace preview-stale still present: the expiry pass never tore it down")
+	}
+	// The orphan pass, running second, is what finishes the job.
+	assertPurged(t, orphans, orphanProjIdentity+"/preview-stale")
+	d.assertBranchGone(t, orphanProjIdentity, "preview-stale")
+}
+
+// TestRunReaperPurgesOrphanedBranchesOnATick is the test that keeps the orphan
+// sweep from shipping inert: every other test in this section calls
+// PurgeOrphanedBranches (or sweep) directly, so a RunReaper tick that never
+// reached it would still pass all of them. It asserts on the fake Neon — the
+// branch actually gone — after a tick, not on any return value.
+func TestRunReaperPurgesOrphanedBranchesOnATick(t *testing.T) {
+	d := newOrphanDeps()
+	// No namespaces at all: this is a branch bifrost has already lost track of.
+	// Aged against the real clock, since RunReaper judges each sweep by its own
+	// time.Now().
+	d.addBranch(orphanProjAPI, "preview-orphan", time.Now().UTC().Add(-24*time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.orch.RunReaper(ctx, 10*time.Millisecond)
+	}()
+
+	// Poll through the fake's lock: the sweep runs concurrently.
+	deadline := time.Now().Add(5 * time.Second)
+	for d.neon.hasBranch(orphanProjAPI, "preview-orphan") {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("preview-orphan survived 5s of 10ms ticks: RunReaper never swept orphaned branches")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunReaper did not return after its context was cancelled")
+	}
 }
 
 func TestRunReaperStopsOnContextCancel(t *testing.T) {

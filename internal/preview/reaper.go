@@ -12,23 +12,25 @@ import (
 )
 
 const (
-	// previewNSPrefix is what previewNamespace prepends to a tag; the sweep
-	// trims it back off to recover the tag Down wants. Shared so the two
-	// directions can't drift apart.
+	// previewNSPrefix is what previewNamespace and previewBranchName prepend
+	// to a tag; both sweeps trim it back off to recover the tag. Shared so the
+	// compose and match directions can't drift apart.
 	previewNSPrefix = "preview-"
 	// previewLabelSelector selects preview namespaces — the same label Up
 	// writes, and the same selector the web layer lists previews with.
 	previewLabelSelector = "bifrost/preview=true"
 )
 
-// sweepBudget bounds one whole PurgeExpired call. A sweep is one List plus,
-// per expired preview, a namespace delete and a couple of Neon calls per
-// project — seconds each, given client-go's own 15s per-call cap. Ten minutes
-// is far more than any realistic sweep needs (dozens of teardowns against a
-// slow API server) while staying an order of magnitude under the hourly
-// interval, so a wedged sweep can never still be running when the next tick
-// arrives. Its real job is to stop a hung call from pinning the detached
-// context open indefinitely, not to pace the work.
+// sweepBudget bounds one whole sweep — PurgeExpired and PurgeOrphanedBranches
+// together. A sweep is one namespace List plus, per expired preview, a
+// namespace delete and a couple of Neon calls per project, plus one further
+// List per pass and one ListBranches per distinct Neon project — seconds each,
+// given client-go's own 15s per-call cap. Ten minutes is far more than any
+// realistic sweep needs (dozens of teardowns against a slow API server) while
+// staying an order of magnitude under the hourly interval, so a wedged sweep
+// can never still be running when the next tick arrives. Its real job is to
+// stop a hung call from pinning the detached context open indefinitely, not to
+// pace the work.
 const sweepBudget = 10 * time.Minute
 
 // PurgeExpired tears down every preview whose bifrost/expires-at has passed,
@@ -207,6 +209,173 @@ func parseExpiry(ns kube.NamespaceInfo) (time.Time, bool) {
 	return expiry, true
 }
 
+// minOrphanAge is how long a preview-<tag> Neon branch with no namespace must
+// have existed before PurgeOrphanedBranches will delete it.
+//
+// Belt-and-braces, NOT a fix for a known race. Up creates the namespace
+// (EnsureNamespace) before it creates the branch (branchNeonDatabases), so
+// there is no instant at which a branch exists and its namespace does not: an
+// in-flight create can never look like an orphan, whatever its age. The floor
+// is insurance against that invariant being broken later — a future reordering
+// of Up would then degrade this sweep into a delay (a branch reclaimed up to
+// an hour late) instead of into data loss (a live preview's database deleted
+// out from under a create still running). One hour is also one full sweep
+// interval, so it costs at most one extra pass on the path it does govern.
+const minOrphanAge = time.Hour
+
+// PurgeOrphanedBranches deletes every preview-<tag> Neon branch, in every Neon
+// project the registry references, that no longer has a preview namespace to
+// belong to. It returns "<project>/<branch>" for each branch it deleted —
+// qualified by project because a branch name is only unique within one, and
+// two projects can each hold a preview-<tag> for the same tag. now is a
+// parameter rather than a call to time.Now for the same reason PurgeExpired's
+// is: it fixes the instant the whole sweep is judged against.
+//
+// This is the recovery path for the one failure Down cannot recover from
+// itself. Down deletes the namespace first and the Neon branches second, so an
+// interruption in between — the process exiting on a spot-node preemption,
+// sweepBudget expiring mid-teardown — leaves a branch that nothing can ever
+// find again: the preview is gone from ListNamespaces, so no later expiry
+// sweep and no repeat `ib preview down` can name it, and what's left is a paid,
+// invisible database. Reclaiming from the Neon side (rather than reversing
+// Down's order) avoids ever having a window where a preview's pods run against
+// a database that has already been deleted.
+//
+// It is cheap by construction: the work is O(distinct Neon projects), not
+// O(previews). ListBranches returns every branch in a project in one call —
+// exactly what Down already does per project — and the registry names two
+// distinct projects today, so a full orphan check is two extra HTTP calls per
+// sweep however many previews exist.
+//
+// Every skip is silent and none is an error, matching PurgeExpired:
+//
+//   - a branch outside the preview-<tag> convention, or named exactly
+//     "preview-" with nothing after it: there is no tag to derive, and a
+//     branch bifrost didn't name is not bifrost's to delete.
+//   - a tag that still has a namespace, Terminating included. A Terminating
+//     namespace still exists, so the preview is still visible to the expiry
+//     sweep and to `ib preview down`; its branch isn't orphaned.
+//   - a Busy tag: an Up or Down holds it, so a missing namespace means a
+//     teardown in flight — Down sitting between its two halves — rather than
+//     one that died.
+//   - a branch younger than minOrphanAge.
+//
+// A project whose ListBranches fails is recorded and skipped, and the
+// remaining projects are still swept, the same way Down accumulates its own
+// Neon failures. A ListNamespaces failure, by contrast, aborts the whole pass:
+// an empty live set alongside a full branch list is indistinguishable from
+// "every preview is an orphan", and this function deletes databases.
+func (o *Orchestrator) PurgeOrphanedBranches(ctx context.Context, now time.Time) ([]string, error) {
+	live, err := o.livePreviewTags(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("preview: PurgeOrphanedBranches: %w", err)
+	}
+
+	var (
+		deleted []string
+		errs    []error
+	)
+	for _, project := range o.neonProjects() {
+		branches, err := o.Neon.ListBranches(ctx, project)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("orphan sweep %s: list branches: %w", project, err))
+			continue
+		}
+		for _, b := range branches {
+			tag, named := strings.CutPrefix(b.Name, previewNSPrefix)
+			if !named || tag == "" {
+				continue
+			}
+			// The orphan test, and with it the entire safety argument for
+			// this function.
+			//
+			// INVARIANT THIS DEPENDS ON: Up (orchestrator.go) calls
+			// o.Kube.EnsureNamespace BEFORE o.branchNeonDatabases.
+			// A preview therefore has its namespace before it has its branch,
+			// and no window exists in which the branch exists and the
+			// namespace does not — which is what makes "branch with no
+			// namespace" mean "orphan" rather than "create in progress". IF
+			// THAT ORDER IS EVER REVERSED, this line begins deleting the
+			// databases of previews that are still being created, and the
+			// minOrphanAge floor below is the only thing standing between that
+			// reordering and immediate data loss. Move the Neon step earlier in
+			// Up and this sweep must be re-derived, not merely re-tested.
+			//
+			// Busy covers the only transient that does produce a branch with no
+			// namespace: Down itself, caught between its two halves.
+			if live[tag] || o.Busy(tag) {
+				continue
+			}
+			age := now.Sub(b.CreatedAt)
+			if age < minOrphanAge {
+				continue
+			}
+			if err := o.Neon.DeleteBranch(ctx, project, b.ID); err != nil {
+				errs = append(errs, fmt.Errorf("orphan sweep %s: delete branch %s: %w", project, b.Name, err))
+				continue
+			}
+			// Logged individually, at info, and never conditionally: this
+			// deletes a database branch, and the log line is the only record
+			// that it happened. Project, branch and age are what an operator
+			// needs to reconcile it against Neon's own console afterwards.
+			slog.Info("preview: deleted orphaned neon branch",
+				"project", project,
+				"branch", b.Name,
+				"age", age.Round(time.Second).String(),
+			)
+			deleted = append(deleted, project+"/"+b.Name)
+		}
+	}
+	return deleted, errors.Join(errs...)
+}
+
+// livePreviewTags is the set of tags that still have a preview namespace.
+//
+// Terminating namespaces are deliberately included: a namespace mid-delete
+// still exists, so its branch belongs to the Down that is tearing it down (or
+// to a later expiry sweep), not to the orphan sweep. Off-convention names are
+// dropped for the same reason PurgeExpired refuses to act on them — there is
+// no tag to derive — which is safe in this direction too, since a namespace
+// that yields no tag can't be shadowing a branch that does.
+func (o *Orchestrator) livePreviewTags(ctx context.Context) (map[string]bool, error) {
+	namespaces, err := o.Kube.ListNamespaces(ctx, previewLabelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("list namespaces: %w", err)
+	}
+	live := make(map[string]bool, len(namespaces))
+	for _, ns := range namespaces {
+		if tag, named := strings.CutPrefix(ns.Name, previewNSPrefix); named && tag != "" {
+			live[tag] = true
+		}
+	}
+	return live, nil
+}
+
+// neonProjects is the distinct Neon project IDs the registry references, in
+// service-name order (Names is sorted, so the result is deterministic for logs
+// and tests).
+//
+// Deduplicated by project ID: nothing stops two services from sharing one Neon
+// project — a project holds many databases, and a registry entry names a
+// database and role within one — and listing the same project twice would
+// double the sweep's API calls and reach a second verdict on branches already
+// judged. Down can be indifferent to this (it matches one exact branch name
+// per service and a second pass simply finds nothing), but a sweep that
+// deletes on an inferred condition should not evaluate anything twice.
+func (o *Orchestrator) neonProjects() []string {
+	seen := make(map[string]bool)
+	var projects []string
+	for _, svc := range o.Registry.Names() {
+		ref := o.Registry[svc].Neon
+		if ref == nil || seen[ref.Project] {
+			continue
+		}
+		seen[ref.Project] = true
+		projects = append(projects, ref.Project)
+	}
+	return projects
+}
+
 // RunReaper sweeps expired previews every `every` until ctx is done. every
 // must be positive (it feeds a time.Ticker).
 //
@@ -237,7 +406,8 @@ func parseExpiry(ns kube.NamespaceInfo) (time.Time, bool) {
 // the real post-SIGTERM window is usually well under a second. It is not
 // absolute: nothing waits on this goroutine, so a process that exits fast
 // enough can still cut a sweep short. It removes the guaranteed truncation,
-// not the possibility of one.
+// not the possibility of one — which is why PurgeOrphanedBranches exists to
+// reclaim what a truncated teardown leaves behind.
 func (o *Orchestrator) RunReaper(ctx context.Context, every time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -248,28 +418,51 @@ func (o *Orchestrator) RunReaper(ctx context.Context, every time.Duration) {
 			slog.Info("preview: expiry sweep stopped")
 			return
 		case <-ticker.C:
-			reclaimed, err := o.sweep(ctx)
+			reclaimed, orphans, err := o.sweep(ctx)
 			if err != nil {
 				// Logged, not fatal: the next sweep retries, and whatever
 				// else this one reclaimed still counts.
 				slog.Error("preview: expiry sweep had failures", "err", err)
 			}
-			if len(reclaimed) == 0 {
+			if len(reclaimed) > 0 {
+				slog.Info("preview: expiry sweep complete", "reclaimed", strings.Join(reclaimed, ","))
+			}
+			if len(orphans) > 0 {
+				slog.Info("preview: orphan sweep reclaimed neon branches", "branches", strings.Join(orphans, ","))
+			}
+			if len(reclaimed) == 0 && len(orphans) == 0 {
 				// The overwhelmingly common outcome — hourly forever, and
 				// worth nothing at info level.
-				slog.Debug("preview: expiry sweep reclaimed nothing")
-				continue
+				slog.Debug("preview: sweep reclaimed nothing")
 			}
-			slog.Info("preview: expiry sweep complete", "reclaimed", strings.Join(reclaimed, ","))
 		}
 	}
 }
 
-// sweep runs one PurgeExpired on a context detached from ctx's cancellation
-// and bounded by sweepBudget. See RunReaper for why a teardown must not be
-// cancellable halfway through.
-func (o *Orchestrator) sweep(ctx context.Context) ([]string, error) {
+// sweep runs one full pass — PurgeExpired, then PurgeOrphanedBranches — on a
+// single context detached from ctx's cancellation and bounded by sweepBudget.
+// See RunReaper for why a teardown must not be cancellable halfway through.
+//
+// Both passes always run: they answer different questions (a live preview past
+// its expiry vs. a branch whose preview is already gone), and one failing says
+// nothing about the other, so their errors are joined rather than sequenced.
+//
+// The orphan pass runs SECOND, deliberately. It reads the cluster through its
+// own ListNamespaces, so going last means it sees the state PurgeExpired has
+// just left behind: a teardown in this very sweep whose Neon half failed after
+// its namespace delete succeeded is reclaimed on this same tick rather than an
+// hour later. Running it first would find that same branch still shadowed by a
+// namespace, and skip it.
+//
+// One now for both passes, taken once: the sweep is a single decision about a
+// single instant, exactly as each pass's own now parameter is. It also errs
+// safely for the orphan pass, which runs later than that instant — every
+// branch is judged marginally younger than it really is, never older.
+func (o *Orchestrator) sweep(ctx context.Context) (reclaimed, orphans []string, err error) {
 	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sweepBudget)
 	defer cancel()
-	return o.PurgeExpired(sweepCtx, time.Now().UTC())
+	now := time.Now().UTC()
+	reclaimed, expiredErr := o.PurgeExpired(sweepCtx, now)
+	orphans, orphanErr := o.PurgeOrphanedBranches(sweepCtx, now)
+	return reclaimed, orphans, errors.Join(expiredErr, orphanErr)
 }

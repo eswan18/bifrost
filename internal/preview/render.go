@@ -570,7 +570,14 @@ func previewIngress(in RenderInput) map[string]any {
 	}
 }
 
-func previewNamespace(tag string) string            { return previewNSPrefix + tag }
+func previewNamespace(tag string) string { return previewNSPrefix + tag }
+
+// previewBranchName is the Neon branch backing tag's preview. Deliberately the
+// same preview-<tag> shape as the namespace, and deliberately built from the
+// same constant: PurgeOrphanedBranches pairs branches with namespaces by
+// trimming previewNSPrefix off both, so a branch name composed from a
+// different literal would silently stop matching.
+func previewBranchName(tag string) string           { return previewNSPrefix + tag }
 func previewEnvConfigMapName(service string) string { return service + "-preview-env" }
 func previewHost(service, tag string) string {
 	return fmt.Sprintf("%s-%s.%s", service, tag, previewDomain)
