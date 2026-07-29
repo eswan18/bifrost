@@ -52,9 +52,9 @@ types:
 - **`preview`** (optional, entirely separate concern) — present only if the
   service should be part of `ib preview up`. See
   [`docs/preview-environments.md`](preview-environments.md) for its
-  `neon`/`env`/`required` fields and the env-template resolution cascade; a
-  service with no `preview:` block simply isn't a preview candidate, and
-  everything above still works without it.
+  `neon`/`env`/`required`/`migrate` fields and the env-template resolution
+  cascade; a service with no `preview:` block simply isn't a preview
+  candidate, and everything above still works without it.
 
 That's it on bifrost's side. Once a new image carrying this entry is
 running — staging automatically, prod after `ib promote bifrost` — the
@@ -120,6 +120,18 @@ per step 1 above, then follow "Onboarding a new previewable app" in
 for the two additional preview-only pieces (a `cloudbuild-preview.yaml` and
 a `<name>-preview-build` trigger). That's strictly additive to everything
 above — a service is a normal fleet member first, previewable second.
+
+**If the service has a database, decide about `migrate:` deliberately.** A
+preview gets its own Neon branch, so it starts on whatever schema that branch
+was cut from — a branch carrying new migrations needs them applied before the
+app starts. `migrate:` supplies the command to run as an initContainer, right
+after the database is branched. Whether you need it depends on what the app
+does at startup: footstrike-api *verifies* migrations and refuses to boot on a
+mismatch (a deliberate prod safety property), so without `migrate:` every
+preview of a branch with a new migration crash-loops. An app that runs its own
+migrations at startup doesn't need the key. An app that neither runs nor
+verifies them will start happily against the wrong schema, which is worse than
+crash-looping — set `migrate:` for that case too.
 
 ## Gotcha: `ib.py`'s own service list
 
