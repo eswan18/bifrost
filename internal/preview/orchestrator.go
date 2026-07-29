@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -151,39 +152,76 @@ func (o *Orchestrator) Up(ctx context.Context, branch string) error {
 			"bifrost/branch": branch,
 			"bifrost/apps":   strings.Join(members, ","),
 			"bifrost/phase":  "creating",
+			// Cleared, not merely left alone: EnsureNamespace MERGES
+			// annotations onto whatever the namespace already carries, and
+			// re-running Up over a previously failed preview is the
+			// documented recovery path. Without these three, that retry
+			// would display the PREVIOUS run's error and last step for its
+			// entire duration ("creating · building X — build ended with
+			// status FAILURE") in both the UI and `ib preview up`. This
+			// write is Up's entry point, so it clears exactly what the ready
+			// write below clears on exit; fail() rewrites bifrost/error (and
+			// leaves this run's own step in place) if the retry fails too,
+			// so nothing diagnostic is lost.
+			"bifrost/error":      "",
+			"bifrost/step":       "",
+			"bifrost/step-since": "",
 		},
 	); err != nil {
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
 	}
 
-	shortSHAs, err := o.buildMembers(ctx, branch, members)
+	shortSHAs, err := o.buildMembers(ctx, ns, branch, members)
 	if err != nil {
 		return o.fail(ctx, ns, err)
 	}
+	o.step(ctx, ns, "branching databases")
 	dbURIs, err := o.branchNeonDatabases(ctx, tag, members)
 	if err != nil {
 		return o.fail(ctx, ns, err)
 	}
+	o.step(ctx, ns, "copying secrets")
 	if err := o.copySecrets(ctx, ns, members, dbURIs); err != nil {
 		return o.fail(ctx, ns, err)
 	}
+	o.step(ctx, ns, "applying manifests")
 	if err := o.renderAndApply(ctx, ns, tag, branch, members, shortSHAs); err != nil {
 		return o.fail(ctx, ns, err)
 	}
 
+	// Reaching ready clears bifrost/step (and its timestamp) in the same
+	// write as the phase flip: a finished preview shouldn't go on
+	// displaying whatever step last ran. A failed preview (the fail() path
+	// above) deliberately never does this — its last step is the
+	// diagnostic ("failed while building footstrike-api").
 	if err := o.Kube.AnnotateNamespace(ctx, ns, map[string]string{
-		"bifrost/phase": "ready",
-		"bifrost/error": "",
+		"bifrost/phase":      "ready",
+		"bifrost/error":      "",
+		"bifrost/step":       "",
+		"bifrost/step-since": "",
 	}); err != nil {
 		return fmt.Errorf("preview: Up: mark ready: %w", err)
 	}
 	return nil
 }
 
-// failAnnotateTimeout bounds fail's detached compensating write — long
-// enough for a real AnnotateNamespace call, short enough not to hang a
-// failure path indefinitely if the API server is unreachable.
-const failAnnotateTimeout = 10 * time.Second
+// failAnnotateTimeout and stepAnnotateTimeout bound fail's and step's
+// detached writes. They differ because the two writes have opposite
+// priorities, not because one of them was tuned carelessly:
+//
+//   - fail's write MUST land — it's the only record that a preview failed and
+//     why — so it gets the generous bound, long enough to ride out a slow API
+//     server. Nothing is waiting on it: Up is already returning an error.
+//   - step's write is cosmetic and its error is swallowed, but it sits
+//     *inline* on the happy path, between the stages of the very flow this
+//     feature exists to make feel faster. A slow API server here adds latency
+//     to preview creation itself, so it gets the tight bound: better to lose
+//     one step annotation than to spend ten seconds per stage boundary
+//     narrating.
+const (
+	failAnnotateTimeout = 10 * time.Second
+	stepAnnotateTimeout = 3 * time.Second
+)
 
 // fail marks ns bifrost/phase=failed with a sanitized bifrost/error
 // annotation (cause's message only — never a secret value; callers are
@@ -212,6 +250,34 @@ func (o *Orchestrator) fail(ctx context.Context, ns string, cause error) error {
 	return cause
 }
 
+// step records what Up is doing right now, for operators watching `ib
+// preview up` go quiet for minutes at a time while a build or a Neon branch
+// creation runs. It writes bifrost/step (operator-facing prose — never a
+// Neon URI, token, or any other secret; this lands in a namespace
+// annotation any cluster reader can see) plus bifrost/step-since (an
+// RFC3339 timestamp, not a duration, so a caller re-reading the namespace
+// minutes later can still compute accurate elapsed time locally — this is
+// also why callers write it once per step rather than once per poll tick:
+// a two-minute build costs one annotation write, not twelve).
+//
+// Best-effort: like fail's compensating write, this runs on a context
+// detached from ctx's cancellation (context.WithoutCancel) with its own
+// short timeout (stepAnnotateTimeout — deliberately tighter than fail's, see
+// there), since ctx dying is exactly when a long-running stage's step text is
+// most useful to have already landed. Unlike fail, an annotation failure here
+// is logged and swallowed, never returned or otherwise surfaced to the
+// caller — narrating progress must never itself become a reason Up fails.
+func (o *Orchestrator) step(ctx context.Context, ns, text string) {
+	annotateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepAnnotateTimeout)
+	defer cancel()
+	if err := o.Kube.AnnotateNamespace(annotateCtx, ns, map[string]string{
+		"bifrost/step":       text,
+		"bifrost/step-since": time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		slog.Warn("preview: step annotation failed", "ns", ns, "step", text, "err", err)
+	}
+}
+
 // resolveMembers determines which of the registry's previewable services
 // have branch pushed to their repo: ErrNoBranch means "not a member", any
 // other error aborts the whole run (we can't tell membership, so we can't
@@ -233,10 +299,13 @@ func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]str
 }
 
 // buildMembers runs (and awaits) each member's preview build trigger,
-// returning the resulting short SHA per service.
-func (o *Orchestrator) buildMembers(ctx context.Context, branch string, members []string) (map[string]string, error) {
+// returning the resulting short SHA per service. ns is only for step()'s
+// progress narration — every other kube write for a preview happens
+// elsewhere in Up.
+func (o *Orchestrator) buildMembers(ctx context.Context, ns, branch string, members []string) (map[string]string, error) {
 	shortSHAs := make(map[string]string, len(members))
-	for _, svc := range members {
+	for i, svc := range members {
+		o.step(ctx, ns, fmt.Sprintf("building %s (%d/%d)", svc, i+1, len(members)))
 		triggerID := o.TriggerIDs[svc+"-preview-build"]
 		if triggerID == "" {
 			return nil, fmt.Errorf("no preview build trigger configured for %s", svc)

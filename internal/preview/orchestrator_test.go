@@ -200,11 +200,28 @@ type fakeKube struct {
 	// creating -> failed), since the final state alone only shows the last one.
 	annotationHistory []map[string]string
 
-	ensureErr     error
-	annotateErr   error
-	applyErr      error
-	copySecretErr error
-	deleteErr     error
+	ensureErr   error
+	annotateErr error
+	// annotateStepErr, if set, fails only a "pure" step() write — a call
+	// whose annotations carry bifrost/step but not bifrost/phase (see
+	// isStepOnlyAnnotation) — leaving fail()'s and the final ready call's
+	// writes (which always carry bifrost/phase too) governed by annotateErr
+	// instead. This is what lets a test isolate "step annotations fail" from
+	// "every AnnotateNamespace call fails."
+	annotateStepErr error
+	applyErr        error
+	copySecretErr   error
+	deleteErr       error
+}
+
+// isStepOnlyAnnotation reports whether annotations is exactly what
+// Orchestrator.step writes (bifrost/step + bifrost/step-since, nothing
+// else) as opposed to fail()'s or Up's final ready write, both of which
+// always include bifrost/phase alongside.
+func isStepOnlyAnnotation(annotations map[string]string) bool {
+	_, hasStep := annotations["bifrost/step"]
+	_, hasPhase := annotations["bifrost/phase"]
+	return hasStep && !hasPhase
 }
 
 func newFakeKube() *fakeKube {
@@ -241,6 +258,9 @@ func (f *fakeKube) AnnotateNamespace(ctx context.Context, name string, annotatio
 	// same way, and fail()'s compensating write must survive that.
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if f.annotateStepErr != nil && isStepOnlyAnnotation(annotations) {
+		return f.annotateStepErr
 	}
 	if f.annotateErr != nil {
 		return f.annotateErr
@@ -968,5 +988,199 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	if d.orch.Busy("some-other-tag") {
 		t.Error("Busy(unrelated tag) = true, want false")
+	}
+}
+
+// ---- step progress reporting -------------------------------------------------
+
+// TestUpReportsStepsInOrder pins the sequence and wording of every
+// bifrost/step write across a full two-member happy-path Up: each build
+// (with its position), Neon branching, secret copying, and manifest
+// application — in that order, and nothing else in between. Extracted from
+// annotationHistory (not just the final state) since every earlier step's
+// annotation is overwritten by the next.
+//
+// Membership resolution is deliberately NOT narrated: it finishes before the
+// namespace exists (so there's nowhere to write it), and a step written after
+// its own work is done, then overwritten by the first build step
+// milliseconds later, is unobservable by any poller.
+func TestUpReportsStepsInOrder(t *testing.T) {
+	d := newTwoMemberDeps(t)
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	var steps []string
+	for _, snap := range d.kube.annotationHistory {
+		step, ok := snap["bifrost/step"]
+		if !ok {
+			continue
+		}
+		if len(steps) == 0 || steps[len(steps)-1] != step {
+			steps = append(steps, step)
+		}
+	}
+	want := []string{
+		"", // cleared on entry, by EnsureNamespace's own write
+		"building footstrike-api (1/2)",
+		"building footstrike-dashboard (2/2)",
+		"branching databases",
+		"copying secrets",
+		"applying manifests",
+		"", // cleared on ready
+	}
+	if len(steps) != len(want) {
+		t.Fatalf("distinct step sequence = %#v, want %#v", steps, want)
+	}
+	for i, w := range want {
+		if steps[i] != w {
+			t.Errorf("step[%d] = %q, want %q", i, steps[i], w)
+		}
+	}
+}
+
+// TestUpStepSinceIsAnRFC3339Timestamp checks that every bifrost/step-since
+// write is a real RFC3339 timestamp (the CLI parses it to compute elapsed
+// time locally, per the plan) rather than, say, a duration string.
+func TestUpStepSinceIsAnRFC3339Timestamp(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	// Ready clears step-since; the final annotate call happens after every
+	// step write, so re-derive what was set for the last real step from
+	// history instead of the cleared final state.
+	var lastSince string
+	for _, snap := range d.kube.annotationHistory {
+		if since, ok := snap["bifrost/step-since"]; ok && since != "" {
+			lastSince = since
+		}
+	}
+	if lastSince == "" {
+		t.Fatal("no non-empty bifrost/step-since was ever written")
+	}
+	if _, err := time.Parse(time.RFC3339, lastSince); err != nil {
+		t.Errorf("bifrost/step-since = %q, not RFC3339: %v", lastSince, err)
+	}
+	if ns.annotations["bifrost/step-since"] != "" {
+		t.Errorf("bifrost/step-since after ready = %q, want cleared", ns.annotations["bifrost/step-since"])
+	}
+}
+
+// TestUpReadyClearsStep is the direct assertion behind "reaching ready
+// clears the step": after a successful Up, the final namespace state must
+// carry no step text, so a finished preview doesn't display a stale one.
+func TestUpReadyClearsStep(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	if ns.annotations["bifrost/step"] != "" {
+		t.Errorf("bifrost/step after ready = %q, want cleared", ns.annotations["bifrost/step"])
+	}
+}
+
+// TestUpFailedPreviewRetainsLastStep is the direct assertion behind "a
+// failed preview keeps its last step — that's the diagnostic": fail() must
+// not clear (or overwrite) whatever step was last recorded, so an operator
+// sees e.g. "failed while building footstrike-api" rather than a blank.
+func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	if err == nil {
+		t.Fatal("expected an error when a build fails, got nil")
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	if ns.annotations["bifrost/phase"] != "failed" {
+		t.Fatalf("bifrost/phase = %q, want failed", ns.annotations["bifrost/phase"])
+	}
+	if ns.annotations["bifrost/step"] != "building footstrike-api (1/2)" {
+		t.Errorf("bifrost/step on a failed preview = %q, want the last step retained", ns.annotations["bifrost/step"])
+	}
+	if ns.annotations["bifrost/step-since"] == "" {
+		t.Error("bifrost/step-since on a failed preview is empty, want the last step's timestamp retained")
+	}
+}
+
+// TestUpRetryDoesNotInheritPreviousRunsStepOrError covers the recovery path
+// the docs point operators at: fail a preview, then re-run `ib preview up`.
+// EnsureNamespace MERGES annotations, so unless Up's entry write clears them
+// explicitly, the previous run's bifrost/error and bifrost/step survive into
+// the retry — and since the retry's own builds take minutes, the UI and the
+// CLI would both show the OLD failure ("creating · building X — build ended
+// with status FAILURE") for that entire window, which reads as if the new run
+// had already failed.
+//
+// The assertion targets the retry's very first annotation snapshot (the
+// EnsureNamespace write itself), because that's the write responsible: later
+// snapshots legitimately carry this run's own fresh step text, which for an
+// identical failure would be indistinguishable from the stale one.
+func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err == nil {
+		t.Fatal("expected the first Up to fail (its build fails), got nil")
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	staleStep, staleErr := ns.annotations["bifrost/step"], ns.annotations["bifrost/error"]
+	if staleStep == "" || staleErr == "" {
+		t.Fatalf("precondition: a failed preview should retain a step (%q) and an error (%q)", staleStep, staleErr)
+	}
+	firstRunWrites := len(d.kube.annotationHistory)
+
+	// Retry: same branch, builds now succeed (an unconfigured build in
+	// fakeGCB succeeds immediately).
+	d.gcb.statuses = nil
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("retry Up failed: %v", err)
+	}
+	if len(d.kube.annotationHistory) <= firstRunWrites {
+		t.Fatalf("retry recorded no annotation writes (history stayed at %d)", firstRunWrites)
+	}
+
+	entry := d.kube.annotationHistory[firstRunWrites]
+	if entry["bifrost/phase"] != "creating" {
+		t.Fatalf("retry's first annotation write has phase %q, want creating — this test is looking at the wrong snapshot", entry["bifrost/phase"])
+	}
+	if got := entry["bifrost/error"]; got != "" {
+		t.Errorf("bifrost/error at the start of the retry = %q, want cleared (it's the previous run's failure)", got)
+	}
+	if got := entry["bifrost/step"]; got != "" {
+		t.Errorf("bifrost/step at the start of the retry = %q, want cleared (it's the previous run's last step)", got)
+	}
+	if got := entry["bifrost/step-since"]; got != "" {
+		t.Errorf("bifrost/step-since at the start of the retry = %q, want cleared (it would date the previous run's step)", got)
+	}
+}
+
+// TestUpStepAnnotationFailureDoesNotFailTheRun is the constraint from the
+// task brief made explicit: step() is best-effort. fakeKube.annotateStepErr
+// fails every pure step() write (a call carrying only bifrost/step and
+// bifrost/step-since — see isStepOnlyAnnotation) while leaving the final
+// ready write (which also carries bifrost/phase) untouched, so this proves
+// specifically that step-annotation failures mid-run are swallowed rather
+// than propagated: Up must still reach ready.
+func TestUpStepAnnotationFailureDoesNotFailTheRun(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	kc := d.kube
+	kc.annotateStepErr = errors.New("annotate: connection reset")
+
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	if err != nil {
+		t.Fatalf("Up failed despite step-annotation errors being best-effort: %v", err)
+	}
+	ns := d.kube.namespaces["preview-hae-cadence"]
+	if ns.annotations["bifrost/phase"] != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready even though every step annotation failed", ns.annotations["bifrost/phase"])
+	}
+	// Every step() write failed, so none of them should have landed at all.
+	if ns.annotations["bifrost/step"] != "" {
+		t.Errorf("bifrost/step = %q, want empty — every step write failed and only the final ready write (unaffected by annotateStepErr) should have landed", ns.annotations["bifrost/step"])
 	}
 }

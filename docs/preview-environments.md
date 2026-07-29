@@ -28,10 +28,20 @@ token (Secret Manager secret `bifrost_prod_preview_api_token`) against:
 
 ```
 GET    /api/previews          # list
-GET    /api/previews/{tag}    # one preview's record (phase, health, urls) — ib.py polls this from `up`
+GET    /api/previews/{tag}    # one preview's record — ib.py polls this from `up`
 POST   /api/previews          # {"branch": "..."} -> create/update, returns {tag, phase}
 DELETE /api/previews/{tag}    # tear down
 ```
+
+A record carries `tag`, `branch`, `apps`, `phase`, `health`, `createdAt`,
+`urls`, plus the progress trio: `step` (what `Up` is doing right now, e.g.
+`building footstrike-api (1/2)`), `stepSince` (RFC3339 — a timestamp, not a
+duration, so a poller computes elapsed time locally instead of watching it go
+stale between polls), and `error` (the failure cause, same string as the
+`bifrost/error` annotation). Those three are omitted from the JSON when empty,
+so a consumer must treat a missing key as "". `step` without `stepSince` is a
+legal combination: a `bifrost/step-since` annotation that's absent or doesn't
+parse as RFC3339 is dropped rather than failing the read.
 
 A tag mid-`Up`/`Down` is claimed by an in-memory busy set; a concurrent call
 for the same tag gets `409` (`ib.py`: "That preview is busy").
@@ -55,38 +65,70 @@ ingress class staging uses.
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
 3. **Ensure the namespace**: `preview-<tag>`, annotated
    `bifrost/branch`, `bifrost/apps` (comma-joined members), and
-   `bifrost/phase: creating`.
+   `bifrost/phase: creating` — and, in the same write, `bifrost/error`,
+   `bifrost/step` and `bifrost/step-since` explicitly cleared to `""`. That
+   clearing matters because this write *merges* onto whatever the namespace
+   already has: re-running `up` over a previously failed preview (the recovery
+   path below) would otherwise show the old run's error and last step for the
+   whole retry.
 4. **Build**: run each member's `{service}-preview-build` Cloud Build trigger and
    wait for it (`buildPollInterval`, 10s), collecting the resulting short SHA.
    Every member's build runs, every time — there is no check for "this SHA
-   already has a preview image."
-5. **Neon branch**: for every member with a registry `neon:` reference,
+   already has a preview image." Step: `building {service} (i/n)`, rewritten
+   per member.
+5. **Neon branch** (step: `branching databases`): for every member with a
+   registry `neon:` reference,
    find-or-create a `preview-<tag>` branch off that project's default branch
    (empty parent ID) and fetch its connection URI for the registry's
    `database`/`role`. A service with no `neon:` entry (e.g.
    `footstrike-dashboard`) is skipped.
-6. **Copy secrets**: each Neon-backed member's `{svc}-staging-secrets` Secret
+6. **Copy secrets** (step: `copying secrets`): each Neon-backed member's
+   `{svc}-staging-secrets` Secret
    Store CSI secret is copied into the preview namespace with `DATABASE_URL`
    overridden to the new branch's URI, plus the shared wildcard TLS
    secret (`preview-footstrike-run-tls`, provisioned once in the `previews`
    namespace — copied rather than reissued per preview, since Let's
    Encrypt's duplicate-certificate limit is 5/week for an identical
    `dnsNames` set).
-7. **Render and apply**: for each member, fetch its `k8s/` tree, parse its
+7. **Render and apply** (step: `applying manifests`): for each member, fetch
+   its `k8s/` tree, parse its
    `staging/configmap-env.yaml` (empty map if it has none), compute the final
    env via the registry's templates (see "The registry" below), build a
    generated kustomize overlay atop the fetched `k8s/base`, and
    server-side-apply the result into the preview namespace.
-8. **Mark ready**: `bifrost/phase: ready`, `bifrost/error: ""`.
+8. **Mark ready**: `bifrost/phase: ready`, `bifrost/error: ""`,
+   `bifrost/step: ""`, `bifrost/step-since: ""` — one write, so a finished
+   preview never goes on displaying the last step it ran.
 
 Any failure after step 3 sets `bifrost/phase: failed` with a sanitized
-`bifrost/error` annotation (never a secret value) naming the cause. A failure
-in steps 1–2 returns before the namespace exists, so it never leaves a zombie
-namespace.
+`bifrost/error` annotation (never a secret value) naming the cause, and
+**deliberately leaves `bifrost/step`/`bifrost/step-since` in place** — the last
+step is half the diagnostic (which stage it died in, and when), so it's kept
+alongside the error rather than cleared; see Gotchas for how that reads. A
+failure in steps 1–2 returns before the namespace exists, so it never leaves a
+zombie namespace.
 
 `Up` is safe to re-run: `EnsureNamespace`/`CopySecret`/apply are idempotent,
 and Neon branch creation is scan-then-create. This is also the recovery path
 for a stuck `creating` (see "Gotchas").
+
+### Progress annotations
+
+Steps 4–7 each announce themselves first, by writing `bifrost/step` (operator-
+facing prose — never a secret; it lands in an annotation any cluster reader can
+see) and `bifrost/step-since` (RFC3339). One write per stage, not per poll
+tick: a two-minute build costs one annotation, and elapsed time is computed
+from `step-since` by whoever reads it. Step writes are best-effort — a failed
+annotation is logged and swallowed, never a reason `Up` fails — and bounded by
+a tighter timeout than the failure annotation, since they sit inline on the
+creation path (`stepAnnotateTimeout` vs `failAnnotateTimeout` in
+`orchestrator.go`).
+
+Membership resolution (step 1) is not narrated: it finishes before the
+namespace exists, so there's nothing to annotate yet.
+
+Both the API (`step`/`stepSince`/`error`) and the Previews tab surface these;
+the tab polls on its fast cadence whenever any preview is `creating`.
 
 ## Lifecycle (`Down`)
 
@@ -216,3 +258,11 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   idempotent — but it **always re-runs every member's preview build** (no
   skip-if-image-exists check), so recovery costs a full rebuild of every app
   in the preview, not just the one that was mid-flight.
+- **A `failed` preview keeps showing its last step, on purpose.** `bifrost/step`
+  is cleared on `ready` but retained on `failed`, so the row reads "failed ·
+  building footstrike-api (1/2) — build ended with status FAILURE" for as long
+  as that namespace exists. It describes the run that failed, not something in
+  flight. Re-running `up` clears both at the start of the retry (step 3), and a
+  preview whose namespace is `Terminating` reports neither — the annotations
+  are still on the namespace, but the API record and the UI row suppress them,
+  so a teardown never reads as a build in progress.
