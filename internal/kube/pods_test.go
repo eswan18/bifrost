@@ -149,7 +149,12 @@ func TestListPodsInitContainers(t *testing.T) {
 		&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "preview-x", Name: "api-7d9f-nx2kp"},
 			Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{Name: "migrate", Image: "reg/api:preview-abc"}},
+				// Deliberately a DIFFERENT image from the app container: in a
+				// real preview kustomize retags both to the same tag, but an
+				// identical image makes the Images() assertion below pass
+				// whether or not init containers leak into Containers, since
+				// Images dedupes. A distinct tag is what makes it discriminate.
+				InitContainers: []corev1.Container{{Name: "migrate", Image: "reg/api:migrate"}},
 				Containers:     []corev1.Container{{Name: "api", Image: "reg/api:preview-abc"}},
 			},
 			Status: corev1.PodStatus{

@@ -527,8 +527,9 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 }
 
 // appliedAppImage returns the image of svc's app container in the objects
-// just applied for it — the Deployment named svc, container named svc, the
-// convention render.go's detectBase refuses to render without. "" when it
+// just applied for it — the Deployment named svc (enforced by the generated
+// deployment patch's target) holding the container named svc (enforced by
+// render.go's detectBase). "" when it
 // can't be found, which callers must treat as "don't filter on image"
 // rather than "match nothing".
 func appliedAppImage(objs []*unstructured.Unstructured, svc string) string {
@@ -675,8 +676,11 @@ func membersNotReady(pods []kube.PodInfo, members []string, appImages map[string
 //
 // The join is via the pod's controlling ReplicaSet, whose name is always
 // "<deployment>-<pod-template-hash>" and whose Deployment is named after the
-// service (render.go's detectBase enforces that convention, failing the
-// render outright if a base departs from it). Going through the ReplicaSet
+// service. That naming isn't merely conventional: the generated overlay's
+// deployment patch targets metadata.name: <svc>, so kustomize fails the
+// render outright if the base has no Deployment by that name. (detectBase
+// separately pins the container name and image repo, but not this.)
+// Going through the ReplicaSet
 // rather than matching pod names directly also structurally excludes
 // Job-owned pods — a member's CronJob is suspended in a preview, but a
 // leftover job pod named "<svc>-purge-..." would otherwise match a
