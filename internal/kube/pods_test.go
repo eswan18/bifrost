@@ -138,6 +138,71 @@ func TestImagesExcludesJobPods(t *testing.T) {
 	}
 }
 
+// TestListPodsInitContainers: init containers are surfaced separately from
+// app containers, with their names, so a caller can tell *which* init step
+// wedged a pod (the preview orchestrator's "migrate" step). They must stay
+// out of Containers — and therefore out of Images and SummarizeHealth —
+// since an init container is expected to terminate and would otherwise read
+// as a permanently unhealthy container.
+func TestListPodsInitContainers(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "preview-x", Name: "api-7d9f-nx2kp"},
+			Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Name: "migrate", Image: "reg/api:preview-abc"}},
+				Containers:     []corev1.Container{{Name: "api", Image: "reg/api:preview-abc"}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{{
+					Name:         "migrate",
+					RestartCount: 4,
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+						Reason: "CrashLoopBackOff",
+					}},
+					LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1, Reason: "Error",
+					}},
+				}},
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name: "api",
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+						Reason: "PodInitializing",
+					}},
+				}},
+			},
+		},
+	)
+	c := &client{typed: cs}
+	pods, err := c.ListPods(context.Background(), "preview-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 {
+		t.Fatalf("got %d pods, want 1", len(pods))
+	}
+	p := pods[0]
+	if len(p.InitContainers) != 1 {
+		t.Fatalf("InitContainers = %+v, want exactly one", p.InitContainers)
+	}
+	init := p.InitContainers[0]
+	if init.Name != "migrate" {
+		t.Errorf("init container Name = %q, want migrate", init.Name)
+	}
+	if init.WaitingReason != "CrashLoopBackOff" || init.RestartCount != 4 {
+		t.Errorf("init container = %+v, want CrashLoopBackOff with 4 restarts", init)
+	}
+	if init.ExitCode == nil || *init.ExitCode != 1 || init.TerminatedReason != "Error" {
+		t.Errorf("init container exit = %v/%q, want 1/Error from LastTerminationState", init.ExitCode, init.TerminatedReason)
+	}
+	if len(p.Containers) != 1 || p.Containers[0].Name != "api" {
+		t.Errorf("Containers = %+v, want just the app container (init containers stay separate)", p.Containers)
+	}
+	if got := Images(pods); len(got) != 1 || got[0] != "reg/api:preview-abc" {
+		t.Errorf("Images = %v, want only the app container's image", got)
+	}
+}
+
 // TestListPodsExitCodes: a failed job pod's exit code comes from the current
 // terminated state; a crashlooping (currently waiting) pod's exit code comes
 // from its last termination state; a healthy running container has no exit

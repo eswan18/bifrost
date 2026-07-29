@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
@@ -22,6 +23,11 @@ type client struct {
 }
 
 type ContainerInfo struct {
+	// Name is the container's name as declared in the pod spec. It's what
+	// lets a caller tell one container apart from another in the same pod —
+	// e.g. the preview orchestrator naming the "migrate" initContainer
+	// specifically when a branch's migrations are what's wedging a pod.
+	Name string
 	// Image comes from spec.containers, not status.containerStatuses: during
 	// ImagePullBackOff the status-side image can be empty or stale, which
 	// would corrupt promote/mid-deploy detection.
@@ -51,6 +57,16 @@ type PodInfo struct {
 	OwnerName  string
 	Phase      string
 	Containers []ContainerInfo
+	// InitContainers mirrors Containers for spec.initContainers /
+	// status.initContainerStatuses. It's deliberately a separate field
+	// rather than folded into Containers: Images and SummarizeHealth (and
+	// through them promote's mid-deploy detection and every health readout)
+	// must keep seeing only the long-running app containers, since an init
+	// container is expected to terminate and would otherwise read as a
+	// permanently unhealthy container. Callers that care about init
+	// containers — a preview waiting out its "migrate" step — opt in by
+	// reading this field.
+	InitContainers []ContainerInfo
 }
 
 // ListPods returns the pods in a namespace. An empty namespace lists across
@@ -68,30 +84,42 @@ func (c *client) ListPods(ctx context.Context, namespace string) ([]PodInfo, err
 			info.OwnerName = ref.Name
 		}
 		for _, ctr := range p.Spec.Containers {
-			ci := ContainerInfo{Image: ctr.Image}
-			for _, cs := range p.Status.ContainerStatuses {
-				if cs.Name != ctr.Name {
-					continue
-				}
-				ci.Ready = cs.Ready
-				ci.RestartCount = cs.RestartCount
-				if cs.State.Waiting != nil {
-					ci.WaitingReason = cs.State.Waiting.Reason
-				}
-				if t := cs.State.Terminated; t != nil {
-					ci.ExitCode = &t.ExitCode
-					ci.TerminatedReason = t.Reason
-				} else if t := cs.LastTerminationState.Terminated; t != nil {
-					ci.ExitCode = &t.ExitCode
-					ci.TerminatedReason = t.Reason
-				}
-				break
-			}
-			info.Containers = append(info.Containers, ci)
+			info.Containers = append(info.Containers, containerInfo(ctr, p.Status.ContainerStatuses))
+		}
+		for _, ctr := range p.Spec.InitContainers {
+			info.InitContainers = append(info.InitContainers, containerInfo(ctr, p.Status.InitContainerStatuses))
 		}
 		out = append(out, info)
 	}
 	return out, nil
+}
+
+// containerInfo pairs one spec container with its matching status entry (by
+// name — the only join key the two lists share). A container with no status
+// yet (nothing scheduled, or an init container the kubelet hasn't reached)
+// keeps its zero-value status fields: not ready, no waiting reason, no exit
+// code.
+func containerInfo(ctr corev1.Container, statuses []corev1.ContainerStatus) ContainerInfo {
+	ci := ContainerInfo{Name: ctr.Name, Image: ctr.Image}
+	for _, cs := range statuses {
+		if cs.Name != ctr.Name {
+			continue
+		}
+		ci.Ready = cs.Ready
+		ci.RestartCount = cs.RestartCount
+		if cs.State.Waiting != nil {
+			ci.WaitingReason = cs.State.Waiting.Reason
+		}
+		if t := cs.State.Terminated; t != nil {
+			ci.ExitCode = &t.ExitCode
+			ci.TerminatedReason = t.Reason
+		} else if t := cs.LastTerminationState.Terminated; t != nil {
+			ci.ExitCode = &t.ExitCode
+			ci.TerminatedReason = t.Reason
+		}
+		break
+	}
+	return ci
 }
 
 // Images returns the deduped container images across the namespace's

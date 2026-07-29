@@ -96,9 +96,36 @@ ingress class staging uses.
    env via the registry's templates (see "The registry" below), build a
    generated kustomize overlay atop the fetched `k8s/base`, and
    server-side-apply the result into the preview namespace.
-8. **Mark ready**: `bifrost/phase: ready`, `bifrost/error: ""`,
+8. **Wait for pods** (step: `waiting for pods`): poll the namespace's pods (`podPollInterval`, 5s) until
+   every member has at least one Deployment-managed pod and all of them
+   report ready, bounded at `podReadyTimeout` (5 minutes — a cold-node image
+   pull plus a branch's migrations, well inside the API layer's 30-minute
+   per-run budget). A crash-looping container fails the preview immediately
+   rather than waiting out the bound; anything else that hasn't converged
+   (including a member with **no** pods at all) fails at the bound. Either
+   way the `bifrost/error` is sanitized down to the member's name and the
+   pod's own reason — e.g. `footstrike-api not ready: migrate initContainer
+   CrashLoopBackOff`. Pod *reasons* are safe to surface; pod *logs* are not,
+   and are never fetched.
+
+   Only pods running the image this run just applied count. A rolling update
+   keeps the previous generation's pods alive until the new ones are ready,
+   so a re-`Up` sent to *fix* a crash-looping preview still has the broken
+   pod in the namespace the whole time — judging readiness on it would fail
+   every recovery attempt. (A re-run that rebuilds an unchanged commit
+   produces the same image, and those pods are judged: they're running
+   exactly what was applied.)
+9. **Mark ready**: `bifrost/phase: ready`, `bifrost/error: ""`,
    `bifrost/step: ""`, `bifrost/step-since: ""` — one write, so a finished
    preview never goes on displaying the last step it ran.
+
+`ready` therefore means "every member has running, ready pods", not merely
+"the manifests were accepted" — API consumers (`ib preview up`, the Previews
+tab) can treat it as "usable". This matters most for the `migrate`
+initContainer (see the registry's `migrate:` key below): a failed migration
+leaves a pod in `Init:CrashLoopBackOff` with the app container never
+starting, which an apply-then-declare-ready flow would have reported as a
+perfectly healthy preview.
 
 Any failure after step 3 sets `bifrost/phase: failed` with a sanitized
 `bifrost/error` annotation (never a secret value) naming the cause, and
@@ -154,6 +181,7 @@ footstrike-api:
       project: aged-river-81935268
       database: neondb
       role: neondb_owner
+    migrate: ["alembic", "upgrade", "head"]  # omit for apps with no migrations
     env:
       ENV: staging
       PUBLIC_API_BASE_URL: "{{ url self }}"
@@ -162,6 +190,15 @@ footstrike-api:
       JWT_ISSUER: "{{ url identity }}"
     required: [...]                       # keys that must render non-empty
 ```
+
+`migrate:`, when present, is run as a **`migrate` initContainer** before the
+app container starts — same image (including the `preview-<sha>` tag
+override) and same `envFrom`, so it sees `DATABASE_URL` pointing at this
+preview's fresh Neon branch. A preview branches staging's database at
+staging's revision, so a branch carrying a new migration would otherwise come
+up against an out-of-date schema. Omitting `migrate:` renders no
+initContainers at all. Because the whole pod is blocked on it, a failed
+migration is what step 8's readiness wait is most often reporting.
 
 Three template forms (`internal/preview/template.go`'s `Eval`), each either a
 literal (no `{{`/`}}`, passed through unchanged) or exactly one
@@ -266,3 +303,12 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   preview whose namespace is `Terminating` reports neither — the annotations
   are still on the namespace, but the API record and the UI row suppress them,
   so a teardown never reads as a build in progress.
+- **A `failed` phase from the readiness wait means the pods didn't come up**,
+  not that anything bifrost did went wrong — the namespace, secrets, Neon
+  branch and manifests are all in place, so `kubectl -n preview-<tag>
+  describe pod` (and, for a `migrate initContainer` failure, `kubectl logs
+  ... -c migrate`) is where the actual cause lives. bifrost deliberately
+  never fetches pod logs itself: unlike a pod *reason*, a log line can carry
+  anything, including secrets, and `bifrost/error` is served over the API.
+  Fix the branch and re-run `ib preview up`; teardown (`ib preview down`) is
+  unaffected either way.

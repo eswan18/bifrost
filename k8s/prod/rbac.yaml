@@ -4,6 +4,13 @@ kind: ClusterRole
 metadata:
   name: bifrost-prod-pods-reader
 rules:
+  # Cluster-wide pod reads back both the dashboard's health readouts and the
+  # preview orchestrator's readiness wait (Up polls a preview-<tag>
+  # namespace's pods before it will mark the preview ready — see
+  # waitForPods in internal/preview/orchestrator.go). Narrowing this to
+  # specific namespaces would break previews silently: their namespaces are
+  # dynamically named, so a 403 would only show up against the real cluster,
+  # never in tests.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

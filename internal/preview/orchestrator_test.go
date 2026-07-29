@@ -184,6 +184,13 @@ type copySecretCall struct {
 	overrides                      map[string][]byte
 }
 
+// appliedDeployment is one Deployment ApplyObjects saw, reduced to what
+// synthesizing its pods needs.
+type appliedDeployment struct {
+	name  string
+	image string
+}
+
 // fakeKube is an in-package hand-fake implementing the full kube.Client
 // interface; only the five preview-write methods do anything interesting,
 // the rest are unused stubs to satisfy the interface.
@@ -200,8 +207,28 @@ type fakeKube struct {
 	// creating -> failed), since the final state alone only shows the last one.
 	annotationHistory []map[string]string
 
+	// appliedDeployments[ns] is every Deployment ApplyObjects has applied
+	// into ns, with the app-container image it carried. ListPods synthesizes
+	// one running, ready pod per entry unless podScript overrides it —
+	// modelling what a real cluster converges to, so every test that doesn't
+	// care about pod readiness gets the healthy outcome without hand-writing
+	// pod fixtures. Carrying the image matters: Up's readiness wait only
+	// counts pods running the image it just applied.
+	appliedDeployments map[string][]appliedDeployment
+	// podScript, when non-nil, replaces that synthesis: each ListPods call
+	// for a namespace consumes the next entry in its sequence (the last
+	// entry repeats forever once exhausted), so a test can script pods that
+	// start unready and become ready — or never do. A namespace with no
+	// entry lists no pods at all.
+	podScript map[string][][]kube.PodInfo
+	// listPodsCalls counts ListPods calls per namespace: the index into
+	// podScript, and how a test asserts Up actually polled rather than
+	// glancing once.
+	listPodsCalls map[string]int
+
 	ensureErr   error
 	annotateErr error
+	listPodsErr error
 	// annotateStepErr, if set, fails only a "pure" step() write — a call
 	// whose annotations carry bifrost/step but not bifrost/phase (see
 	// isStepOnlyAnnotation) — leaving fail()'s and the final ready call's
@@ -225,7 +252,11 @@ func isStepOnlyAnnotation(annotations map[string]string) bool {
 }
 
 func newFakeKube() *fakeKube {
-	return &fakeKube{namespaces: map[string]*fakeNamespace{}}
+	return &fakeKube{
+		namespaces:         map[string]*fakeNamespace{},
+		appliedDeployments: map[string][]appliedDeployment{},
+		listPodsCalls:      map[string]int{},
+	}
 }
 
 func (f *fakeKube) EnsureNamespace(_ context.Context, name string, labels, annotations map[string]string) error {
@@ -283,6 +314,27 @@ func (f *fakeKube) ApplyObjects(_ context.Context, _ string, objs []*unstructure
 		return f.applyErr
 	}
 	f.applyCalls = append(f.applyCalls, objs)
+	for _, o := range objs {
+		if o.GetKind() != "Deployment" {
+			continue
+		}
+		ns := o.GetNamespace()
+		dep := appliedDeployment{name: o.GetName(), image: appliedAppImage([]*unstructured.Unstructured{o}, o.GetName())}
+		// A re-apply replaces the previous generation outright, exactly as a
+		// converged rolling update does — otherwise a rerun test would list
+		// pods from both generations forever.
+		replaced := false
+		for i, existing := range f.appliedDeployments[ns] {
+			if existing.name == dep.name {
+				f.appliedDeployments[ns][i] = dep
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			f.appliedDeployments[ns] = append(f.appliedDeployments[ns], dep)
+		}
+	}
 	return nil
 }
 
@@ -307,8 +359,82 @@ func (f *fakeKube) DeleteNamespace(_ context.Context, name string) error {
 	return nil
 }
 
+// ListPods serves Up's readiness wait. Default behavior is "the cluster
+// converged": one ready pod per Deployment ApplyObjects has seen. podScript
+// overrides that with a per-namespace sequence, one entry consumed per call.
+func (f *fakeKube) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	call := f.listPodsCalls[ns]
+	f.listPodsCalls[ns]++
+	if f.listPodsErr != nil {
+		return nil, f.listPodsErr
+	}
+	if f.podScript != nil {
+		seq := f.podScript[ns]
+		if len(seq) == 0 {
+			return nil, nil
+		}
+		if call >= len(seq) {
+			call = len(seq) - 1
+		}
+		return seq[call], nil
+	}
+	var out []kube.PodInfo
+	for _, dep := range f.appliedDeployments[ns] {
+		out = append(out, readyPod(dep.name, dep.image))
+	}
+	return out, nil
+}
+
+// apiImage/dashImage are the images a newTwoMemberDeps run really applies:
+// fakeGCB returns "<triggerID>-sha" as each build's short SHA (trig-api,
+// trig-dash), and render tags the preview image preview-<sha>. A scripted
+// pod that doesn't carry these is a *previous* generation's pod as far as
+// Up's readiness wait is concerned.
+var (
+	apiImage  = previewImage("footstrike-api", "trig-api-sha")
+	dashImage = previewImage("footstrike-dashboard", "trig-dash-sha")
+)
+
+// previewImage is the image a preview's rendered Deployment carries, and
+// therefore what its pods run: the fleet's Artifact Registry path, tagged
+// preview-<short sha>. Tests that script pods have to match it, because Up's
+// wait only counts pods running the image it just applied.
+func previewImage(svc, shortSHA string) string {
+	return "us-central1-docker.pkg.dev/ethans-services/containers/" + svc + ":preview-" + shortSHA
+}
+
+// readyPod is one running, fully-ready Deployment pod for deployment,
+// shaped the way a real one is: owned by a ReplicaSet named
+// "<deployment>-<template hash>", with a container named after the service
+// (the convention render.go's detectBase enforces).
+func readyPod(deployment, image string) kube.PodInfo {
+	return kube.PodInfo{
+		Name:       deployment + "-7d9f6b8c4d-nx2kp",
+		OwnerKind:  "ReplicaSet",
+		OwnerName:  deployment + "-7d9f6b8c4d",
+		Phase:      "Running",
+		Containers: []kube.ContainerInfo{{Name: deployment, Image: image, Ready: true}},
+	}
+}
+
+// initializingPod is a pod whose init containers are still running: the app
+// container isn't ready and reports the contentless "PodInitializing", which
+// is exactly what a pod mid-migration looks like. The init containers are
+// given the app's image, as the rendered migrate initContainer really is.
+func initializingPod(deployment, image string, init ...kube.ContainerInfo) kube.PodInfo {
+	p := readyPod(deployment, image)
+	p.Phase = "Pending"
+	p.Containers = []kube.ContainerInfo{{Name: deployment, Image: image, WaitingReason: "PodInitializing"}}
+	for i := range init {
+		init[i].Image = image
+	}
+	p.InitContainers = init
+	return p
+}
+
 // Unused kube.Client methods — plain stubs to satisfy the interface.
-func (f *fakeKube) ListPods(context.Context, string) ([]kube.PodInfo, error) { return nil, nil }
 func (f *fakeKube) ListArgoApps(context.Context) (map[string]kube.AppStatus, error) {
 	return nil, nil
 }
@@ -827,6 +953,440 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	}
 }
 
+// ---- Up: waiting for pods -----------------------------------------------------
+
+// shrinkPodWait shrinks the readiness wait's bound and poll interval for the
+// duration of a test, so a test that exercises the timeout path costs
+// milliseconds instead of five real minutes. The bound stays generously
+// larger than the interval so a test can still distinguish "gave up at the
+// bound" from "failed early".
+func shrinkPodWait(t *testing.T, timeout, interval time.Duration) {
+	t.Helper()
+	oldTimeout, oldInterval := podReadyTimeout, podPollInterval
+	podReadyTimeout, podPollInterval = timeout, interval
+	t.Cleanup(func() { podReadyTimeout, podPollInterval = oldTimeout, oldInterval })
+}
+
+// TestUpWaitsForPodsBeforeMarkingReady is the core of this behavior: the
+// preview only reaches ready after the pods actually report ready, not when
+// ApplyObjects returns. The scripted namespace starts with a pod still
+// running its migrate initContainer and only converges on the third poll —
+// so an Up that declared ready off the apply alone would finish having
+// listed pods at most once.
+func TestUpWaitsForPodsBeforeMarkingReady(t *testing.T) {
+	shrinkPodWait(t, 5*time.Second, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+
+	migrating := []kube.PodInfo{
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate"}),
+		readyPod("footstrike-dashboard", dashImage),
+	}
+	converged := []kube.PodInfo{
+		readyPod("footstrike-api", apiImage),
+		readyPod("footstrike-dashboard", dashImage),
+	}
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {migrating, migrating, converged}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready", got)
+	}
+	if got := d.kube.listPodsCalls[ns]; got != 3 {
+		t.Errorf("ListPods called %d times, want exactly 3 (Up must keep polling until the pods converge)", got)
+	}
+
+	// "waiting for pods" must be narrated before ready, not after: it's the
+	// stage a user watches the CLI sit on.
+	var sawWaiting bool
+	for _, snap := range d.kube.annotationHistory {
+		if snap["bifrost/step"] == "waiting for pods" {
+			sawWaiting = true
+		}
+		if snap["bifrost/phase"] == "ready" && !sawWaiting {
+			t.Error("preview reached ready without ever narrating the pod wait")
+		}
+	}
+	if !sawWaiting {
+		t.Error("no bifrost/step write said \"waiting for pods\"")
+	}
+}
+
+// TestUpFailsWhenMigrateInitContainerCrashLoops is the failure mode Task 1
+// created: a branch whose alembic migration fails leaves the migrate
+// initContainer in CrashLoopBackOff and the app container never starts.
+// The preview must land on failed, naming both the member and the migrate
+// step specifically — "footstrike-api not ready: PodInitializing" would tell
+// an operator nothing about where to look.
+func TestUpFailsWhenMigrateInitContainerCrashLoops(t *testing.T) {
+	// A long bound (relative to the poll interval) that this test must NOT
+	// spend: a crash-looping container is terminal, so the wait has to give
+	// up immediately rather than burn the whole timeout.
+	shrinkPodWait(t, 30*time.Second, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+
+	exitCode := int32(1)
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{
+			Name:             "migrate",
+			WaitingReason:    "CrashLoopBackOff",
+			RestartCount:     3,
+			ExitCode:         &exitCode,
+			TerminatedReason: "Error",
+		}),
+		readyPod("footstrike-dashboard", dashImage),
+	}}}
+
+	start := time.Now()
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Up to fail when the migrate initContainer crash-loops, got nil")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Up took %v to fail, want it to give up as soon as it sees CrashLoopBackOff rather than waiting out the %v bound", elapsed, podReadyTimeout)
+	}
+
+	want := "footstrike-api not ready: migrate initContainer CrashLoopBackOff"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	nsRec := d.kube.namespaces[ns]
+	if got := nsRec.annotations["bifrost/phase"]; got != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed (a readiness failure is a failed preview, not a new phase)", got)
+	}
+	if got := nsRec.annotations["bifrost/error"]; got != want {
+		t.Errorf("bifrost/error = %q, want %q", got, want)
+	}
+	// The retained step is the diagnostic: which stage died.
+	if got := nsRec.annotations["bifrost/step"]; got != "waiting for pods" {
+		t.Errorf("bifrost/step on the failed preview = %q, want the pod wait retained", got)
+	}
+	// Sanitized: the annotation is served over the JSON API, and this
+	// preview's namespace holds a real DATABASE_URL.
+	if strings.Contains(nsRec.annotations["bifrost/error"], "postgres://") ||
+		strings.Contains(nsRec.annotations["bifrost/error"], "fakesecret") {
+		t.Errorf("bifrost/error leaks connection details: %q", nsRec.annotations["bifrost/error"])
+	}
+}
+
+// TestUpTimesOutWhenPodsNeverBecomeReady covers the bound itself: a member
+// stuck starting forever (no terminal reason to short-circuit on) fails the
+// preview once the wait expires, naming the member.
+func TestUpTimesOutWhenPodsNeverBecomeReady(t *testing.T) {
+	shrinkPodWait(t, 50*time.Millisecond, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{
+		// Still pulling its image: not terminal, so the wait keeps trying
+		// until the bound rather than failing on the first sighting.
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", WaitingReason: "ImagePullBackOff"}),
+		readyPod("footstrike-dashboard", dashImage),
+	}}}
+
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	if err == nil {
+		t.Fatal("expected Up to fail when a member's pods never become ready, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %q, want it to say the wait timed out", err.Error())
+	}
+	if !strings.Contains(err.Error(), "footstrike-api") {
+		t.Errorf("error = %q, want it to name the member that never came up", err.Error())
+	}
+	if !strings.Contains(err.Error(), "migrate initContainer ImagePullBackOff") {
+		t.Errorf("error = %q, want the pod's own reason carried through", err.Error())
+	}
+	if strings.Contains(err.Error(), "footstrike-dashboard") {
+		t.Errorf("error = %q, want only the member that isn't ready named", err.Error())
+	}
+	if d.kube.listPodsCalls[ns] < 2 {
+		t.Errorf("ListPods called %d times, want repeated polling across the bound", d.kube.listPodsCalls[ns])
+	}
+	nsRec := d.kube.namespaces[ns]
+	if got := nsRec.annotations["bifrost/phase"]; got != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed", got)
+	}
+	if got := nsRec.annotations["bifrost/error"]; !strings.Contains(got, "timed out") {
+		t.Errorf("bifrost/error = %q, want the timeout recorded", got)
+	}
+}
+
+// TestUpTimesOutWhenAMemberHasNoPods is the "nothing to wait for" care
+// point: a member whose manifests produced no Deployment (so no pods ever
+// appear) must hit the bound with a clear message, not spin forever.
+func TestUpTimesOutWhenAMemberHasNoPods(t *testing.T) {
+	shrinkPodWait(t, 50*time.Millisecond, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+
+	// footstrike-dashboard's pods show up; footstrike-api's never do.
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{readyPod("footstrike-dashboard", dashImage)}}}
+
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	if err == nil {
+		t.Fatal("expected Up to fail when a member never gets any pods, got nil")
+	}
+	want := "footstrike-api not ready: no pods found"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to contain %q", err.Error(), want)
+	}
+	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed", got)
+	}
+}
+
+// TestUpPodWaitRetriesListFailures: one ListPods blip must not
+// destroy a preview whose builds took ten minutes. (The fake fails every
+// call while listPodsErr is set, so this also pins that a *persistent*
+// failure still ends in a timeout naming the cause rather than hanging.)
+func TestUpPodWaitRetriesListFailures(t *testing.T) {
+	shrinkPodWait(t, 50*time.Millisecond, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	d.kube.listPodsErr = errors.New("pods list: connection reset by peer")
+
+	err := d.orch.Up(context.Background(), "hae-cadence")
+	if err == nil {
+		t.Fatal("expected Up to fail when pods can never be listed, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") || !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("error = %q, want a timeout carrying the underlying list failure", err.Error())
+	}
+	if d.kube.listPodsCalls["preview-hae-cadence"] < 2 {
+		t.Errorf("ListPods called %d times, want the list error retried rather than failing the run on the first blip", d.kube.listPodsCalls["preview-hae-cadence"])
+	}
+}
+
+// TestUpPodWaitRespectsContextCancellation: the wait must not outlive the
+// run's own context (the API layer's 30-minute goroutine budget), and the
+// namespace must still land on failed via fail()'s detached write.
+func TestUpPodWaitRespectsContextCancellation(t *testing.T) {
+	// Leave the real 5-minute bound in place: the point is that ctx, not the
+	// bound, is what ends this wait.
+	shrinkPodWait(t, 5*time.Minute, 10*time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate"}),
+	}}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := d.orch.Up(ctx, "hae-cadence")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Up to fail when the context dies mid-wait, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("Up took %v to return after context cancellation, want it to abandon the 5-minute bound immediately", elapsed)
+	}
+	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed", got)
+	}
+}
+
+// TestDownWorksAfterAReadinessFailure: teardown of a preview that failed the
+// pod wait is unchanged — the namespace exists and its Neon branch was
+// created before the failure, so both must still be cleaned up. A readiness
+// failure must not strand cluster or Neon resources.
+func TestDownWorksAfterAReadinessFailure(t *testing.T) {
+	shrinkPodWait(t, 30*time.Second, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", WaitingReason: "CrashLoopBackOff"}),
+	}}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err == nil {
+		t.Fatal("expected the Up to fail its readiness wait, got nil")
+	}
+	if len(d.neon.branches["aged-river-81935268"]) != 1 {
+		t.Fatalf("expected the Neon branch to exist after the failed Up, got %+v", d.neon.branches["aged-river-81935268"])
+	}
+
+	if err := d.orch.Down(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Down after a readiness failure: %v", err)
+	}
+	if _, stillPresent := d.kube.namespaces[ns]; stillPresent {
+		t.Error("namespace still present after Down")
+	}
+	if len(d.neon.branches["aged-river-81935268"]) != 0 {
+		t.Errorf("aged-river-81935268 branches = %+v, want the preview branch deleted", d.neon.branches["aged-river-81935268"])
+	}
+}
+
+// ---- readiness helpers --------------------------------------------------------
+
+// TestPodNotReadyReason pins the diagnosis rules the failure message is
+// built from — in particular that an init container's own reason beats the
+// app container's contentless "PodInitializing", and that only
+// CrashLoopBackOff is terminal.
+func TestPodNotReadyReason(t *testing.T) {
+	exit1 := int32(1)
+	exit0 := int32(0)
+	tests := []struct {
+		name       string
+		pod        kube.PodInfo
+		wantReason string
+		wantFatal  bool
+	}{
+		{
+			name:       "ready pod",
+			pod:        readyPod("footstrike-api", apiImage),
+			wantReason: "",
+		},
+		{
+			name:       "migrate crashlooping is terminal and named",
+			pod:        initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", WaitingReason: crashLoopBackOff}),
+			wantReason: "migrate initContainer CrashLoopBackOff",
+			wantFatal:  true,
+		},
+		{
+			name: "migrate that has failed once but isn't backing off yet",
+			pod: initializingPod("footstrike-api", apiImage, kube.ContainerInfo{
+				Name: "migrate", ExitCode: &exit1, TerminatedReason: "Error",
+			}),
+			wantReason: "migrate initContainer exited 1",
+		},
+		{
+			name: "migrate OOM-killed names the reason",
+			pod: initializingPod("footstrike-api", apiImage, kube.ContainerInfo{
+				Name: "migrate", ExitCode: &exit1, TerminatedReason: "OOMKilled",
+			}),
+			wantReason: "migrate initContainer OOMKilled (exit 1)",
+		},
+		{
+			name:       "migrate still running falls through to the app container",
+			pod:        initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate"}),
+			wantReason: "PodInitializing",
+		},
+		{
+			name: "a completed migrate is not a problem",
+			pod: func() kube.PodInfo {
+				p := initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", ExitCode: &exit0})
+				p.Containers = []kube.ContainerInfo{{Name: "footstrike-api", WaitingReason: crashLoopBackOff}}
+				return p
+			}(),
+			wantReason: "CrashLoopBackOff",
+			wantFatal:  true,
+		},
+		{
+			name: "no waiting reason at all still reads as not ready",
+			pod: kube.PodInfo{
+				Name: "footstrike-api-7d9f6b8c4d-nx2kp", OwnerKind: "ReplicaSet",
+				OwnerName: "footstrike-api-7d9f6b8c4d", Phase: "Running",
+				Containers: []kube.ContainerInfo{{Name: "footstrike-api"}},
+			},
+			wantReason: "containers not ready",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, fatal := podNotReadyReason(tc.pod)
+			if reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			}
+			if fatal != tc.wantFatal {
+				t.Errorf("fatal = %v, want %v", fatal, tc.wantFatal)
+			}
+		})
+	}
+}
+
+// TestPodsForMemberIgnoresJobAndStaleGenerationPods: a member's CronJob is
+// suspended in a preview, but a leftover "<svc>-purge-..." job pod must
+// never be mistaken for one of the member's Deployment pods (it would hold
+// the preview un-ready, or once Succeeded be waited on forever) — and
+// neither must a pod left over from the *previous* Up, which is what a
+// rolling update keeps around while the new one starts.
+func TestPodsForMemberIgnoresJobAndStaleGenerationPods(t *testing.T) {
+	jobPod := kube.PodInfo{
+		Name: "footstrike-api-purge-29735100-8wrsp", OwnerKind: "Job",
+		OwnerName: "footstrike-api-purge-29735100", Phase: "Failed",
+		Containers: []kube.ContainerInfo{{Name: "footstrike-api-purge", Image: apiImage}},
+	}
+	succeeded := readyPod("footstrike-api", apiImage)
+	succeeded.Name, succeeded.Phase = "footstrike-api-oldrs-abcde", "Succeeded"
+	stale := readyPod("footstrike-api", previewImage("footstrike-api", "oldsha"))
+	stale.Name, stale.OwnerName = "footstrike-api-1a2b3c4d5e-qqqqq", "footstrike-api-1a2b3c4d5e"
+	pods := []kube.PodInfo{
+		jobPod, succeeded, stale,
+		readyPod("footstrike-api", apiImage),
+		readyPod("footstrike-dashboard", dashImage),
+	}
+
+	got, anyGeneration := podsForMember(pods, "footstrike-api", apiImage)
+	if len(got) != 1 || got[0].Name != "footstrike-api-7d9f6b8c4d-nx2kp" {
+		t.Errorf("podsForMember = %+v, want only this generation's running ReplicaSet-owned pod", got)
+	}
+	if !anyGeneration {
+		t.Error("anyGeneration = false, want true — the member does have (older) pods")
+	}
+
+	// With no image to key on, the filter has to fall back to matching every
+	// generation rather than matching nothing.
+	got, _ = podsForMember(pods, "footstrike-api", "")
+	if len(got) != 2 {
+		t.Errorf("podsForMember with no wantImage = %+v, want both running pods", got)
+	}
+}
+
+// TestUpToleratesThePreviousRunsCrashLoopingPod is the regression guard on
+// the documented recovery path: re-running Up is how a developer fixes a
+// preview that failed (say, on a bad migration). A rolling update keeps the
+// broken generation's pod around until the new one is ready, so the wait
+// must judge only the pods this run applied — otherwise the fix always fails
+// on the strength of the bug it fixes.
+func TestUpToleratesThePreviousRunsCrashLoopingPod(t *testing.T) {
+	shrinkPodWait(t, 30*time.Second, time.Millisecond)
+	d := newTwoMemberDeps(t)
+	const ns = "preview-hae-cadence"
+
+	// The previous Up's pod, still crash-looping on its failed migration.
+	broken := initializingPod("footstrike-api", previewImage("footstrike-api", "brokensha"),
+		kube.ContainerInfo{Name: "migrate", WaitingReason: crashLoopBackOff})
+	broken.Name, broken.OwnerName = "footstrike-api-1a2b3c4d5e-qqqqq", "footstrike-api-1a2b3c4d5e"
+
+	starting := []kube.PodInfo{broken,
+		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate"}),
+		readyPod("footstrike-dashboard", dashImage)}
+	converged := []kube.PodInfo{
+		readyPod("footstrike-api", apiImage),
+		readyPod("footstrike-dashboard", dashImage)}
+	d.kube.podScript = map[string][][]kube.PodInfo{ns: {starting, converged}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence"); err != nil {
+		t.Fatalf("Up failed on the previous run's leftover pod: %v", err)
+	}
+	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready", got)
+	}
+}
+
+// TestSanitizeReasonBoundsFreeFormText: container reasons are short tokens,
+// but a client-go error is free-form and lands in an annotation served over
+// the JSON API — it must be flattened and capped.
+func TestSanitizeReasonBoundsFreeFormText(t *testing.T) {
+	if got := sanitizeReason("pods list:\n  connection   reset\n"); got != "pods list: connection reset" {
+		t.Errorf("sanitizeReason collapsed to %q", got)
+	}
+	long := sanitizeReason(strings.Repeat("x", 500))
+	if len([]rune(long)) > 170 {
+		t.Errorf("sanitizeReason returned %d runes, want it capped", len([]rune(long)))
+	}
+}
+
 // ---- Down -----------------------------------------------------------------
 
 func TestDownDeletesNamespaceAndBestEffortDeletesNeonBranches(t *testing.T) {
@@ -995,10 +1555,10 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 
 // TestUpReportsStepsInOrder pins the sequence and wording of every
 // bifrost/step write across a full two-member happy-path Up: each build
-// (with its position), Neon branching, secret copying, and manifest
-// application — in that order, and nothing else in between. Extracted from
-// annotationHistory (not just the final state) since every earlier step's
-// annotation is overwritten by the next.
+// (with its position), Neon branching, secret copying, manifest application,
+// and the wait for those manifests' pods — in that order, and nothing else in
+// between. Extracted from annotationHistory (not just the final state) since
+// every earlier step's annotation is overwritten by the next.
 //
 // Membership resolution is deliberately NOT narrated: it finishes before the
 // namespace exists (so there's nowhere to write it), and a step written after
@@ -1028,6 +1588,7 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 		"branching databases",
 		"copying secrets",
 		"applying manifests",
+		"waiting for pods",
 		"", // cleared on ready
 	}
 	if len(steps) != len(want) {
