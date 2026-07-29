@@ -69,7 +69,14 @@ func main() {
 	// wired up right here in this file, off `fleet` directly.
 	reg := preview.FromFleet(fleet)
 
-	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 75s leaves headroom over auth's own ~46s discovery-doc retry budget
+	// (internal/auth.defaultDiscoveryRetry): identity can be briefly
+	// unreachable at startup after a co-restart (e.g. a spot-node
+	// preemption reschedules every pod at once), and that retry loop is
+	// what actually bounds the wait — this context is just a backstop so a
+	// hung (rather than refused) connection can't wedge startup past that
+	// budget.
+	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 75*time.Second)
 	oidcClient, err := auth.NewOIDC(oidcCtx,
 		cfg.OIDCIssuerExternal, cfg.OIDCIssuerInternal,
 		cfg.OIDCClientID, cfg.OIDCClientSecret,
