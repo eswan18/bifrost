@@ -23,6 +23,7 @@ import (
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/neon"
 	"github.com/eswan18/bifrost/internal/preview"
+	"github.com/eswan18/bifrost/internal/registry"
 	"github.com/eswan18/bifrost/internal/web"
 )
 
@@ -58,10 +59,15 @@ func main() {
 	// disabling the preview control plane. Loaded unconditionally (not just
 	// when GCPProject/preview deps are present) since it's also the source
 	// of which services are previewable at all, used below.
-	reg, err := preview.LoadRegistry()
+	fleet, err := registry.Load()
 	if err != nil {
-		log.Fatalf("preview registry: %v", err)
+		log.Fatalf("registry: %v", err)
 	}
+	// reg narrows the fleet-wide registry down to the previewable subset —
+	// the shape the preview control plane below expects. Other fleet-wide
+	// consumers of the full registry (build badges, service cards, ...) are
+	// wired up in a later plan step.
+	reg := preview.FromFleet(fleet)
 
 	oidcCtx, oidcCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	oidcClient, err := auth.NewOIDC(oidcCtx,

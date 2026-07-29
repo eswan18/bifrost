@@ -8,6 +8,21 @@ import (
 	"github.com/eswan18/bifrost/internal/config"
 )
 
+// testRegistry loads the real embedded fleet registry.yaml (via
+// LoadRegistry, which narrows it to the preview view) for tests that need
+// an actual Registry value -- envConfigFor's callers, mainly -- without
+// every one of them repeating the error-check boilerplate. The registry's
+// own parsing/validation is covered by internal/registry's tests; this
+// package only needs a real value to drive envConfigFor/Orchestrator with.
+func testRegistry(t *testing.T) Registry {
+	t.Helper()
+	reg, err := LoadRegistry()
+	if err != nil {
+		t.Fatalf("LoadRegistry() error = %v", err)
+	}
+	return reg
+}
+
 func TestParseStagingEnv(t *testing.T) {
 	t.Run("present file parses data map", func(t *testing.T) {
 		files := map[string][]byte{

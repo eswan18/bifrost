@@ -29,8 +29,8 @@ type Config struct {
 	DisplayLocation *time.Location
 	// Preview control plane (all optional; empty disables preview features).
 	// Which services are previewable, and their Neon references, live in the
-	// registry (see internal/preview/registry.go), not here — these are just
-	// the secrets/tokens the orchestrator needs to act on it.
+	// registry (see internal/registry/registry.go), not here — these are
+	// just the secrets/tokens the orchestrator needs to act on it.
 	GitHubToken     string // PAT for branch lookups on private repos
 	NeonAPIKey      string // Neon API key for branch create/delete
 	PreviewAPIToken string // static bearer token for the preview API (CLI use)
