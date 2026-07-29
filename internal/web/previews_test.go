@@ -71,6 +71,72 @@ func TestRecordFromNamespaceTerminating(t *testing.T) {
 	}
 }
 
+// TestRecordFromNamespaceStep pins the step-reporting contract added for
+// preview progress: bifrost/step, bifrost/step-since, and bifrost/error all
+// surface onto previewRecord verbatim (the timestamp parsed, not just
+// copied).
+func TestRecordFromNamespaceStep(t *testing.T) {
+	ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "creating")
+	ns.Annotations["bifrost/step"] = "building footstrike-api (1/2)"
+	ns.Annotations["bifrost/step-since"] = "2026-07-27T12:34:56Z"
+
+	r := recordFromNamespace(ns)
+	if r.Step != "building footstrike-api (1/2)" {
+		t.Errorf("Step = %q", r.Step)
+	}
+	wantSince := time.Date(2026, 7, 27, 12, 34, 56, 0, time.UTC)
+	if !r.StepSince.Equal(wantSince) {
+		t.Errorf("StepSince = %v, want %v", r.StepSince, wantSince)
+	}
+}
+
+// TestRecordFromNamespaceReadyReportsEmptyStep asserts the "ready clears
+// step" half of the contract: a ready preview (no bifrost/step annotation,
+// since Up wipes it on success) must not display a stale step.
+func TestRecordFromNamespaceReadyReportsEmptyStep(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+	r := recordFromNamespace(ns)
+	if r.Step != "" {
+		t.Errorf("Step = %q, want empty for a ready preview", r.Step)
+	}
+	if !r.StepSince.IsZero() {
+		t.Errorf("StepSince = %v, want zero for a ready preview", r.StepSince)
+	}
+}
+
+// TestRecordFromNamespaceFailedRetainsStepAndError asserts the "failed
+// preview keeps its last step" diagnostic contract, plus that bifrost/error
+// surfaces onto the record.
+func TestRecordFromNamespaceFailedRetainsStepAndError(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "failed")
+	ns.Annotations["bifrost/step"] = "building footstrike-api (1/2)"
+	ns.Annotations["bifrost/step-since"] = "2026-07-27T12:34:56Z"
+	ns.Annotations["bifrost/error"] = "build ended with status FAILURE"
+
+	r := recordFromNamespace(ns)
+	if r.Step != "building footstrike-api (1/2)" {
+		t.Errorf("Step = %q, want the retained last step", r.Step)
+	}
+	if r.Error != "build ended with status FAILURE" {
+		t.Errorf("Error = %q", r.Error)
+	}
+}
+
+// TestRecordFromNamespaceInvalidStepSinceIgnored guards against a malformed
+// (or absent) bifrost/step-since annotation crashing or poisoning the
+// record: it should just leave StepSince zero rather than propagating a
+// parse error anywhere visible.
+func TestRecordFromNamespaceInvalidStepSinceIgnored(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "creating")
+	ns.Annotations["bifrost/step"] = "branching databases"
+	ns.Annotations["bifrost/step-since"] = "not-a-timestamp"
+
+	r := recordFromNamespace(ns)
+	if !r.StepSince.IsZero() {
+		t.Errorf("StepSince = %v, want zero for an unparseable annotation", r.StepSince)
+	}
+}
+
 func TestAssemblePreviews(t *testing.T) {
 	fk := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-b", "b", "footstrike-api", "ready"),

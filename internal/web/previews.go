@@ -28,6 +28,20 @@ type previewRecord struct {
 	Health    string            `json:"health"`
 	CreatedAt time.Time         `json:"createdAt"`
 	URLs      map[string]string `json:"urls"`
+	// Step and StepSince narrate what the orchestrator's Up is doing right
+	// now (bifrost/step, bifrost/step-since — see internal/preview's
+	// Orchestrator.step). Step is "" once a preview reaches ready (cleared
+	// on success) but is deliberately left in place on a failed preview, so
+	// it reads as "failed while building footstrike-api" rather than going
+	// silent. StepSince is a timestamp, not a duration, so elapsed time is
+	// always computed fresh by whoever renders it (the CLI, the UI) instead
+	// of going stale between polls.
+	Step      string    `json:"step,omitempty"`
+	StepSince time.Time `json:"stepSince,omitzero"`
+	// Error surfaces bifrost/error (already written by Orchestrator.fail)
+	// so a failed preview's cause is visible to API consumers instead of
+	// only the cluster-side annotation.
+	Error string `json:"error,omitempty"`
 }
 
 // recordFromNamespace derives everything derivable without extra cluster
@@ -41,6 +55,13 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 		Phase:     ns.Annotations["bifrost/phase"],
 		CreatedAt: ns.CreatedAt,
 		URLs:      map[string]string{},
+		Step:      ns.Annotations["bifrost/step"],
+		Error:     ns.Annotations["bifrost/error"],
+	}
+	if since := ns.Annotations["bifrost/step-since"]; since != "" {
+		if t, err := time.Parse(time.RFC3339, since); err == nil {
+			rec.StepSince = t
+		}
 	}
 	for _, app := range strings.Split(ns.Annotations["bifrost/apps"], ",") {
 		if app = strings.TrimSpace(app); app != "" {
