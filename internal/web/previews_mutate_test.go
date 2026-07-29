@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -99,6 +100,20 @@ func newFakeOrchestration() *fakeOrchestration {
 }
 
 func (f *fakeOrchestration) Busy(tag string) bool { return f.busyTags[tag] }
+
+// BusyTags enumerates the same scripted busyTags map Busy answers from, so a
+// test can never set up a fake whose two answers disagree. Sorted, like the
+// real Orchestrator.BusyTags.
+func (f *fakeOrchestration) BusyTags() []string {
+	tags := make([]string, 0, len(f.busyTags))
+	for tag, busy := range f.busyTags {
+		if busy {
+			tags = append(tags, tag)
+		}
+	}
+	sort.Strings(tags)
+	return tags
+}
 
 func (f *fakeOrchestration) Up(ctx context.Context, branch string, opts preview.UpOptions) error {
 	f.gotBranch = branch

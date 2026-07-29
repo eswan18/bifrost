@@ -320,6 +320,14 @@ type fakeKube struct {
 	// sweep's re-read, whose failure must skip that preview rather than let it
 	// be torn down on a stale snapshot.
 	getErrByNS map[string]error
+	// onEnsureNamespace, if set, runs at the top of every EnsureNamespace call
+	// (before the namespace is created/merged). It is how a test reaches a
+	// LATER stage of Up with a run context that has since died: cancelling
+	// before Up is called no longer gets there, because the still-Terminating
+	// pre-check reads the namespace first and a dead context fails that read.
+	// Like onDeleteNamespace it runs with f.mu ALREADY HELD, so it must not
+	// call back into the fake's own locking methods.
+	onEnsureNamespace func(name string)
 	// onDeleteNamespace, if set, runs at the top of every DeleteNamespace call
 	// (before the delete itself), and is how a sweep test moves the cluster
 	// underneath an in-progress sweep: renewing a later namespace's expiry, or
@@ -350,6 +358,9 @@ func newFakeKube() *fakeKube {
 func (f *fakeKube) EnsureNamespace(_ context.Context, name string, labels, annotations map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onEnsureNamespace != nil {
+		f.onEnsureNamespace(name)
+	}
 	if f.ensureErr != nil {
 		return f.ensureErr
 	}
@@ -1029,7 +1040,13 @@ func TestUpFailDetachesAnnotateFromADeadRunContext(t *testing.T) {
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // the run context is already dead before the failure is even reached
+	defer cancel()
+	// The run context dies the instant the namespace exists — i.e. after the
+	// still-Terminating pre-check's read (which a dead context would fail,
+	// aborting the run before any of this) and before the build failure this
+	// test is actually about. What's under test is that fail()'s compensating
+	// annotate write lands anyway, on a context detached from this one.
+	d.kube.onEnsureNamespace = func(string) { cancel() }
 
 	err := d.orch.Up(ctx, "hae-cadence", UpOptions{})
 	if err == nil {
@@ -1250,6 +1267,122 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	if len(d.kube.applyCalls) != 0 {
 		t.Errorf("ApplyObjects called %d times, want 0", len(d.kube.applyCalls))
 	}
+}
+
+// ---- Up: a namespace still terminating ----------------------------------------
+
+// assertNothingWasStarted asserts that a run bailed out before it did any of
+// the expensive, externally-visible work: no build triggered, no Neon branch
+// created, no secret copied, nothing applied — and that the namespace was
+// never even annotated, which is the witness that EnsureNamespace itself
+// wasn't reached.
+//
+// The build assertions are the point of the whole fix, not garnish. A run
+// against a namespace Kubernetes is deleting cannot possibly succeed, and it
+// used to discover that only at copy-secrets, minutes and two Cloud Builds
+// later. Asserting only that Up returned an error would pass just as happily
+// against that version.
+func (d *testDeps) assertNothingWasStarted(t *testing.T) {
+	t.Helper()
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if n := d.gcb.runCallsFor(trigger); n != 0 {
+			t.Errorf("RunTrigger(%s) called %d times, want 0 — the run must fail before any build starts", trigger, n)
+		}
+	}
+	if d.neon.hasBranch("aged-river-81935268", previewBranchName("hae-cadence")) {
+		t.Error("a Neon branch was created, want none — the run must fail before it branches a database")
+	}
+	if n := len(d.kube.copySecretCalls); n != 0 {
+		t.Errorf("CopySecret called %d times, want 0", n)
+	}
+	if n := len(d.kube.applyCalls); n != 0 {
+		t.Errorf("ApplyObjects called %d times, want 0", n)
+	}
+	if n := len(d.kube.annotationHistory); n != 0 {
+		t.Errorf("namespace was annotated %d times, want 0 — EnsureNamespace must never be reached", n)
+	}
+}
+
+// TestUpRefusesATerminatingNamespace is the production bug: the owner tore a
+// preview down and immediately recreated it, and Up ran for two and a half
+// minutes against a namespace that no longer existed — completing both Cloud
+// Builds and branching Neon — before dying at copy-secrets with `namespaces
+// "preview-training-plans" not found`. Kubernetes accepts an annotation
+// update on a Terminating namespace, so EnsureNamespace SUCCEEDS and there is
+// no error for Up to catch.
+func TestUpRefusesATerminatingNamespace(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	// A namespace mid-delete: still present, still carrying the last run's
+	// annotations, but on its way out.
+	d.kube.namespaces["preview-hae-cadence"] = &fakeNamespace{
+		labels:      map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{"bifrost/phase": "ready"},
+		phase:       "Terminating",
+	}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if !errors.Is(err, ErrTerminating) {
+		t.Fatalf("Up = %v, want ErrTerminating so the API layer and CLI can report it precisely", err)
+	}
+	if !strings.Contains(err.Error(), "preview-hae-cadence") {
+		t.Errorf("error = %q, want it to name the namespace", err.Error())
+	}
+	d.assertNothingWasStarted(t)
+
+	// The dying namespace's own annotations are left exactly as they were:
+	// a refused run must not scribble bifrost/phase=creating onto a preview
+	// that is being deleted.
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want the terminating namespace's annotations untouched", got)
+	}
+}
+
+// TestUpCreatesAFreshNamespaceOnceTheOldOneIsGone is the other half of the
+// same flow, and the one the refusal must not break: recreate-after-teardown
+// is the ordinary path, and once Kubernetes has actually finished the delete
+// there is nothing left to refuse. A pre-check that treated "absent" as
+// anything other than "go ahead" would make every second `ib preview up`
+// fail forever.
+func TestUpCreatesAFreshNamespaceOnceTheOldOneIsGone(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if _, present := d.kube.namespaces["preview-hae-cadence"]; present {
+		t.Fatal("fixture already has the namespace; this test is about its total absence")
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up over a fully-absent namespace failed: %v", err)
+	}
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready — the namespace must be created fresh and run through", got)
+	}
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if n := d.gcb.runCallsFor(trigger); n != 1 {
+			t.Errorf("RunTrigger(%s) called %d times, want 1", trigger, n)
+		}
+	}
+}
+
+// TestUpAbortsWhenTheNamespaceCannotBeRead covers the pre-check's own failure
+// mode. A namespace bifrost can't read is not evidence that it is safe to
+// build into — the same reading PurgeExpired applies to its re-read — and
+// proceeding on an unknown is exactly the bug the pre-check exists to stop.
+// It is deliberately NOT ErrTerminating: nothing was determined, so nothing
+// should be claimed.
+func TestUpAbortsWhenTheNamespaceCannotBeRead(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.kube.getErrByNS = map[string]error{"preview-hae-cadence": errors.New("apiserver: etcdserver: request timed out")}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("Up = nil, want an error when the namespace read fails")
+	}
+	if errors.Is(err, ErrTerminating) {
+		t.Errorf("error = %v, want a plain read failure rather than a terminating verdict", err)
+	}
+	if !strings.Contains(err.Error(), "preview-hae-cadence") {
+		t.Errorf("error = %q, want it to name the namespace", err.Error())
+	}
+	d.assertNothingWasStarted(t)
 }
 
 // ---- Up: waiting for pods -----------------------------------------------------

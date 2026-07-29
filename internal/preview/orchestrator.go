@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,13 @@ import (
 // ErrBusy reports that an Up or Down for this tag is already in flight. The
 // API layer maps this to 409.
 var ErrBusy = errors.New("preview: orchestration already in progress for this tag")
+
+// ErrTerminating reports that the tag's namespace still exists but Kubernetes
+// is in the middle of deleting it, so this Up cannot be started. Distinguished
+// from ErrBusy — and from every other Up failure — so the API layer and the
+// CLI can say "still tearing down, retry shortly" rather than surfacing a
+// generic failure: it is a wait-and-retry condition, not a broken preview.
+var ErrTerminating = errors.New("preview: the previous teardown of this preview is still in progress; retry once it finishes")
 
 // buildPollInterval is how often Up polls Cloud Build for a preview build's
 // status. A var (not a const) so tests can shrink it instead of waiting on
@@ -121,6 +129,29 @@ func (o *Orchestrator) Busy(tag string) bool {
 	return o.busy[tag]
 }
 
+// BusyTags returns every tag currently claimed, sorted so callers (and tests)
+// get a stable order.
+//
+// The enumerating counterpart to Busy, and it exists because a claim can
+// outlive — or precede — the namespace it belongs to, which makes it
+// invisible to anything that reads the cluster. Down holds the tag after
+// DeleteNamespace has returned while it works through the Neon branches, and
+// Up holds it during membership resolution before the namespace exists at
+// all. In both windows `ib preview list` and the Previews tab, which see
+// namespaces and nothing else, report the preview as simply absent while a
+// concurrent up/down is told the tag is busy. The read path uses this to
+// surface those tags instead (see internal/web's assemblePreviews).
+func (o *Orchestrator) BusyTags() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	tags := make([]string, 0, len(o.busy))
+	for tag := range o.busy {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
+}
+
 // UpOptions is everything about a preview run that isn't the branch itself.
 // A struct rather than positional parameters because both fields are
 // optional, and their zero values are the defaults every caller that doesn't
@@ -167,8 +198,10 @@ type UpOptions struct {
 // Every stage past EnsureNamespace that fails — the readiness wait
 // included — marks the namespace bifrost/phase=failed with a sanitized
 // bifrost/error annotation before returning; stage-1 validation failures
-// (bad membership, an unresolvable dashboard triple) return before the
-// namespace is ever touched, so they never leave a zombie behind.
+// (bad membership, an unresolvable dashboard triple), and the
+// still-Terminating refusal that immediately precedes EnsureNamespace, all
+// return before the namespace is ever touched, so they never leave a zombie
+// behind.
 //
 // Idempotent re-`Up` (e.g. after a bifrost restart mid-creation, or a
 // deliberate re-POST once the branch has new commits) is the recovery path:
@@ -226,6 +259,9 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 	}
 
 	ns := previewNamespace(tag)
+	if err := o.refuseTerminating(ctx, ns); err != nil {
+		return err
+	}
 	if err := o.Kube.EnsureNamespace(ctx, ns,
 		map[string]string{"bifrost/preview": "true"},
 		map[string]string{
@@ -299,6 +335,64 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 		"bifrost/step-since": "",
 	}); err != nil {
 		return fmt.Errorf("preview: Up: mark ready: %w", err)
+	}
+	return nil
+}
+
+// refuseTerminating fails the run, before it has done anything, when ns
+// already exists and Kubernetes is deleting it.
+//
+// It exists because EnsureNamespace cannot report this. The API server
+// happily accepts a metadata update on a namespace in phase Terminating, so
+// EnsureNamespace SUCCEEDS against one — there is no error for Up to catch,
+// and Up used to walk straight on into a run that could not possibly finish:
+// both Cloud Builds run, the Neon branches get created, and the first call
+// that tries to CREATE something inside the doomed namespace (copySecrets) is
+// where it finally dies, minutes later, with a bare `namespaces
+// "preview-<tag>" not found`. That is the exact production failure this
+// guards: tear a preview down, recreate it immediately, and burn two builds
+// and a database branch on a namespace that was disappearing the whole time.
+//
+// Placement is deliberate: immediately before EnsureNamespace, after the
+// stages that have no cluster side effects (membership resolution, the
+// required-key pre-flight). Later is impossible — EnsureNamespace is the
+// point of no return. Earlier (say at the top of Up) would fail a doomed run
+// marginally sooner but would WIDEN the window between looking and acting by
+// however long membership resolution's GitHub round trips take, and the
+// window is the only thing this check is really trading in.
+//
+// Because it is a look-then-act, it is NOT airtight, and nothing here can
+// make it so. The namespace can enter Terminating in the instant between this
+// read and EnsureNamespace, or at any point during the minutes that follow —
+// an `ib preview down`, or a bare kubectl delete, landing mid-create does
+// exactly that. Kubernetes offers no "create unless terminating" primitive to
+// close it with, and the busy set only serializes bifrost's own Up and Down,
+// not anyone else's delete. What this buys is the COMMON case: the
+// recreate-immediately-after-teardown that produced the two-and-a-half-minute
+// doomed run now fails in one API call, having triggered nothing. A run that
+// loses the race still fails the old way, just as it always did.
+//
+// It refuses rather than waiting, polling, or retrying, deliberately.
+// Namespace teardown is unbounded in principle (finalizers, stuck pods) and
+// routinely takes tens of seconds; blocking here would hold the tag's busy
+// claim for the whole time, so a caller who would rather give up couldn't,
+// and `ib preview list` would show nothing at all meanwhile. The caller gets
+// a named error and decides.
+//
+// A GetNamespace that fails aborts the run too. A namespace bifrost cannot
+// read is not evidence that it is safe to build into — the same reading the
+// expiry sweep applies to its own re-read — and proceeding on an unknown is
+// precisely the bug being fixed here.
+func (o *Orchestrator) refuseTerminating(ctx context.Context, ns string) error {
+	existing, found, err := o.Kube.GetNamespace(ctx, ns)
+	if err != nil {
+		return fmt.Errorf("preview: Up: check namespace %s: %w", ns, err)
+	}
+	// Absent is the ordinary recreate-after-teardown path once the delete has
+	// actually finished: nothing to refuse, and EnsureNamespace below creates
+	// it fresh.
+	if found && existing.Phase == "Terminating" {
+		return fmt.Errorf("preview: Up: namespace %s is still Terminating: %w", ns, ErrTerminating)
 	}
 	return nil
 }

@@ -12,14 +12,21 @@ import (
 	"github.com/eswan18/bifrost/internal/preview"
 )
 
-// orchestration is the subset of *preview.Orchestrator the mutating preview
-// endpoints need. It exists so handler tests can supply a trivial fake
-// (Up/Down/Busy) rather than standing up a real Orchestrator, which needs
-// five real clients (kube, GitHub, Neon, Cloud Build) to even construct.
+// orchestration is the subset of *preview.Orchestrator the preview endpoints
+// need. It exists so handler tests can supply a trivial fake rather than
+// standing up a real Orchestrator, which needs five real clients (kube,
+// GitHub, Neon, Cloud Build) to even construct.
+//
+// Up/Down/Busy are what the mutating endpoints in this file use. BusyTags is
+// for the READ path (previews.go's assemblePreviews), which needs the whole
+// claimed set rather than a yes/no about a tag it already knows: a tag can be
+// claimed while no namespace exists for it, and that record has to come from
+// somewhere.
 type orchestration interface {
 	Up(ctx context.Context, branch string, opts preview.UpOptions) error
 	Down(ctx context.Context, tag string) error
 	Busy(tag string) bool
+	BusyTags() []string
 }
 
 // asyncOrchestrationTimeout bounds the detached goroutine that actually runs

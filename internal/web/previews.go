@@ -52,7 +52,33 @@ type previewRecord struct {
 	// autoUpdateAnnotation and PollAutoUpdates). Opt-in and false by
 	// default, so it is omitted from the JSON for almost every preview.
 	AutoUpdate bool `json:"autoUpdate,omitempty"`
+	// Busy reports that the orchestrator currently holds this tag for an
+	// in-flight Up or Down (internal/preview's Orchestrator.Busy). Alone
+	// among this struct's fields it is NOT derived from the namespace: it is
+	// bifrost's own in-process state, and that is exactly why it is worth
+	// reporting. A busy tag is the reason a concurrent up/down gets a 409,
+	// and until now nothing in the API said so, which left "That preview is
+	// busy" and "No preview environments" as the two simultaneous answers to
+	// the same question. False for a preview nobody is touching, so
+	// omitempty keeps it out of the JSON for almost every record; a consumer
+	// must read a missing key as false.
+	Busy bool `json:"busy,omitempty"`
 }
+
+// phaseBusy is the phase carried by a synthesized record — a tag the
+// orchestrator holds that has no namespace to describe it (see busyRecord).
+//
+// It is deliberately its own phase rather than a reuse of an existing one.
+// "creating" and "terminating" would both be guesses: the busy set is a bare
+// claim on a tag and does not record which of Up or Down took it, and the two
+// windows that produce this state are one of each (Up before EnsureNamespace,
+// Down after DeleteNamespace). "terminating" would be an outright lie besides
+// — recordFromNamespace reserves it for a namespace whose Kubernetes phase
+// really is Terminating, and here there is no namespace at all. "unknown",
+// which recordFromNamespace uses for a namespace missing its phase
+// annotation, would throw away the one thing that IS known. So: busy, which
+// claims exactly what bifrost can see.
+const phaseBusy = "busy"
 
 // recordFromNamespace derives everything derivable without extra cluster
 // calls; Health is filled separately by the assemblers.
@@ -127,21 +153,84 @@ func anyPreviewCreating(records []previewRecord) bool {
 	return false
 }
 
+// busyRecord synthesizes the record for a tag the orchestrator holds but that
+// has no namespace behind it, so the state is visible in listings at all
+// instead of reading as "no such preview".
+//
+// Everything a namespace would have supplied is genuinely unknown here, and
+// is left at the zero value rather than invented: no branch, no apps, no
+// URLs, no creation time (the UI's relativeTime renders "" for the zero time,
+// so the AGE cell simply stays blank). Health is "unknown" for the same
+// reason the read path degrades to it elsewhere — there is no namespace to
+// list pods in, and asking would be a wasted call with a foregone answer.
+// Apps and URLs are non-nil so they marshal as [] and {} like every other
+// record's.
+func busyRecord(tag string) previewRecord {
+	return previewRecord{
+		Tag:    tag,
+		Apps:   []string{},
+		Phase:  phaseBusy,
+		Health: "unknown",
+		URLs:   map[string]string{},
+		Busy:   true,
+	}
+}
+
 func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error) {
 	namespaces, err := h.Kube.ListNamespaces(ctx, previewLabelSelector)
 	if err != nil {
 		return nil, err
 	}
-	records := make([]previewRecord, 0, len(namespaces))
+	// One snapshot of the claimed set for the whole response, used both for
+	// the flag on each namespace-backed record and to decide what to
+	// synthesize below. Re-asking per tag would let a single response
+	// contradict itself — flagging a tag busy in one record while omitting
+	// the synthesized one for another because the claim moved in between.
+	busy := h.busyTags()
+	records := make([]previewRecord, 0, len(namespaces)+len(busy))
+	hasNamespace := make(map[string]bool, len(namespaces))
 	for _, ns := range namespaces {
 		rec := recordFromNamespace(ns)
 		rec.Health = h.previewHealth(ctx, ns.Name)
+		rec.Busy = busy[rec.Tag]
+		hasNamespace[rec.Tag] = true
 		records = append(records, rec)
+	}
+	// Only the claimed tags with nothing to describe them: a busy tag that
+	// does have a namespace already got a real record above, carrying the
+	// same flag, and must not also get a phantom second one.
+	for tag := range busy {
+		if !hasNamespace[tag] {
+			records = append(records, busyRecord(tag))
+		}
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Tag < records[j].Tag })
 	return records, nil
 }
 
+// busyTags snapshots the orchestrator's claimed-tag set as a lookup table. A
+// nil Orch — previews not configured, see Handlers.Orch — has no claims to
+// report, so every record reads busy=false and nothing is synthesized,
+// exactly as the read path behaved before any of this existed.
+func (h *Handlers) busyTags() map[string]bool {
+	if h.Orch == nil {
+		return nil
+	}
+	tags := h.Orch.BusyTags()
+	set := make(map[string]bool, len(tags))
+	for _, tag := range tags {
+		set[tag] = true
+	}
+	return set
+}
+
+// previewByTag reads one preview. Unlike assemblePreviews it deliberately
+// does NOT synthesize a record for a busy tag with no namespace: found=false
+// here means "no namespace", and DeletePreviewJSON depends on that to answer
+// 404 for a tag that doesn't exist. Synthesizing would turn every in-flight
+// teardown into a 200 and let a DELETE proceed against a preview that is
+// already gone. The busy flag is still reported, so a caller polling a
+// specific tag sees the claim as soon as there is a namespace to hang it on.
 func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewRecord, bool, error) {
 	ns, found, err := h.Kube.GetNamespace(ctx, previewNSPrefix+tag)
 	if err != nil || !found {
@@ -149,6 +238,7 @@ func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewRecord,
 	}
 	rec := recordFromNamespace(ns)
 	rec.Health = h.previewHealth(ctx, ns.Name)
+	rec.Busy = h.Orch != nil && h.Orch.Busy(tag)
 	return rec, true, nil
 }
 

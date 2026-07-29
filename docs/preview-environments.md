@@ -78,6 +78,43 @@ missing key as `false`.
 A tag mid-`Up`/`Down` is claimed by an in-memory busy set; a concurrent call
 for the same tag gets `409` (`ib.py`: "That preview is busy").
 
+`busy` (bool) reports that claim on the record itself. It's `omitempty`, so
+like `autoUpdate` it appears only as `"busy": true` and a missing key reads as
+`false`. It is the one field not derived from the namespace — the busy set is
+bifrost's own in-process state, not cluster state — and that is exactly why
+it's reported: it's the reason a concurrent `up`/`down` gets a 409, and
+without it nothing in the API said so.
+
+### Busy with no namespace
+
+A tag can be claimed while **no namespace exists for it**, in both directions:
+
+- `Down` holds the tag after `DeleteNamespace` has returned, while it works
+  through each service's Neon branches.
+- `Up` holds it from the moment it starts, through membership resolution and
+  the required-key pre-flight, before it creates the namespace at all.
+
+Because `list` and the Previews tab read namespaces, that state used to be
+completely invisible: `ib preview list` said "No preview environments" while
+`ib preview up` said "That preview is busy", and neither was the whole truth.
+So `GET /api/previews` **synthesizes** a record for every claimed tag that has
+no namespace behind it. It carries `"phase": "busy"` and `"busy": true`;
+`branch`, `apps` and `urls` are empty and `createdAt` is the zero time,
+because a synthesized record has no namespace to learn any of that from and
+does not invent it.
+
+`busy` is a phase of its own on purpose. The busy set is a bare claim on a tag
+and does not record which of `Up` or `Down` took it, so `creating` and
+`terminating` would both be guesses — and `terminating` would be wrong twice
+over, since it's reserved for a namespace whose Kubernetes phase really is
+`Terminating` and here there is no namespace at all.
+
+Only the list synthesizes. `GET /api/previews/{tag}` still 404s for a tag with
+no namespace, because `DELETE /api/previews/{tag}` uses that same lookup to
+answer 404 for a preview that doesn't exist — synthesizing there would turn
+every in-flight teardown into a 200 and let a `DELETE` proceed against a
+preview that is already gone.
+
 Preview apps are reachable at `{app}-<tag>.preview.footstrike.run`,
 tailnet-only via the same shared `staging-ingress` Tailscale LB + `nginx`
 ingress class staging uses.
@@ -97,7 +134,34 @@ ingress class staging uses.
    resolved against an empty staging baseline, before the namespace or
    anything else is touched. This fails fast, cleanly, if — for
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
-3. **Ensure the namespace**: `preview-<tag>`, annotated
+3. **Refuse a namespace that's still terminating**, then **ensure the
+   namespace**. The refusal is a single `GetNamespace` immediately before the
+   write below: if `preview-<tag>` still exists in Kubernetes phase
+   `Terminating`, the run aborts right there with a distinguishable error
+   (`preview.ErrTerminating`, "the previous teardown of this preview is still
+   in progress; retry once it finishes") having triggered nothing.
+
+   It's needed because the API server accepts a metadata update on a
+   terminating namespace, so `EnsureNamespace` **succeeds** against one and
+   there is no error to catch. Without the check, tearing a preview down and
+   immediately recreating it ran both Cloud Builds and branched Neon against a
+   namespace that was disappearing the whole time, dying two and a half
+   minutes later at step 5 with a bare
+   `namespaces "preview-<tag>" not found`.
+
+   It is a look-then-act and therefore **not** airtight: the namespace can
+   enter `Terminating` in the instant after the read, or at any point during
+   the minutes that follow (an `ib preview down`, or a bare `kubectl delete`,
+   landing mid-create). Kubernetes offers no "create unless terminating"
+   primitive to close that with, and the busy set only serializes bifrost's
+   own `Up`/`Down`. What the check buys is the common case — recreate
+   immediately after teardown — failing in one API call instead of after two
+   builds. It refuses rather than waiting: teardown is unbounded in principle,
+   and blocking would hold the tag's busy claim for the whole time. Once the
+   delete has actually finished, the namespace is simply absent and `up`
+   creates it fresh and proceeds normally.
+
+   **Ensure the namespace**: `preview-<tag>`, annotated
    `bifrost/branch`, `bifrost/apps` (comma-joined members),
    `bifrost/source-shas`, and `bifrost/phase: creating` — and, in the same
    write, `bifrost/error`,

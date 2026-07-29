@@ -263,6 +263,166 @@ func TestPreviewJSONOmitsAutoUpdateWhenOff(t *testing.T) {
 	}
 }
 
+// --- busy visibility ---------------------------------------------------------
+
+// TestPreviewRecordCarriesBusyFlag pins the flag itself: a tag the
+// orchestrator holds is reported as busy on its record, on both the list and
+// the single-preview read, and a tag nobody holds is not.
+func TestPreviewRecordCarriesBusyFlag(t *testing.T) {
+	fk := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-a", "a", "footstrike-api", "creating"),
+		nsInfo("preview-b", "b", "footstrike-api", "ready"),
+	}}
+	h := &Handlers{Kube: fk, Orch: &fakeOrchestration{busyTags: map[string]bool{"a": true}}}
+
+	recs, err := h.assemblePreviews(context.Background())
+	if err != nil {
+		t.Fatalf("assemblePreviews: %v", err)
+	}
+	if len(recs) != 2 || recs[0].Tag != "a" || recs[1].Tag != "b" {
+		t.Fatalf("records = %+v, want [a b]", recs)
+	}
+	if !recs[0].Busy {
+		t.Error("a is claimed by the orchestrator but its record reports busy=false")
+	}
+	if recs[1].Busy {
+		t.Error("b is claimed by nobody but its record reports busy=true")
+	}
+	// The flag must survive into the JSON, since the CLI and the Previews
+	// tab are the consumers this exists for.
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, httptest.NewRequest("GET", "/api/previews", nil))
+	if body := rec.Body.String(); !strings.Contains(body, `"busy":true`) {
+		t.Errorf("list body = %q, want it to carry \"busy\":true", body)
+	}
+
+	// Same flag on GET /api/previews/{tag}, which polls one tag rather than
+	// listing.
+	got, found, err := h.previewByTag(context.Background(), "a")
+	if err != nil || !found {
+		t.Fatalf("previewByTag(a) = (_, %v, %v)", found, err)
+	}
+	if !got.Busy {
+		t.Error("previewByTag dropped the busy flag")
+	}
+}
+
+// TestPreviewsListSynthesizesABusyTagWithNoNamespace is the state that made
+// the production incident baffling: `ib preview list` said "No preview
+// environments" while `ib preview up` said "That preview is busy", and
+// neither was the whole truth. A tag can be claimed with no namespace behind
+// it — Down holds it after deleting the namespace while it works through the
+// Neon branches, Up holds it during membership resolution before the
+// namespace exists — and a listing that can only see namespaces cannot show
+// that at all.
+func TestPreviewsListSynthesizesABusyTagWithNoNamespace(t *testing.T) {
+	h := &Handlers{
+		Kube: &fakeKube{},
+		Orch: &fakeOrchestration{busyTags: map[string]bool{"training-plans": true}},
+	}
+
+	recs, err := h.assemblePreviews(context.Background())
+	if err != nil {
+		t.Fatalf("assemblePreviews: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("records = %+v, want exactly the one synthesized record", recs)
+	}
+	got := recs[0]
+	if got.Tag != "training-plans" {
+		t.Errorf("Tag = %q, want training-plans", got.Tag)
+	}
+	if !got.Busy {
+		t.Error("Busy = false on a synthesized record, want true")
+	}
+	if got.Phase != "busy" {
+		t.Errorf("Phase = %q, want busy — the claim is all that's known, so the phase must not guess", got.Phase)
+	}
+	if got.Apps == nil || got.URLs == nil {
+		t.Errorf("Apps/URLs = %v/%v, want non-nil so they marshal as [] and {}", got.Apps, got.URLs)
+	}
+
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, httptest.NewRequest("GET", "/api/previews", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `"tag":"training-plans"`) || !strings.Contains(body, `"phase":"busy"`) {
+		t.Errorf("body = %q, want the synthesized record to appear with phase busy", body)
+	}
+	// "terminating" is reserved for a namespace whose Kubernetes phase really
+	// is Terminating. There is no namespace here, so claiming it would be a
+	// guess — and half the time the wrong one, since Up holds the tag too.
+	if strings.Contains(body, "terminating") {
+		t.Errorf("body = %q, want no terminating claim for a tag with no namespace", body)
+	}
+}
+
+// TestPreviewsListInventsNoPhantomRecords is the negative control for the
+// synthesis above: it must add a record only for a claimed tag that has
+// nothing else describing it, never a duplicate alongside a real record and
+// never anything at all for a tag nobody holds.
+func TestPreviewsListInventsNoPhantomRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		busy map[string]bool
+	}{
+		// The busy tag DOES have a namespace, so it already has a real
+		// record; synthesizing on top would show the same preview twice.
+		{"claimed tag that has a namespace", map[string]bool{"a": true}},
+		// Nothing claimed at all — the overwhelmingly common case.
+		{"nothing claimed", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fk := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-a", "a", "footstrike-api", "ready")}}
+			h := &Handlers{Kube: fk, Orch: &fakeOrchestration{busyTags: tc.busy}}
+
+			recs, err := h.assemblePreviews(context.Background())
+			if err != nil {
+				t.Fatalf("assemblePreviews: %v", err)
+			}
+			if len(recs) != 1 || recs[0].Tag != "a" {
+				t.Fatalf("records = %+v, want exactly one record for a", recs)
+			}
+			if recs[0].Phase != "ready" {
+				t.Errorf("Phase = %q, want the namespace's own phase, not a synthesized one", recs[0].Phase)
+			}
+		})
+	}
+}
+
+// TestPreviewsListOmitsBusyWhenFalse holds the field to the same JSON
+// convention autoUpdate follows: absent, not rendered false, for the
+// preview nobody is touching — so a consumer reads a missing key as false.
+func TestPreviewsListOmitsBusyWhenFalse(t *testing.T) {
+	fk := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-a", "a", "footstrike-api", "ready")}}
+	h := &Handlers{Kube: fk, Orch: &fakeOrchestration{}}
+
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, httptest.NewRequest("GET", "/api/previews", nil))
+	if body := rec.Body.String(); strings.Contains(body, `"busy"`) {
+		t.Errorf("body = %q, want the busy key omitted entirely rather than rendered false", body)
+	}
+}
+
+// TestAssemblePreviewsWithoutAnOrchestrator covers the previews-not-configured
+// wiring (main.go leaves Handlers.Orch nil when the preview control plane
+// isn't set up): the read path must still work, reporting nothing busy rather
+// than panicking on a nil interface.
+func TestAssemblePreviewsWithoutAnOrchestrator(t *testing.T) {
+	fk := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-a", "a", "footstrike-api", "ready")}}
+	h := &Handlers{Kube: fk}
+
+	recs, err := h.assemblePreviews(context.Background())
+	if err != nil {
+		t.Fatalf("assemblePreviews: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Busy {
+		t.Fatalf("records = %+v, want one record reporting busy=false", recs)
+	}
+	if _, found, err := h.previewByTag(context.Background(), "a"); err != nil || !found {
+		t.Fatalf("previewByTag = (_, %v, %v), want it to work with a nil Orch", found, err)
+	}
+}
+
 func TestAssemblePreviews(t *testing.T) {
 	fk := &fakeKube{namespaces: []kube.NamespaceInfo{
 		nsInfo("preview-b", "b", "footstrike-api", "ready"),
