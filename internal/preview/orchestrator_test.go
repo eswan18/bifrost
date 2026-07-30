@@ -1333,7 +1333,7 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	}
 }
 
-// ---- Up: a namespace still terminating ----------------------------------------
+// ---- Up: the pre-flight refusals (terminating, tag collision) -----------------
 
 // assertNothingWasStarted asserts that a run bailed out before it did any of
 // the expensive, externally-visible work: no build triggered, no Neon branch
@@ -1341,11 +1341,16 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 // never even annotated, which is the witness that EnsureNamespace itself
 // wasn't reached.
 //
-// The build assertions are the point of the whole fix, not garnish. A run
+// The build assertions are the point of both refusals, not garnish. A run
 // against a namespace Kubernetes is deleting cannot possibly succeed, and it
 // used to discover that only at copy-secrets, minutes and two Cloud Builds
-// later. Asserting only that Up returned an error would pass just as happily
-// against that version.
+// later. A run against another branch's namespace succeeded, which is worse:
+// it adopted that branch's Neon branch and its migrations. Asserting only that
+// Up returned an error would pass just as happily against either version.
+//
+// It is written against the hae-cadence fixture's tag, which every caller
+// shares — including the collision tests, whose two colliding branch names
+// both derive exactly that tag.
 func (d *testDeps) assertNothingWasStarted(t *testing.T) {
 	t.Helper()
 	for _, trigger := range []string{"trig-api", "trig-dash"} {
@@ -1447,6 +1452,130 @@ func TestUpAbortsWhenTheNamespaceCannotBeRead(t *testing.T) {
 		t.Errorf("error = %q, want it to name the namespace", err.Error())
 	}
 	d.assertNothingWasStarted(t)
+}
+
+// collidingBranches are two DIFFERENT branch names that derive the same tag,
+// "hae-cadence" — the fixture tag every test in this file uses. They collide
+// by character folding alone ('/' and '_' both become '-'), so neither is long
+// enough to truncate: the collision the guard exists for needs no long branch
+// name at all. TestTagForBranchIsManyToOne pins the property itself, including
+// the truncation path.
+const (
+	collidingBranchA = "hae/cadence"
+	collidingBranchB = "hae_cadence"
+)
+
+// TestUpRefusesACollidingTagFromADifferentBranch is the silent-corruption
+// path this guard closes. Two branches deriving one tag used to share one
+// preview with no warning at any layer: EnsureNamespace merges (overwriting
+// bifrost/branch with the newcomer), ensureNeonBranch finds the existing
+// preview-<tag> Neon branch by name and reuses it — inheriting whatever
+// migrations the first branch applied — and one `ib preview down` on that tag
+// then destroys both.
+//
+// The refusal has to land BEFORE any of that, which is what
+// assertNothingWasStarted is checking: a guard that fired after the builds
+// would still have branched the database and burned two Cloud Builds, and one
+// that fired after EnsureNamespace would already have stolen the first
+// branch's namespace record.
+func TestUpRefusesACollidingTagFromADifferentBranch(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if TagForBranch(collidingBranchA) != TagForBranch(collidingBranchB) {
+		t.Fatalf("fixture branches %q and %q no longer collide; this test is about the collision",
+			collidingBranchA, collidingBranchB)
+	}
+	// The first branch's finished preview, exactly as its own Up left it.
+	d.kube.namespaces["preview-hae-cadence"] = &fakeNamespace{
+		labels: map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{
+			"bifrost/branch": collidingBranchA,
+			"bifrost/phase":  "ready",
+		},
+	}
+
+	err := d.orch.Up(context.Background(), collidingBranchB, UpOptions{})
+	if !errors.Is(err, ErrTagCollision) {
+		t.Fatalf("Up = %v, want ErrTagCollision so the API layer and CLI can report it precisely", err)
+	}
+	// Both branches by name: an operator reading this has to know which
+	// preview is in the way, not merely that something is.
+	for _, want := range []string{collidingBranchA, collidingBranchB, "hae-cadence"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %q", err.Error(), want)
+		}
+	}
+	d.assertNothingWasStarted(t)
+
+	// The incumbent's record is left exactly as it was: a refused run must not
+	// rewrite bifrost/branch to the newcomer, which is the very overwrite that
+	// made the collision silent.
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/branch"]; got != collidingBranchA {
+		t.Errorf("bifrost/branch = %q, want the incumbent branch %q untouched", got, collidingBranchA)
+	}
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want the incumbent preview left ready", got)
+	}
+}
+
+// TestUpProceedsOverItsOwnNamespace is the case the guard must NOT catch, and
+// the one with the most to lose: re-running `ib preview up` on the same branch
+// is the documented recovery path for a stuck or failed preview, and the
+// auto-update watcher calls Up on the recorded branch every time a member's
+// SHA moves. A guard that refused on the mere presence of a namespace would
+// break both, permanently — every preview would be creatable exactly once.
+func TestUpProceedsOverItsOwnNamespace(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	// A previous run of the SAME branch that failed partway: the state the
+	// recovery re-run is aimed at.
+	d.kube.namespaces["preview-hae-cadence"] = &fakeNamespace{
+		labels: map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{
+			"bifrost/branch": "hae-cadence",
+			"bifrost/phase":  "failed",
+			"bifrost/error":  "build ended with status FAILURE",
+		},
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("re-Up on the same branch failed: %v", err)
+	}
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready — the retry must run all the way through", got)
+	}
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if n := d.gcb.runCallsFor(trigger); n != 1 {
+			t.Errorf("RunTrigger(%s) called %d times, want 1 — the retry must really rebuild", trigger, n)
+		}
+	}
+}
+
+// TestUpProceedsOverANamespaceWithNoBranchAnnotation covers the third state
+// the read can find: a namespace that records no branch at all — a preview
+// predating the annotation, or one left by a partial or out-of-band run.
+//
+// It proceeds, deliberately. Absence is not evidence of a collision, and
+// refusing on it would strand the namespace forever: no `ib preview up` could
+// ever get past the guard again, including the re-run that would repair it.
+// The EnsureNamespace that follows writes the annotation, so the state is
+// self-healing rather than permanent.
+func TestUpProceedsOverANamespaceWithNoBranchAnnotation(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.kube.namespaces["preview-hae-cadence"] = &fakeNamespace{
+		labels:      map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{"bifrost/phase": "ready"},
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up over a namespace with no bifrost/branch annotation failed: %v", err)
+	}
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready", got)
+	}
+	// And the run repaired what it found: the next Up has the evidence this
+	// one didn't.
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/branch"]; got != "hae-cadence" {
+		t.Errorf("bifrost/branch = %q, want the run to have recorded the branch it ran for", got)
+	}
 }
 
 // ---- Up: waiting for pods -----------------------------------------------------
