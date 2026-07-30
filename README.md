@@ -42,8 +42,10 @@ staging.
     ib preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
     ib preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
 
-Lifecycle: membership by branch name -> each member's `{repo}-preview-build`
-Cloud Build trigger runs (manual-only, no push trigger) -> a `preview-<tag>`
+Lifecycle: membership by branch name -> each member's `{registry key}-preview-build`
+Cloud Build trigger runs (manual-only, no push trigger; named after the
+registry key, not the repo, when the two differ — see "Onboarding a new
+previewable app" in `docs/preview-environments.md`) -> a `preview-<tag>`
 Neon branch for any member the registry gives a database reference -> its
 manifests are rendered from the registry's env templates and applied -> the
 namespace's `bifrost/phase` annotation moves `creating` -> `ready` (or

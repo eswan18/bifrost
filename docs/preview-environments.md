@@ -637,15 +637,27 @@ changes:
    push trigger, no `--all-tags`, and the `preview-` prefix deliberately
    fails the staging ImageUpdater's `allowTags` regexp so a preview build can
    never accidentally auto-deploy to staging).
-3. **A `{service}-preview-build` manual-invocation Cloud Build trigger** in
-   infra's Pulumi (`__main__.py`'s `for preview_repo in [...]` loop, pinned to
-   `cloudbuild-preview.yaml` on the repo's `main`) — add the repo name to
-   that list and `pulumi up`. The trigger is named after the registry key
-   (matching what `Orchestrator.TriggerIDs` looks up), not the repo — the two
-   coincide for every previewable service today, but aren't guaranteed to.
-   The GCP IAM prod bifrost needs to run any
-   preview-build trigger (`cloudbuild.builds.editor` + `actAs` on the Cloud
-   Build SA) is already granted once, not per app.
+3. **A `{registry key}-preview-build` manual-invocation Cloud Build trigger**
+   in infra's Pulumi (`__main__.py`'s `for preview_key, preview_repo in
+   [...]` loop, pinned to `cloudbuild-preview.yaml` on the repo's `main`) —
+   add a `(key, repo)` pair to that list and `pulumi up`. The trigger's
+   *name* is always the registry key — matching what
+   `Orchestrator.TriggerIDs` looks up (`buildMembers` does
+   `o.TriggerIDs[svc+"-preview-build"]` with `svc` a registry key, never a
+   repo) — while the GitHub *repo* it builds from is sourced independently,
+   from the pair's second element. For every previewable service today the
+   two happen to be the same string, but that's a coincidence, not a rule:
+   `asset-manager` is already a fleet member whose registry entry sets
+   `repo: asset_manager` (`internal/registry/registry.yaml`), so onboarding
+   *it* to previews means adding `("asset-manager", "asset_manager")` to the
+   loop — the key first, the repo second, never the repo in both slots. Get
+   this backwards and the trigger still builds fine (Cloud Build doesn't
+   care what it's named), but bifrost's lookup by registry key finds no
+   `asset-manager-preview-build` trigger, and the build fails — after the
+   preview's namespace already exists, leaving a zombie `failed` preview
+   behind it. The GCP IAM prod bifrost needs to run any preview-build
+   trigger (`cloudbuild.builds.editor` + `actAs` on the Cloud Build SA) is
+   already granted once, not per app.
 
 That's it — no Go code, no new bifrost endpoint, no orchestrator change.
 
