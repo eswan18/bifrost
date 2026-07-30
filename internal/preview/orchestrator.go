@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,13 @@ import (
 // ErrBusy reports that an Up or Down for this tag is already in flight. The
 // API layer maps this to 409.
 var ErrBusy = errors.New("preview: orchestration already in progress for this tag")
+
+// ErrTerminating reports that the tag's namespace still exists but Kubernetes
+// is in the middle of deleting it, so this Up cannot be started. Distinguished
+// from ErrBusy — and from every other Up failure — so the API layer and the
+// CLI can say "still tearing down, retry shortly" rather than surfacing a
+// generic failure: it is a wait-and-retry condition, not a broken preview.
+var ErrTerminating = errors.New("preview: the previous teardown of this preview is still in progress; retry once it finishes")
 
 // buildPollInterval is how often Up polls Cloud Build for a preview build's
 // status. A var (not a const) so tests can shrink it instead of waiting on
@@ -121,6 +129,59 @@ func (o *Orchestrator) Busy(tag string) bool {
 	return o.busy[tag]
 }
 
+// BusyTags returns every tag currently claimed, sorted so callers (and tests)
+// get a stable order.
+//
+// The enumerating counterpart to Busy, and it exists because a claim can
+// outlive — or precede — the namespace it belongs to, which makes it
+// invisible to anything that reads the cluster. Down holds the tag after
+// DeleteNamespace has returned while it works through the Neon branches, and
+// Up holds it during membership resolution before the namespace exists at
+// all. In both windows `ib preview list` and the Previews tab, which see
+// namespaces and nothing else, report the preview as simply absent while a
+// concurrent up/down is told the tag is busy. The read path uses this to
+// surface those tags instead (see internal/web's assemblePreviews).
+func (o *Orchestrator) BusyTags() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	tags := make([]string, 0, len(o.busy))
+	for tag := range o.busy {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+// UpOptions is everything about a preview run that isn't the branch itself.
+// A struct rather than positional parameters because both fields are
+// optional, and their zero values are the defaults every caller that doesn't
+// care about them wants: no expiry, no auto-update.
+//
+// ExpiresAt is an absolute instant, NOT a TTL duration, and that distinction
+// is load-bearing rather than stylistic. The auto-update watcher
+// (PollAutoUpdates) re-runs Up for a preview that already has an expiry, and
+// it must preserve that expiry exactly. If this were a duration, every
+// re-run would recompute now+ttl and push the deadline forward, so an
+// actively-developed preview — precisely the kind that auto-updates — would
+// keep renewing itself and never expire at all. Passing the instant the
+// preview is already due at lets a re-run carry it through untouched. The
+// now+ttl computation therefore lives in the one place a *user-supplied* TTL
+// enters the system: the API handler (internal/web/previews_mutate.go),
+// which already parses and validates the ttl string.
+//
+// Zero ExpiresAt means "no expiry" and, because the namespace write merges,
+// actively CLEARS any expiry a previous run recorded for this tag (see
+// expiresAtAnnotation). AutoUpdate false clears bifrost/auto-update the same
+// way, for the same reason.
+type UpOptions struct {
+	// ExpiresAt is when the reaper may reclaim this preview. Zero means it
+	// never expires, which is the default.
+	ExpiresAt time.Time
+	// AutoUpdate opts the preview into following its branch: the watcher
+	// re-runs Up whenever a member's branch SHA moves. False is the default.
+	AutoUpdate bool
+}
+
 // Up runs the full preview creation flow for branch to completion: resolve
 // membership, stand up (or update) the namespace, build+branch+secret+render
 // each member, wait for the resulting pods to actually report ready, and
@@ -137,18 +198,19 @@ func (o *Orchestrator) Busy(tag string) bool {
 // Every stage past EnsureNamespace that fails — the readiness wait
 // included — marks the namespace bifrost/phase=failed with a sanitized
 // bifrost/error annotation before returning; stage-1 validation failures
-// (bad membership, an unresolvable dashboard triple) return before the
-// namespace is ever touched, so they never leave a zombie behind.
+// (bad membership, an unresolvable dashboard triple), and the
+// still-Terminating refusal that immediately precedes EnsureNamespace, all
+// return before the namespace is ever touched, so they never leave a zombie
+// behind.
 //
 // Idempotent re-`Up` (e.g. after a bifrost restart mid-creation, or a
 // deliberate re-POST once the branch has new commits) is the recovery path:
 // EnsureNamespace, CopySecret, and ApplyObjects all merge/replace rather than
 // erroring on "already exists", and Neon branch creation is scan-then-create.
 //
-// ttl is optional: a positive ttl records an absolute bifrost/expires-at for
-// the sweeper to reclaim later, and ttl <= 0 means the preview never expires
-// (and clears any expiry a previous run set — see expiresAtAnnotation).
-func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration) error {
+// opts carries the run's optional state (expiry, auto-update); see
+// UpOptions, whose zero value — no expiry, no auto-update — is the default.
+func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) error {
 	if strings.TrimSpace(branch) == "" {
 		return errors.New("preview: Up: branch is required")
 	}
@@ -161,7 +223,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	}
 	defer o.release(tag)
 
-	members, err := o.resolveMembers(ctx, branch)
+	members, sourceSHAs, err := o.resolveMembers(ctx, branch)
 	if err != nil {
 		return fmt.Errorf("preview: Up: %w", err)
 	}
@@ -197,12 +259,21 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	}
 
 	ns := previewNamespace(tag)
+	if err := o.refuseTerminating(ctx, ns); err != nil {
+		return err
+	}
 	if err := o.Kube.EnsureNamespace(ctx, ns,
 		map[string]string{"bifrost/preview": "true"},
 		map[string]string{
-			"bifrost/branch":   branch,
-			"bifrost/apps":     strings.Join(members, ","),
-			phaseAnnotationKey: "creating",
+			branchAnnotationKey: branch,
+			appsAnnotationKey:   strings.Join(members, ","),
+			phaseAnnotationKey:  "creating",
+			// What this run resolved each member's branch to, recorded
+			// BEFORE the builds that consume it — see sourceSHAsAnnotation
+			// for why writing it up front (rather than on success) is what
+			// keeps the auto-update watcher from re-running a failing build
+			// every two minutes forever.
+			sourceSHAsAnnotationKey: sourceSHAsAnnotation(members, sourceSHAs),
 			// Cleared, not merely left alone: EnsureNamespace MERGES
 			// annotations onto whatever the namespace already carries, and
 			// re-running Up over a previously failed preview is the
@@ -217,9 +288,13 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 			"bifrost/error":      "",
 			"bifrost/step":       "",
 			"bifrost/step-since": "",
-			// Written unconditionally, "" and all, for the same merge reason
-			// the three above are cleared; see expiresAtAnnotation.
-			expiresAtAnnotationKey: expiresAtAnnotation(ttl),
+			// Both written unconditionally, "" and all, for the same merge
+			// reason the three above are cleared: an Up that doesn't ask for
+			// an expiry (or for auto-update) must take away one a previous
+			// run set, not silently inherit it. See expiresAtAnnotation and
+			// autoUpdateAnnotation.
+			expiresAtAnnotationKey:  expiresAtAnnotation(opts.ExpiresAt),
+			autoUpdateAnnotationKey: autoUpdateAnnotation(opts.AutoUpdate),
 		},
 	); err != nil {
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
@@ -264,26 +339,131 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, ttl time.Duration)
 	return nil
 }
 
-// The two namespace-annotation keys that are both written here and read back
-// elsewhere in this package (by the expiry sweep) are named, so the writer and
-// the reader cannot drift apart. The rest of the bifrost/* family
-// (branch/apps/error/step/step-since) is written here and read only outside
-// this package, so those stay literals at their single point of use.
+// refuseTerminating fails the run, before it has done anything, when ns
+// already exists and Kubernetes is deleting it.
+//
+// It exists because EnsureNamespace cannot report this. The API server
+// happily accepts a metadata update on a namespace in phase Terminating, so
+// EnsureNamespace SUCCEEDS against one — there is no error for Up to catch,
+// and Up used to walk straight on into a run that could not possibly finish:
+// both Cloud Builds run, the Neon branches get created, and the first call
+// that tries to CREATE something inside the doomed namespace (copySecrets) is
+// where it finally dies, minutes later, with a bare `namespaces
+// "preview-<tag>" not found`. That is the exact production failure this
+// guards: tear a preview down, recreate it immediately, and burn two builds
+// and a database branch on a namespace that was disappearing the whole time.
+//
+// Placement is deliberate: immediately before EnsureNamespace, after the
+// stages that have no cluster side effects (membership resolution, the
+// required-key pre-flight). Later is impossible — EnsureNamespace is the
+// point of no return. Earlier (say at the top of Up) would fail a doomed run
+// marginally sooner but would WIDEN the window between looking and acting by
+// however long membership resolution's GitHub round trips take, and the
+// window is the only thing this check is really trading in.
+//
+// Because it is a look-then-act, it is NOT airtight, and nothing here can
+// make it so. The namespace can enter Terminating in the instant between this
+// read and EnsureNamespace, or at any point during the minutes that follow —
+// an `ib preview down`, or a bare kubectl delete, landing mid-create does
+// exactly that. Kubernetes offers no "create unless terminating" primitive to
+// close it with, and the busy set only serializes bifrost's own Up and Down,
+// not anyone else's delete. What this buys is the COMMON case: the
+// recreate-immediately-after-teardown that produced the two-and-a-half-minute
+// doomed run now fails in one API call, having triggered nothing. A run that
+// loses the race still fails the old way, just as it always did.
+//
+// It refuses rather than waiting, polling, or retrying, deliberately.
+// Namespace teardown is unbounded in principle (finalizers, stuck pods) and
+// routinely takes tens of seconds; blocking here would hold the tag's busy
+// claim for the whole time, so a caller who would rather give up couldn't,
+// and `ib preview list` would show nothing at all meanwhile. The caller gets
+// a named error and decides.
+//
+// A GetNamespace that fails aborts the run too. A namespace bifrost cannot
+// read is not evidence that it is safe to build into — the same reading the
+// expiry sweep applies to its own re-read — and proceeding on an unknown is
+// precisely the bug being fixed here.
+func (o *Orchestrator) refuseTerminating(ctx context.Context, ns string) error {
+	existing, found, err := o.Kube.GetNamespace(ctx, ns)
+	if err != nil {
+		return fmt.Errorf("preview: Up: check namespace %s: %w", ns, err)
+	}
+	// Absent is the ordinary recreate-after-teardown path once the delete has
+	// actually finished: nothing to refuse, and EnsureNamespace below creates
+	// it fresh.
+	if found && existing.Phase == "Terminating" {
+		return fmt.Errorf("preview: Up: namespace %s is still Terminating: %w", ns, ErrTerminating)
+	}
+	return nil
+}
+
+// The namespace-annotation keys that are both written here and read back
+// elsewhere in this package (by the expiry sweep and the auto-update
+// watcher) are named, so the writers and the readers cannot drift apart. The
+// rest of the bifrost/* family (error/step/step-since) is written here and
+// read only outside this package, so those stay literals at their single
+// point of use.
 const (
 	phaseAnnotationKey     = "bifrost/phase"
 	expiresAtAnnotationKey = "bifrost/expires-at"
+	branchAnnotationKey    = "bifrost/branch"
+	appsAnnotationKey      = "bifrost/apps"
+	// sourceSHAsAnnotationKey records the commit each member was deployed
+	// from; autoUpdateAnnotationKey ("true" | "") opts the preview into
+	// following its branch. Both are read by the auto-update watcher — see
+	// autoupdate.go.
+	sourceSHAsAnnotationKey = "bifrost/source-shas"
+	autoUpdateAnnotationKey = "bifrost/auto-update"
 )
 
-// expiresAtAnnotation renders ttl as an absolute RFC3339 instant, or "" for
-// no expiry. Absolute rather than a duration so the reaper never has to know
-// when the preview was created, and "" rather than an omitted key because
-// EnsureNamespace merges: a re-run without --ttl must drop a previous
-// expiry, exactly as it drops the previous run's error and step above.
-func expiresAtAnnotation(ttl time.Duration) string {
-	if ttl <= 0 {
+// expiresAtAnnotation renders expiresAt as RFC3339, or "" for the zero time
+// (no expiry). Absolute rather than a duration so the reaper never has to
+// know when the preview was created — and so a re-run can carry an existing
+// expiry through unchanged instead of extending it (see UpOptions). "" rather
+// than an omitted key because EnsureNamespace merges: a re-run without a ttl
+// must drop a previous expiry, exactly as it drops the previous run's error
+// and step above.
+func expiresAtAnnotation(expiresAt time.Time) string {
+	if expiresAt.IsZero() {
 		return ""
 	}
-	return time.Now().UTC().Add(ttl).Format(time.RFC3339)
+	return expiresAt.UTC().Format(time.RFC3339)
+}
+
+// autoUpdateAnnotation renders the opt-in as "true" or "" — never an omitted
+// key, and never "false", for the same merge reason expiresAtAnnotation
+// returns "": EnsureNamespace merges onto whatever the namespace already
+// carries, so an Up that doesn't ask for auto-update has to overwrite a
+// previous run's "true" rather than leave it standing. "" (not "false")
+// because the watcher's test is `== "true"`, so absent and cleared are one
+// case, and because it matches how bifrost/error, step and expires-at are
+// cleared here.
+func autoUpdateAnnotation(on bool) string {
+	if !on {
+		return ""
+	}
+	return "true"
+}
+
+// sourceSHAsAnnotation renders "<svc>=<sha>" pairs, comma-joined in members
+// order (which is sorted, so the value is stable), in the same style as
+// bifrost/apps. These are FULL commit SHAs as GitHub reports them — not the
+// short SHAs the builds tag images with — because this value's whole purpose
+// is to be compared against a later BranchSHA call by the auto-update
+// watcher, and the two must be the same kind of string.
+//
+// Up writes it in the EnsureNamespace call at the TOP of the run, from what
+// resolveMembers just resolved, rather than at the end from what actually
+// deployed. That ordering is what stops the watcher from hot-looping: a run
+// whose build fails still records the SHA it attempted, so the next tick sees
+// no difference and leaves it alone until someone pushes a new commit. See
+// PollAutoUpdates.
+func sourceSHAsAnnotation(members []string, shas map[string]string) string {
+	pairs := make([]string, 0, len(members))
+	for _, svc := range members {
+		pairs = append(pairs, svc+"="+shas[svc])
+	}
+	return strings.Join(pairs, ",")
 }
 
 // failAnnotateTimeout and stepAnnotateTimeout bound fail's and step's
@@ -363,20 +543,28 @@ func (o *Orchestrator) step(ctx context.Context, ns, text string) {
 // have branch pushed to their repo: ErrNoBranch means "not a member", any
 // other error aborts the whole run (we can't tell membership, so we can't
 // safely proceed).
-func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]string, error) {
+//
+// It returns each member's full commit SHA alongside the membership itself —
+// the same BranchSHA call answers both questions, and the SHA is what Up
+// records as bifrost/source-shas for the auto-update watcher to compare
+// against. Keyed by service (not repo), since that's how every other
+// per-member map in this package is keyed and what the annotation names.
+func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]string, map[string]string, error) {
 	var members []string
+	shas := map[string]string{}
 	for _, svc := range o.Registry.Names() {
-		_, err := o.GitHub.BranchSHA(ctx, o.Fleet.RepoFor(svc), branch)
+		sha, err := o.GitHub.BranchSHA(ctx, o.Fleet.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
 			continue
 		case err != nil:
-			return nil, fmt.Errorf("checking branch for %s: %w", svc, err)
+			return nil, nil, fmt.Errorf("checking branch for %s: %w", svc, err)
 		default:
 			members = append(members, svc)
+			shas[svc] = sha
 		}
 	}
-	return members, nil
+	return members, shas, nil
 }
 
 // buildMembers runs (and awaits) each member's preview build trigger,

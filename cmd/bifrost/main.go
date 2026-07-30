@@ -34,6 +34,15 @@ import (
 // nothing (most previews carry no expiry at all).
 const previewReapInterval = time.Hour
 
+// autoUpdateInterval is how often bifrost checks whether an opted-in
+// preview's branch has new commits. Two minutes because this deadline is the
+// opposite of the reaper's: the whole point is that a push turns into a
+// running preview without anyone asking, and an hour of that would be worse
+// than doing it by hand. It stays cheap because it costs one GitHub
+// BranchSHA call per member of each preview that opted in — nothing at all
+// for the previews (i.e. most of them) that didn't.
+const autoUpdateInterval = 2 * time.Minute
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -212,10 +221,16 @@ func main() {
 	mux.Handle("GET /apps", requireAuth(http.HandlerFunc(webH.Apps)))
 	mux.Handle("GET /jobs", requireAuth(http.HandlerFunc(webH.Jobs)))
 	mux.Handle("GET /previews", requireAuth(http.HandlerFunc(webH.Previews)))
+	// The per-preview detail page. Session auth (requireAuth), NOT the
+	// bearer-tolerant requirePreviewAuth the /api/previews endpoints use: this
+	// is a dashboard page reached by clicking a row, and the CLI has the JSON
+	// API for the same data.
+	mux.Handle("GET /previews/{tag}", requireAuth(http.HandlerFunc(webH.Preview)))
 	mux.Handle("GET /partial/overview", requireAuth(http.HandlerFunc(webH.OverviewFragment)))
 	mux.Handle("GET /partial/apps", requireAuth(http.HandlerFunc(webH.AppsFragment)))
 	mux.Handle("GET /partial/jobs", requireAuth(http.HandlerFunc(webH.JobsFragment)))
 	mux.Handle("GET /partial/previews", requireAuth(http.HandlerFunc(webH.PreviewsFragment)))
+	mux.Handle("GET /partial/previews/{tag}", requireAuth(http.HandlerFunc(webH.PreviewFragment)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 	mux.Handle("POST /services/{name}/rollback", requireAuth(http.HandlerFunc(webH.Rollback)))
@@ -247,8 +262,15 @@ func main() {
 	// replica would double-fire it — harmless, since teardown is idempotent
 	// and both would go through the same busy set — but nothing here elects a
 	// leader, so that is an observation, not a guarantee.
+	//
+	// The auto-update watcher rides alongside it on the same gate and the
+	// same ctx, for the same reasons: without an orchestrator there is no Up
+	// to re-run, and a SIGTERM should stop the loop with the server. It is a
+	// separate goroutine rather than another pass inside the sweep because
+	// the two run at wildly different cadences (two minutes vs. an hour).
 	if orch != nil {
 		go orch.RunReaper(ctx, previewReapInterval)
+		go orch.RunAutoUpdates(ctx, autoUpdateInterval)
 	}
 
 	errCh := make(chan error, 1)

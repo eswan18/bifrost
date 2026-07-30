@@ -12,14 +12,21 @@ import (
 	"github.com/eswan18/bifrost/internal/preview"
 )
 
-// orchestration is the subset of *preview.Orchestrator the mutating preview
-// endpoints need. It exists so handler tests can supply a trivial fake
-// (Up/Down/Busy) rather than standing up a real Orchestrator, which needs
-// five real clients (kube, GitHub, Neon, Cloud Build) to even construct.
+// orchestration is the subset of *preview.Orchestrator the preview endpoints
+// need. It exists so handler tests can supply a trivial fake rather than
+// standing up a real Orchestrator, which needs five real clients (kube,
+// GitHub, Neon, Cloud Build) to even construct.
+//
+// Up/Down/Busy are what the mutating endpoints in this file use. BusyTags is
+// for the READ path (previews.go's assemblePreviews), which needs the whole
+// claimed set rather than a yes/no about a tag it already knows: a tag can be
+// claimed while no namespace exists for it, and that record has to come from
+// somewhere.
 type orchestration interface {
-	Up(ctx context.Context, branch string, ttl time.Duration) error
+	Up(ctx context.Context, branch string, opts preview.UpOptions) error
 	Down(ctx context.Context, tag string) error
 	Busy(tag string) bool
+	BusyTags() []string
 }
 
 // asyncOrchestrationTimeout bounds the detached goroutine that actually runs
@@ -43,9 +50,13 @@ const maxPreviewTTL = 30 * 24 * time.Hour
 // createPreviewRequest is POST /api/previews's JSON body. TTL is an optional
 // Go duration string ("8h", "90m"); absent or empty means the preview never
 // expires, which is the default by design (see the plan's constraints).
+// AutoUpdate opts the preview into following its branch — absent means false,
+// and a re-POST without it turns auto-update back off, exactly as a re-POST
+// without a ttl clears the expiry.
 type createPreviewRequest struct {
-	Branch string `json:"branch"`
-	TTL    string `json:"ttl,omitempty"`
+	Branch     string `json:"branch"`
+	TTL        string `json:"ttl,omitempty"`
+	AutoUpdate bool   `json:"autoUpdate,omitempty"`
 }
 
 // CreatePreviewJSON serves POST /api/previews. It validates just enough to
@@ -94,6 +105,14 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 	// Rejected here, synchronously, rather than clamped or deferred to Up: a
 	// caller who mistyped their TTL should learn about it from the 400, not
 	// from a preview that vanishes (or doesn't) hours later.
+	//
+	// Turning the validated duration into the absolute instant Up records is
+	// this handler's job too, and deliberately so: Up takes an instant
+	// because the auto-update watcher re-runs it and must carry an existing
+	// expiry through UNCHANGED (a duration would be recomputed from "now" on
+	// every re-run, so a preview that keeps getting commits would keep
+	// renewing itself and never expire). Here is where a user-supplied
+	// relative ttl enters the system, so here is where it stops being one.
 	var ttl time.Duration
 	if s := strings.TrimSpace(req.TTL); s != "" {
 		d, err := time.ParseDuration(s)
@@ -115,6 +134,12 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusConflict, "preview "+tag+" is busy")
 		return
 	}
+	// Zero (no expiry) unless a ttl was given, since UpOptions.ExpiresAt's
+	// zero value is what "never expires" means all the way down.
+	opts := preview.UpOptions{AutoUpdate: req.AutoUpdate}
+	if ttl > 0 {
+		opts.ExpiresAt = time.Now().UTC().Add(ttl)
+	}
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), asyncOrchestrationTimeout)
@@ -123,7 +148,7 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 		// against a concurrent POST for the same tag (see the Busy(tag)
 		// pre-check note above) — that's a no-op loser, not a real failure,
 		// but it's still logged rather than silently discarded.
-		if err := h.Orch.Up(ctx, branch, ttl); err != nil {
+		if err := h.Orch.Up(ctx, branch, opts); err != nil {
 			slog.Error("preview create failed", "tag", tag, "branch", branch, "err", err)
 			return
 		}

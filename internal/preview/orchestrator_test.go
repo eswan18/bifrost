@@ -32,11 +32,21 @@ type fakeGitHub struct {
 	branchErr map[string]error
 	k8sFiles  map[string]map[string][]byte
 	fetchErr  map[string]error
+	// shas overrides what BranchSHA reports for a member repo; anything
+	// unset reports defaultBranchSHA. This is how an auto-update test moves
+	// a branch forward — the whole feature is a comparison against this
+	// value, so a fake that always answered the same thing would make every
+	// one of those tests inert.
+	shas map[string]string
 
 	// hook, if set, runs at the top of every BranchSHA call — used by the
 	// busy-mutex test to pause an in-flight Up long enough to observe it.
 	hook func(repo string)
 }
+
+// defaultBranchSHA is what a member repo's branch points at unless a test
+// says otherwise.
+const defaultBranchSHA = "deadbeef0123456789"
 
 func (f *fakeGitHub) BranchSHA(_ context.Context, repo, _ string) (string, error) {
 	if f.hook != nil {
@@ -46,7 +56,10 @@ func (f *fakeGitHub) BranchSHA(_ context.Context, repo, _ string) (string, error
 		return "", err
 	}
 	if f.members[repo] {
-		return "deadbeef0123456789", nil
+		if sha, ok := f.shas[repo]; ok {
+			return sha, nil
+		}
+		return defaultBranchSHA, nil
 	}
 	return "", github.ErrNoBranch
 }
@@ -175,15 +188,35 @@ type fakeGCB struct {
 	getErr    map[string]error
 	statuses  map[string][]gcb.BuildStatus
 	callCount map[string]int
+	// runCalls counts RunTrigger calls per trigger — the witness that an Up
+	// really started a build. The auto-update tests need it because a run
+	// that fails in the build stage leaves no other trace an assertion can
+	// count (nothing is applied, and the annotations a failed retry writes
+	// are identical to the ones already there).
+	runCalls map[string]int
 }
 
 func (f *fakeGCB) LatestBuilds(context.Context) (map[string]gcb.BuildStatus, error) { return nil, nil }
 
 func (f *fakeGCB) RunTrigger(_ context.Context, triggerID, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.runCalls == nil {
+		f.runCalls = map[string]int{}
+	}
+	f.runCalls[triggerID]++
 	if err, ok := f.runErr[triggerID]; ok {
 		return "", err
 	}
 	return triggerID, nil
+}
+
+// runCallsFor reads a trigger's RunTrigger count under the fake's lock —
+// safe to call while a background watcher goroutine is running.
+func (f *fakeGCB) runCallsFor(triggerID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runCalls[triggerID]
 }
 
 func (f *fakeGCB) GetBuild(_ context.Context, buildID string) (gcb.BuildStatus, error) {
@@ -287,6 +320,14 @@ type fakeKube struct {
 	// sweep's re-read, whose failure must skip that preview rather than let it
 	// be torn down on a stale snapshot.
 	getErrByNS map[string]error
+	// onEnsureNamespace, if set, runs at the top of every EnsureNamespace call
+	// (before the namespace is created/merged). It is how a test reaches a
+	// LATER stage of Up with a run context that has since died: cancelling
+	// before Up is called no longer gets there, because the still-Terminating
+	// pre-check reads the namespace first and a dead context fails that read.
+	// Like onDeleteNamespace it runs with f.mu ALREADY HELD, so it must not
+	// call back into the fake's own locking methods.
+	onEnsureNamespace func(name string)
 	// onDeleteNamespace, if set, runs at the top of every DeleteNamespace call
 	// (before the delete itself), and is how a sweep test moves the cluster
 	// underneath an in-progress sweep: renewing a later namespace's expiry, or
@@ -317,6 +358,9 @@ func newFakeKube() *fakeKube {
 func (f *fakeKube) EnsureNamespace(_ context.Context, name string, labels, annotations map[string]string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onEnsureNamespace != nil {
+		f.onEnsureNamespace(name)
+	}
 	if f.ensureErr != nil {
 		return f.ensureErr
 	}
@@ -373,6 +417,27 @@ func (f *fakeKube) annotations(name string) map[string]string {
 		return map[string]string{}
 	}
 	return copyStringMap(ns.annotations)
+}
+
+// appliesFor counts the ApplyObjects calls that targeted ns, under the fake's
+// lock. It is the witness that an Up really ran (or really didn't) for ONE
+// preview: the auto-update tests run several previews through the same fakes,
+// where a global call count can't tell whose work it is, and the namespace
+// annotations can't distinguish "not re-run" from "re-run and wrote the same
+// values back".
+func (f *fakeKube) appliesFor(ns string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, objs := range f.applyCalls {
+		for _, o := range objs {
+			if o.GetNamespace() == ns {
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
 
 // hasNamespace reports whether name still exists, under the fake's lock —
@@ -665,7 +730,7 @@ func newTwoMemberDeps(t *testing.T) *testDeps {
 func TestUpHappyPathTwoMembers(t *testing.T) {
 	d := newTwoMemberDeps(t)
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 
@@ -782,10 +847,10 @@ func anyObjectHasImage(calls [][]*unstructured.Unstructured, imageFragment strin
 func TestUpIsIdempotentOnRerun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	ctx := context.Background()
-	if err := d.orch.Up(ctx, "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("first Up failed: %v", err)
 	}
-	if err := d.orch.Up(ctx, "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("second Up (rerun) failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -799,32 +864,100 @@ func TestUpIsIdempotentOnRerun(t *testing.T) {
 
 // ---- Up: expiry ---------------------------------------------------------------
 
-func TestUpWithTTLRecordsAnAbsoluteExpiry(t *testing.T) {
+// TestUpRecordsExpiresAtVerBATIM pins the half of UpOptions that stops the
+// auto-updater from renewing an expiry it was only supposed to preserve: the
+// instant the caller passes is what lands in bifrost/expires-at, unchanged.
+// Up must not re-derive it from a duration and "now" — an assertion that
+// merely checked "roughly 8h from now" would pass for a recomputing Up, which
+// is exactly the bug.
+func TestUpRecordsExpiresAtVerbatim(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	before := time.Now().UTC()
-	if err := d.orch.Up(context.Background(), "hae-cadence", 8*time.Hour); err != nil {
+	// Deliberately NOT now+8h: a fixed instant unrelated to the wall clock
+	// can only match if Up wrote through what it was given.
+	want := time.Date(2031, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{ExpiresAt: want}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/expires-at"]
-	parsed, err := time.Parse(time.RFC3339, got)
-	if err != nil {
-		t.Fatalf("bifrost/expires-at = %q, not RFC3339: %v", got, err)
-	}
-	if delta := parsed.Sub(before.Add(8 * time.Hour)); delta < -time.Minute || delta > time.Minute {
-		t.Errorf("expiry %v is not ~8h after creation", parsed)
+	if got != want.Format(time.RFC3339) {
+		t.Errorf("bifrost/expires-at = %q, want it recorded verbatim as %q", got, want.Format(time.RFC3339))
 	}
 }
 
-func TestUpWithoutTTLClearsAnyPriorExpiry(t *testing.T) {
+func TestUpWithoutExpiryClearsAnyPriorExpiry(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	if err := d.orch.Up(context.Background(), "hae-cadence", 8*time.Hour); err != nil {
+	expiry := time.Now().UTC().Add(8 * time.Hour)
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{ExpiresAt: expiry}); err != nil {
 		t.Fatalf("first Up failed: %v", err)
 	}
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("second Up failed: %v", err)
 	}
 	if got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/expires-at"]; got != "" {
-		t.Errorf("bifrost/expires-at = %q after a no-TTL re-run, want cleared", got)
+		t.Errorf("bifrost/expires-at = %q after a no-expiry re-run, want cleared", got)
+	}
+}
+
+// ---- Up: auto-update opt-in ---------------------------------------------------
+
+// TestUpRecordsAutoUpdateOptIn covers both directions of the annotation in
+// one place, since the second is only interesting relative to the first: an
+// Up that asks for auto-update writes "true", and an Up that doesn't CLEARS
+// it rather than inheriting the previous run's value through the merge.
+func TestUpRecordsAutoUpdateOptIn(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ns := previewNamespace("hae-cadence")
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{AutoUpdate: true}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	if got := d.kube.annotations(ns)["bifrost/auto-update"]; got != "true" {
+		t.Fatalf("bifrost/auto-update = %q, want true", got)
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("second Up failed: %v", err)
+	}
+	if got := d.kube.annotations(ns)["bifrost/auto-update"]; got != "" {
+		t.Errorf("bifrost/auto-update = %q after a re-run that didn't ask for it, want cleared", got)
+	}
+}
+
+// TestUpRecordsSourceSHAs pins the annotation the watcher compares against:
+// full SHAs (what BranchSHA returns), one service=sha pair per member, in
+// bifrost/apps order, and no entry for a non-member.
+func TestUpRecordsSourceSHAs(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	// fakeGitHub returns this SHA for every repo that has the branch; the
+	// builds' own short SHAs (trig-api-sha) must NOT appear here.
+	want := "footstrike-api=deadbeef0123456789,footstrike-dashboard=deadbeef0123456789"
+	if got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/source-shas"]; got != want {
+		t.Errorf("bifrost/source-shas = %q, want %q", got, want)
+	}
+}
+
+// TestUpRecordsSourceSHAsBeforeBuilding is the anti-hot-loop property stated
+// as a property of Up alone: the SHA a run attempted is on the namespace even
+// when that run FAILS, because it is written in the same EnsureNamespace call
+// as the phase, before any build runs. Without it the auto-update watcher
+// would find the branch still ahead of the (never-recorded) deployed SHA and
+// re-run the same doomed build every two minutes forever.
+func TestUpRecordsSourceSHAsBeforeBuilding(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{AutoUpdate: true}); err == nil {
+		t.Fatal("Up succeeded, want the scripted build failure")
+	}
+	ann := d.kube.annotations(previewNamespace("hae-cadence"))
+	if ann["bifrost/phase"] != "failed" {
+		t.Fatalf("bifrost/phase = %q, want failed", ann["bifrost/phase"])
+	}
+	if got := ann["bifrost/source-shas"]; !strings.Contains(got, "footstrike-api=deadbeef0123456789") {
+		t.Errorf("bifrost/source-shas = %q, want the attempted SHA recorded despite the failure", got)
 	}
 }
 
@@ -833,7 +966,7 @@ func TestUpWithoutTTLClearsAnyPriorExpiry(t *testing.T) {
 func TestUpRejectsEmptyBranch(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	for _, branch := range []string{"", "   "} {
-		if err := d.orch.Up(context.Background(), branch, 0); err == nil {
+		if err := d.orch.Up(context.Background(), branch, UpOptions{}); err == nil {
 			t.Errorf("Up(%q) = nil, want an error", branch)
 		}
 	}
@@ -846,7 +979,7 @@ func TestUpRejectsBranchWithNoUsableTag(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	// TagForBranch strips every character outside [a-z0-9-]; an all-emoji
 	// (or similarly all-invalid) branch name slugs to "".
-	if err := d.orch.Up(context.Background(), "!!!", 0); err == nil {
+	if err := d.orch.Up(context.Background(), "!!!", UpOptions{}); err == nil {
 		t.Fatal("expected an error for a branch that slugs to an empty tag, got nil")
 	}
 }
@@ -855,7 +988,7 @@ func TestUpNeonCreateBranchFailureFailsTheRun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.neon.createErr = map[string]error{"aged-river-81935268": errors.New("neon: quota exceeded")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error when Neon branch creation fails, got nil")
 	}
@@ -882,7 +1015,7 @@ func TestUpFinalReadyAnnotateFailureIsReturned(t *testing.T) {
 	// still isolates the final-ready branch specifically.
 	kc.annotateErr = errors.New("annotate: etcd unavailable")
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error when the final ready AnnotateNamespace call fails, got nil")
 	}
@@ -907,9 +1040,15 @@ func TestUpFailDetachesAnnotateFromADeadRunContext(t *testing.T) {
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // the run context is already dead before the failure is even reached
+	defer cancel()
+	// The run context dies the instant the namespace exists — i.e. after the
+	// still-Terminating pre-check's read (which a dead context would fail,
+	// aborting the run before any of this) and before the build failure this
+	// test is actually about. What's under test is that fail()'s compensating
+	// annotate write lands anyway, on a context detached from this one.
+	d.kube.onEnsureNamespace = func(string) { cancel() }
 
-	err := d.orch.Up(ctx, "hae-cadence", 0)
+	err := d.orch.Up(ctx, "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -935,7 +1074,7 @@ func TestUpBuildFailureSetsPhaseFailed(t *testing.T) {
 		"trig-api": {{Status: "FAILURE"}},
 	}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to fail when a build fails, got nil")
 	}
@@ -977,7 +1116,7 @@ func TestUpBuildPollRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := d.orch.Up(ctx, "hae-cadence", 0)
+	err := d.orch.Up(ctx, "hae-cadence", UpOptions{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1008,7 +1147,7 @@ func TestUpPollsMultipleTimesBeforeSucceeding(t *testing.T) {
 		"trig-api": {{Status: "QUEUED"}, {Status: "WORKING"}, {Status: "SUCCESS", SHA: "realsha7"}},
 	}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	if !anyObjectHasImage(d.kube.applyCalls, "footstrike-api:preview-realsha7") {
@@ -1028,7 +1167,7 @@ func TestUpDashboardWithoutClientIDErrors(t *testing.T) {
 	// missing PreviewOAuthClientID.
 	o := &Orchestrator{Cfg: cfg, Kube: kc, GitHub: gh, Neon: &fakeNeon{}, Builds: &fakeGCB{}, Registry: testRegistry(t), Fleet: testFleet(t)}
 
-	err := o.Up(context.Background(), "dash-only-branch", 0)
+	err := o.Up(context.Background(), "dash-only-branch", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error for a dashboard preview with no PreviewOAuthClientID, got nil")
 	}
@@ -1044,7 +1183,7 @@ func TestUpNoMembersErrors(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.members = map[string]bool{} // no repo has this branch
 
-	err := d.orch.Up(context.Background(), "nonexistent-branch", 0)
+	err := d.orch.Up(context.Background(), "nonexistent-branch", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error when no service has the branch, got nil")
 	}
@@ -1057,7 +1196,7 @@ func TestUpAbortsOnNonNotFoundMembershipError(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.branchErr = map[string]error{"footstrike-api": errors.New("github: rate limited")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to abort on a non-ErrNoBranch membership error, got nil")
 	}
@@ -1080,7 +1219,7 @@ func TestUpNeonSecretNeverLeaksIntoErrorAnnotation(t *testing.T) {
 	d.neon.connURI = map[string]string{"aged-river-81935268": secretURI}
 	d.kube.copySecretErr = errors.New("secret copy: connection refused")
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to fail when CopySecret fails, got nil")
 	}
@@ -1098,7 +1237,7 @@ func TestUpFailureJoinsAnnotateErrorRatherThanSwallowingIt(t *testing.T) {
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 	d.kube.annotateErr = errors.New("annotate: etcd unavailable")
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -1114,7 +1253,7 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.github.fetchErr = map[string]error{"footstrike-api": errors.New("github: tarball 500")}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error when fetching a member's k8s/ tree fails, got nil")
 	}
@@ -1128,6 +1267,122 @@ func TestUpRenderStageFetchK8sFailureFailsTheRun(t *testing.T) {
 	if len(d.kube.applyCalls) != 0 {
 		t.Errorf("ApplyObjects called %d times, want 0", len(d.kube.applyCalls))
 	}
+}
+
+// ---- Up: a namespace still terminating ----------------------------------------
+
+// assertNothingWasStarted asserts that a run bailed out before it did any of
+// the expensive, externally-visible work: no build triggered, no Neon branch
+// created, no secret copied, nothing applied — and that the namespace was
+// never even annotated, which is the witness that EnsureNamespace itself
+// wasn't reached.
+//
+// The build assertions are the point of the whole fix, not garnish. A run
+// against a namespace Kubernetes is deleting cannot possibly succeed, and it
+// used to discover that only at copy-secrets, minutes and two Cloud Builds
+// later. Asserting only that Up returned an error would pass just as happily
+// against that version.
+func (d *testDeps) assertNothingWasStarted(t *testing.T) {
+	t.Helper()
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if n := d.gcb.runCallsFor(trigger); n != 0 {
+			t.Errorf("RunTrigger(%s) called %d times, want 0 — the run must fail before any build starts", trigger, n)
+		}
+	}
+	if d.neon.hasBranch("aged-river-81935268", previewBranchName("hae-cadence")) {
+		t.Error("a Neon branch was created, want none — the run must fail before it branches a database")
+	}
+	if n := len(d.kube.copySecretCalls); n != 0 {
+		t.Errorf("CopySecret called %d times, want 0", n)
+	}
+	if n := len(d.kube.applyCalls); n != 0 {
+		t.Errorf("ApplyObjects called %d times, want 0", n)
+	}
+	if n := len(d.kube.annotationHistory); n != 0 {
+		t.Errorf("namespace was annotated %d times, want 0 — EnsureNamespace must never be reached", n)
+	}
+}
+
+// TestUpRefusesATerminatingNamespace is the production bug: the owner tore a
+// preview down and immediately recreated it, and Up ran for two and a half
+// minutes against a namespace that no longer existed — completing both Cloud
+// Builds and branching Neon — before dying at copy-secrets with `namespaces
+// "preview-training-plans" not found`. Kubernetes accepts an annotation
+// update on a Terminating namespace, so EnsureNamespace SUCCEEDS and there is
+// no error for Up to catch.
+func TestUpRefusesATerminatingNamespace(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	// A namespace mid-delete: still present, still carrying the last run's
+	// annotations, but on its way out.
+	d.kube.namespaces["preview-hae-cadence"] = &fakeNamespace{
+		labels:      map[string]string{"bifrost/preview": "true"},
+		annotations: map[string]string{"bifrost/phase": "ready"},
+		phase:       "Terminating",
+	}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if !errors.Is(err, ErrTerminating) {
+		t.Fatalf("Up = %v, want ErrTerminating so the API layer and CLI can report it precisely", err)
+	}
+	if !strings.Contains(err.Error(), "preview-hae-cadence") {
+		t.Errorf("error = %q, want it to name the namespace", err.Error())
+	}
+	d.assertNothingWasStarted(t)
+
+	// The dying namespace's own annotations are left exactly as they were:
+	// a refused run must not scribble bifrost/phase=creating onto a preview
+	// that is being deleted.
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want the terminating namespace's annotations untouched", got)
+	}
+}
+
+// TestUpCreatesAFreshNamespaceOnceTheOldOneIsGone is the other half of the
+// same flow, and the one the refusal must not break: recreate-after-teardown
+// is the ordinary path, and once Kubernetes has actually finished the delete
+// there is nothing left to refuse. A pre-check that treated "absent" as
+// anything other than "go ahead" would make every second `ib preview up`
+// fail forever.
+func TestUpCreatesAFreshNamespaceOnceTheOldOneIsGone(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if _, present := d.kube.namespaces["preview-hae-cadence"]; present {
+		t.Fatal("fixture already has the namespace; this test is about its total absence")
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up over a fully-absent namespace failed: %v", err)
+	}
+	if got := d.kube.annotations("preview-hae-cadence")["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready — the namespace must be created fresh and run through", got)
+	}
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if n := d.gcb.runCallsFor(trigger); n != 1 {
+			t.Errorf("RunTrigger(%s) called %d times, want 1", trigger, n)
+		}
+	}
+}
+
+// TestUpAbortsWhenTheNamespaceCannotBeRead covers the pre-check's own failure
+// mode. A namespace bifrost can't read is not evidence that it is safe to
+// build into — the same reading PurgeExpired applies to its re-read — and
+// proceeding on an unknown is exactly the bug the pre-check exists to stop.
+// It is deliberately NOT ErrTerminating: nothing was determined, so nothing
+// should be claimed.
+func TestUpAbortsWhenTheNamespaceCannotBeRead(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.kube.getErrByNS = map[string]error{"preview-hae-cadence": errors.New("apiserver: etcdserver: request timed out")}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("Up = nil, want an error when the namespace read fails")
+	}
+	if errors.Is(err, ErrTerminating) {
+		t.Errorf("error = %v, want a plain read failure rather than a terminating verdict", err)
+	}
+	if !strings.Contains(err.Error(), "preview-hae-cadence") {
+		t.Errorf("error = %q, want it to name the namespace", err.Error())
+	}
+	d.assertNothingWasStarted(t)
 }
 
 // ---- Up: waiting for pods -----------------------------------------------------
@@ -1165,7 +1420,7 @@ func TestUpWaitsForPodsBeforeMarkingReady(t *testing.T) {
 	}
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {migrating, migrating, converged}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
@@ -1218,7 +1473,7 @@ func TestUpFailsWhenMigrateInitContainerCrashLoops(t *testing.T) {
 	}}}
 
 	start := time.Now()
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1266,7 +1521,7 @@ func TestUpTimesOutWhenPodsNeverBecomeReady(t *testing.T) {
 		readyPod("footstrike-dashboard", dashImage),
 	}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to fail when a member's pods never become ready, got nil")
 	}
@@ -1305,7 +1560,7 @@ func TestUpTimesOutWhenAMemberHasNoPods(t *testing.T) {
 	// footstrike-dashboard's pods show up; footstrike-api's never do.
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {{readyPod("footstrike-dashboard", dashImage)}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to fail when a member never gets any pods, got nil")
 	}
@@ -1327,7 +1582,7 @@ func TestUpPodWaitRetriesListFailures(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.kube.listPodsErr = errors.New("pods list: connection reset by peer")
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected Up to fail when pods can never be listed, got nil")
 	}
@@ -1356,7 +1611,7 @@ func TestUpPodWaitRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := d.orch.Up(ctx, "hae-cadence", 0)
+	err := d.orch.Up(ctx, "hae-cadence", UpOptions{})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -1385,7 +1640,7 @@ func TestDownWorksAfterAReadinessFailure(t *testing.T) {
 		initializingPod("footstrike-api", apiImage, kube.ContainerInfo{Name: "migrate", WaitingReason: "CrashLoopBackOff"}),
 	}}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err == nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err == nil {
 		t.Fatal("expected the Up to fail its readiness wait, got nil")
 	}
 	if len(d.neon.branches["aged-river-81935268"]) != 1 {
@@ -1543,7 +1798,7 @@ func TestUpToleratesThePreviousRunsCrashLoopingPod(t *testing.T) {
 		readyPod("footstrike-dashboard", dashImage)}
 	d.kube.podScript = map[string][][]kube.PodInfo{ns: {starting, converged}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed on the previous run's leftover pod: %v", err)
 	}
 	if got := d.kube.namespaces[ns].annotations["bifrost/phase"]; got != "ready" {
@@ -1688,7 +1943,7 @@ func TestBusyMutex(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- d.orch.Up(context.Background(), "busy-branch", 0) }()
+	go func() { done <- d.orch.Up(context.Background(), "busy-branch", UpOptions{}) }()
 
 	select {
 	case <-started:
@@ -1699,7 +1954,7 @@ func TestBusyMutex(t *testing.T) {
 	if !d.orch.Busy(tag) {
 		t.Error("Busy(tag) = false while Up is in flight, want true")
 	}
-	if err := d.orch.Up(context.Background(), "busy-branch", 0); !errors.Is(err, ErrBusy) {
+	if err := d.orch.Up(context.Background(), "busy-branch", UpOptions{}); !errors.Is(err, ErrBusy) {
 		t.Errorf("concurrent Up = %v, want ErrBusy", err)
 	}
 	if err := d.orch.Down(context.Background(), tag); !errors.Is(err, ErrBusy) {
@@ -1744,7 +1999,7 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 func TestUpReportsStepsInOrder(t *testing.T) {
 	d := newTwoMemberDeps(t)
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 
@@ -1783,7 +2038,7 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 // time locally, per the plan) rather than, say, a duration string.
 func TestUpStepSinceIsAnRFC3339Timestamp(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1812,7 +2067,7 @@ func TestUpStepSinceIsAnRFC3339Timestamp(t *testing.T) {
 // carry no step text, so a finished preview doesn't display a stale one.
 func TestUpReadyClearsStep(t *testing.T) {
 	d := newTwoMemberDeps(t)
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("Up failed: %v", err)
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1829,7 +2084,7 @@ func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err == nil {
 		t.Fatal("expected an error when a build fails, got nil")
 	}
@@ -1862,7 +2117,7 @@ func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
 
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err == nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err == nil {
 		t.Fatal("expected the first Up to fail (its build fails), got nil")
 	}
 	ns := d.kube.namespaces["preview-hae-cadence"]
@@ -1875,7 +2130,7 @@ func TestUpRetryDoesNotInheritPreviousRunsStepOrError(t *testing.T) {
 	// Retry: same branch, builds now succeed (an unconfigured build in
 	// fakeGCB succeeds immediately).
 	d.gcb.statuses = nil
-	if err := d.orch.Up(context.Background(), "hae-cadence", 0); err != nil {
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
 		t.Fatalf("retry Up failed: %v", err)
 	}
 	if len(d.kube.annotationHistory) <= firstRunWrites {
@@ -1909,7 +2164,7 @@ func TestUpStepAnnotationFailureDoesNotFailTheRun(t *testing.T) {
 	kc := d.kube
 	kc.annotateStepErr = errors.New("annotate: connection reset")
 
-	err := d.orch.Up(context.Background(), "hae-cadence", 0)
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
 	if err != nil {
 		t.Fatalf("Up failed despite step-annotation errors being best-effort: %v", err)
 	}

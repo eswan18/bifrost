@@ -14,9 +14,35 @@
      The AGE cell additionally folds in .ExpiresAt (via preview-expiry)
      rather than adding a seventh grid column — jobs-grid's CSS is a fixed
      six-column layout shared with jobs.html. A preview with no TTL (the
-     common case) is unaffected: preview-expiry renders nothing for it. */}}
-{{define "tab-body"}}
+     common case) is unaffected: preview-expiry renders nothing for it.
+
+     The create and teardown controls added on top of that read-only view
+     obey the same six-column rule: the per-row teardown trigger is folded
+     INTO the PREVIEW cell (preview-teardown) rather than given a seventh
+     column, and every modal is rendered outside the grid rows entirely, at
+     the .previews container level, where position:fixed makes its placement
+     in the document purely a readability question. */}}
+{{/* Two pages share this template set, and so share the preview-* blocks
+     below outright: the Previews TAB (previews-list) and one preview's DETAIL
+     page (preview-detail). LoadTemplates parses each file as its own base.html
+     child, so a detail page in a file of its own could not reach
+     preview-phase/preview-expiry at all and would need its own subtly
+     different copies of them — exactly what this dispatch avoids. pageVM's
+     Preview is nil on the tab and non-nil on the detail page. */}}
+{{define "tab-body"}}{{if .Preview}}{{template "preview-detail" .}}{{else}}{{template "previews-list" .}}{{end}}{{end}}
+
+{{define "previews-list"}}
 <div class="previews"{{if .AnyActive}} data-active{{end}}>
+
+  {{/* Toolbar row. jobs-filter is borrowed purely as a layout primitive —
+       a flex row with a right-aligned group — since no new CSS is allowed
+       here and it is the only existing class with that shape. */}}
+  <div class="jobs-filter">
+    <span class="c-mut jobs-summary">A preview builds one branch into a namespace, databases and URLs of its own.</span>
+    <span class="filter-right">
+      <a href="#modal-preview-create" class="pill pill-primary">+ New preview</a>
+    </span>
+  </div>
 
   <div class="jobs-desktop">
     <div class="jobs-grid jobs-head">
@@ -24,12 +50,12 @@
     </div>
     {{range .Previews}}
     <div class="jobs-grid jobs-row">
-      <span class="mono w6">{{.Tag}}</span>
-      <span class="mono">{{or .Branch "—"}}</span>
+      <span class="mono w6">{{template "preview-tag-link" .}}{{template "preview-teardown" .}}</span>
+      <span class="mono">{{or .Branch "—"}}{{template "preview-autoupdate" .}}</span>
       <span>{{template "preview-apps" .}}</span>
       {{template "preview-phase" .}}
       <span class="c-mut">{{.Health}}</span>
-      <span class="c-mut" title="{{abstime .CreatedAt}}">{{reltime .CreatedAt}}{{template "preview-expiry" .}}</span>
+      <span class="c-mut"{{if not .CreatedAt.IsZero}} title="{{abstime .CreatedAt}}"{{end}}>{{reltime .CreatedAt}}{{template "preview-expiry" .}}</span>
     </div>
     {{else}}
     <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
@@ -39,17 +65,35 @@
   <div class="jobs-mobile">
     {{range .Previews}}
     <div class="job-card">
-      <div class="job-card-top"><span class="mono w6">{{.Tag}}</span><span class="c-mut">{{.Phase}}</span></div>
-      <div class="c-mut job-card-meta">{{or .Branch "—"}} · {{.Health}} · {{reltime .CreatedAt}}{{template "preview-expiry" .}}</div>
+      <div class="job-card-top"><span class="mono w6">{{template "preview-tag-link" .}}</span><span class="c-mut">{{.Phase}}</span></div>
+      {{/* The age segment carries its own separator (rather than a bare
+           " · " before it) because a synthesized busy record has a zero
+           CreatedAt, for which reltime renders "" — an unconditional
+           separator would leave the card reading "— · unknown · " with
+           nothing after it. Expiry stays outside the "with" so it keeps
+           reading .ExpiresAt; it renders nothing for a zero one. */}}
+      <div class="c-mut job-card-meta">{{or .Branch "—"}}{{template "preview-autoupdate" .}} · {{.Health}}{{with reltime .CreatedAt}} · {{.}}{{end}}{{template "preview-expiry" .}}</div>
       <div class="c-mut job-card-meta">{{template "preview-apps" .}}</div>
       {{if or .Step .Error}}
       <div class="job-card-meta">{{if .Step}}<span class="c-mut">{{.Step}}</span>{{end}}{{if .Error}} <span class="c-red">{{.Error}}</span>{{end}}</div>
+      {{end}}
+      {{/* The phone is the reason bifrost exists, so the mobile card gets a
+           real full-size pill-block target rather than the desktop row's
+           inline ✕. Both open the SAME #modal-preview-down-{tag}, which is
+           rendered once below. The wrapper is emitted only when there is a
+           control to put in it — card-actions:empty would hide an empty one
+           anyway, but only if it held no whitespace text node at all. */}}
+      {{if .Teardownable}}
+      <div class="card-actions"><a href="#modal-preview-down-{{.Tag}}" class="pill-block pill-ghost">Tear down…</a></div>
       {{end}}
     </div>
     {{else}}
     <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
     {{end}}
   </div>
+
+  {{template "preview-create-modal" .}}
+  {{range .Previews}}{{if .Teardownable}}{{template "preview-down-modal" dict "Tag" .Tag "Branch" .Branch "CSRF" $.CSRF}}{{end}}{{end}}
 
 </div>
 {{end}}
@@ -76,3 +120,247 @@
      the same "no new grid column" reasoning preview-apps above follows for
      APPS. */}}
 {{define "preview-expiry"}}{{with expiry .ExpiresAt}} · {{.}}{{end}}{{end}}
+
+{{/* preview-autoupdate marks a preview that follows its branch, folded into
+     the BRANCH cell (and the mobile card's meta line) rather than added as a
+     seventh jobs-grid column — the same fixed-six-column constraint
+     preview-expiry works around, and the branch is what the preview is
+     following, so the marker belongs next to it. Renders nothing at all for
+     the common opted-out preview, separator included, so a row that doesn't
+     auto-update is byte-identical to before this existed. c-mut is the same
+     muted class the rest of this tab already uses; no new CSS. */}}
+{{define "preview-autoupdate"}}{{if .AutoUpdate}} <span class="c-mut" title="auto-updates when new commits land on this branch">· auto</span>{{end}}{{end}}
+
+{{/* preview-tag-link turns a row's tag into the link to that preview's detail
+     page, on both surfaces — the desktop grid's PREVIEW cell and the mobile
+     card's top line. The tag is the row's identity, so it is the anchor;
+     nothing else in the row is.
+
+     It sits INSIDE the existing <span class="mono w6"> rather than replacing
+     it, so the desktop row still renders exactly six top-level grid children
+     (jobs-grid is a fixed six-column layout shared with jobs.html).
+
+     A synthesized busy tag links too, even though it has no namespace and
+     previewByTag 404s for it: the detail page recognizes that case and says
+     the preview is mid-operation. A tag visible in the list that cannot be
+     clicked would be the stranger answer.
+
+     app-name is the existing "this text is a link to a thing" style (weight
+     600, underline on hover); w6 on the parent already supplies the weight,
+     so all it adds here is the affordance. No new CSS. */}}
+{{define "preview-tag-link"}}<a href="/previews/{{.Tag}}" class="app-name">{{.Tag}}</a>{{end}}
+
+{{/* preview-teardown is the desktop row's teardown trigger, folded into the
+     PREVIEW cell next to the tag it acts on — a seventh jobs-grid column is
+     not available (fixed six-column layout, shared with jobs.html), and the
+     tag cell is the row's identity, which is exactly what the control
+     targets. It is a plain :target link, so opening the confirmation needs
+     no JS at all; only the DELETE itself does.
+
+     Nothing is rendered for a record that isn't Teardownable — a synthesized
+     busy record (a claimed tag with no namespace behind it, see
+     internal/web/previews.go's busyRecord) has nothing DELETE could act on,
+     and previewByTag would answer 404. Offering a control that cannot work
+     would be worse than offering none. */}}
+{{define "preview-teardown"}}{{if .Teardownable}} <a href="#modal-preview-down-{{.Tag}}" class="c-faint" title="Tear down {{.Tag}}" aria-label="Tear down {{.Tag}}">✕</a>{{end}}{{end}}
+
+{{/* preview-create-modal is the create form, in the same CSS-only :target
+     modal idiom base.html's promote/rollback confirmations use.
+
+     Unlike those, this is NOT a plain form POST the JS merely upgrades: POST
+     /api/previews reads its CSRF token from the X-CSRF-Token header (see
+     verifyMutationCSRF in internal/web/previews_mutate.go) and takes a JSON
+     body, neither of which an HTML form can produce. base.html's
+     js-preview-create handler intercepts the submit and issues the fetch;
+     the action/method here document the target rather than provide a no-JS
+     fallback, because there cannot be one. The token therefore rides on the
+     submit button as data-csrf (which is what becomes the header) instead of
+     the hidden "csrf" input promote/rollback post as a form value.
+
+     Living inside #tab-body would normally mean the background refresh wipes
+     whatever the user has typed — but that refresh pauses entirely while any
+     #modal-… target is open (modalOpen() in base.html), so the form is only
+     ever swapped when nobody is filling it in.
+
+     No new CSS: filter-select is the only existing text-ish control style,
+     and the modal-note wrappers supply the field spacing modal-row otherwise
+     only gives its buttons. */}}
+{{define "preview-create-modal"}}
+<div id="modal-preview-create" class="modal">
+  <a href="#close" class="modal-backdrop" aria-label="Close"></a>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div class="modal-title">New preview</div>
+      <a href="#close" class="modal-x" aria-label="Close">✕</a>
+    </div>
+    <div class="modal-sub">The branch is built and deployed into a namespace of its own.</div>
+    <form action="/api/previews" method="POST" class="modal-rows js-preview-create">
+      <div class="modal-row">
+        <div class="micro">BRANCH</div>
+        <div class="modal-note"><input type="text" name="branch" class="filter-select mono" size="24" required autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="my-branch" aria-label="Branch"></div>
+        <div class="modal-note">Required. The preview's tag is derived from it.</div>
+      </div>
+      <div class="modal-row">
+        <div class="micro">TTL</div>
+        <div class="modal-note"><input type="text" name="ttl" class="filter-select mono" size="8" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="8h" aria-label="TTL"></div>
+        <div class="modal-note">Optional Go duration — 8h, 90m. Left blank, the preview never expires.</div>
+      </div>
+      <div class="modal-row">
+        <div class="micro">AUTO-UPDATE</div>
+        <div class="modal-note"><label><input type="checkbox" name="autoUpdate"> Re-deploy when new commits land on the branch</label></div>
+      </div>
+      <div class="modal-row">
+        <button type="submit" class="pill pill-primary" data-csrf="{{.CSRF}}">Create preview</button>
+        <div class="modal-note"><span class="c-red js-preview-error"></span></div>
+      </div>
+    </form>
+    <a href="#close" class="modal-cancel">Cancel</a>
+  </div>
+</div>
+{{end}}
+
+{{/* preview-down-modal is one preview's teardown confirmation — the
+     confirmation step both the desktop ✕ and the mobile pill open, rendered
+     once per preview so the two triggers share a single element id.
+
+     It is rendered at the .previews container level, outside both the
+     jobs-grid rows and the mobile cards: a modal nested in a .jobs-grid row
+     would be that row's seventh grid child, and jobs-grid is a fixed
+     six-column layout shared with jobs.html. Being position:fixed, it looks
+     identical wherever it sits in the document.
+
+     The confirm is a <button>, not a form: DELETE /api/previews/{tag} is a
+     method HTML forms cannot issue, and it reads its CSRF token from the
+     X-CSRF-Token header — hence data-csrf here rather than a hidden input.
+     base.html's js-preview-down handler does the fetch. */}}
+{{define "preview-down-modal"}}
+<div id="modal-preview-down-{{.Tag}}" class="modal">
+  <a href="#close" class="modal-backdrop" aria-label="Close"></a>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <div class="modal-title">Tear down {{.Tag}}</div>
+      <a href="#close" class="modal-x" aria-label="Close">✕</a>
+    </div>
+    <div class="modal-sub">Its namespace, database branches and URLs are deleted. This cannot be undone.</div>
+    <div class="modal-rows">
+      <div class="modal-row">
+        <div class="micro">PREVIEW</div>
+        <div class="hash-diff"><span class="to">{{.Tag}}</span></div>
+        <div class="modal-note">built from {{or .Branch "an unrecorded branch"}}</div>
+        <button type="button" class="pill pill-primary js-preview-down" data-tag="{{.Tag}}" data-csrf="{{.CSRF}}">Tear down</button>
+        <div class="modal-note"><span class="c-red js-preview-error"></span></div>
+      </div>
+    </div>
+    <a href="#close" class="modal-cancel">Cancel</a>
+  </div>
+</div>
+{{end}}
+
+{{/* preview-detail is one preview's page: everything the record knows, with
+     its URLs given the room the tab's single APPS cell cannot.
+
+     It animates with no new machinery. base.html's poller reads the fragment
+     URL from data-refresh on <body> (here /partial/previews/{tag}, set by
+     previewPage), swaps the response into #tab-body, and drops to the 4s
+     cadence whenever a [data-active] is anywhere inside it — so a creating
+     preview narrates its steps here exactly as `ib preview up` does in a
+     terminal, purely from the attribute below. Everything the tab already
+     established, pointed at one tag.
+
+     preview-phase and preview-expiry are reused rather than re-expressed, so
+     a phase reads identically on both pages. preview-apps is deliberately NOT
+     reused: it renders the members as a compact row of name-links, which is
+     the cramped presentation this page exists to replace — the env-tiles block
+     below shows the same members, keyed by app name, with their full URLs as
+     the visible link text. There is exactly one URL per app
+     (recordFromNamespace derives them 1:1), so those tiles are also the member
+     list; a second, smaller copy of it would be noise, not information.
+
+     No new CSS: the tiles are the app card's env-tile idiom, the fact rows are
+     the overview's fleet-row, the status line is its attn-empty, and the
+     heading is modal-title — which is not modal-scoped in style.css, and is
+     the only heading scale between .brand and .sec-label. Borrowing an
+     existing class as a layout primitive is the same move the tab's toolbar
+     makes with .jobs-filter. */}}
+{{define "preview-detail"}}
+{{$d := .Preview}}
+<div class="preview-detail"{{if $d.Active}} data-active{{end}}>
+
+  <div class="jobs-filter">
+    <span class="jobs-summary"><a href="/previews" class="jobs-link">← All previews</a></span>
+  </div>
+
+  <div class="modal-title mono">{{$d.Tag}}</div>
+
+  {{if eq $d.State "found"}}
+  {{/* One status line carrying the whole narration: phase, the step it is on,
+       how long that step has been running, and — for a failed preview — why.
+       preview-phase supplies all but the elapsed time, which cannot live in
+       that shared block because the tab's grid cell has no room for it. */}}
+  <div class="attn-empty">
+    <span class="dot {{if eq $d.Rec.Phase "ready"}}dot-grn{{else if eq $d.Rec.Phase "failed"}}dot-red{{else}}dot-amb{{end}}"></span>
+    <span>{{template "preview-phase" $d.Rec}}{{with $d.StepFor}} <span class="c-faint">· running {{.}}</span>{{end}}</span>
+  </div>
+
+  <div class="band band-attn">
+    <div class="attn-col">
+      <div class="sec-label">URLS</div>
+      {{/* One tile per member, stacked (col-list is a single-column grid)
+           rather than in env-tiles' two-up layout: a preview URL runs to ~57
+           characters, and half a column is exactly the cramped cell this page
+           exists to get away from. Stacked, each one fits on a line and is
+           trivially copyable. */}}
+      {{if $d.Rec.URLs}}
+      <div class="col-list">
+        {{range $app, $url := $d.Rec.URLs}}
+        <div class="env-tile">
+          <div class="tile-label">{{$app}}</div>
+          <div class="tile-hash"><a href="{{$url}}" target="_blank" rel="noopener" class="app-name">{{$url}}</a></div>
+        </div>
+        {{end}}
+      </div>
+      {{else}}
+      <div class="attn-empty"><span class="dot dot-amb"></span>No URLs yet — they appear once this preview's members are resolved.</div>
+      {{end}}
+    </div>
+
+    <div class="fleet">
+      <div class="sec-label">DETAILS</div>
+      <div class="fleet-row"><span>Branch</span><span class="mono c-ink">{{or $d.Rec.Branch "—"}}</span></div>
+      <div class="fleet-row"><span>Phase</span><span class="mono c-ink">{{$d.Rec.Phase}}</span></div>
+      <div class="fleet-row fleet-rule"><span>Health</span><span class="mono c-ink">{{$d.Rec.Health}}</span></div>
+      {{/* Created folds the expiry in through preview-expiry, exactly as the
+           tab's AGE cell does — same block, so "expires in 6h" / "expired" /
+           nothing-at-all for the no-TTL common case all read identically on
+           both pages. The title is omitted for a zero CreatedAt (a synthesized
+           record carries one) rather than rendered as 0001-01-01, and the
+           value falls back to an em dash so the row is never blank. */}}
+      <div class="fleet-row"><span>Created</span><span class="mono c-ink"{{if not $d.Rec.CreatedAt.IsZero}} title="{{abstime $d.Rec.CreatedAt}}"{{end}}>{{or (reltime $d.Rec.CreatedAt) "—"}}{{template "preview-expiry" $d.Rec}}</span></div>
+      <div class="fleet-row"><span>Auto-update</span><span class="mono c-ink">{{if $d.Rec.AutoUpdate}}on{{else}}off{{end}}</span></div>
+    </div>
+  </div>
+  {{else if eq $d.State "pending"}}
+  {{/* The click-through from a synthesized busy row. previewByTag 404s for
+       this tag on purpose (DELETE depends on it), so without this branch the
+       user would land on a bare not-found for a preview the list just showed
+       them. The container is data-active — Busy is set on the synthesized
+       record — so the page polls itself into the real thing. */}}
+  <div class="attn-empty">
+    <span class="dot dot-amb"></span>
+    <span>This preview is mid-operation. Bifrost is holding the tag while an <code>up</code> or <code>down</code> finishes, and there is no namespace behind it yet — nothing to show until there is. This page updates itself.</span>
+  </div>
+  {{else if eq $d.State "unavailable"}}
+  <div class="attn-empty">
+    <span class="dot dot-red"></span>
+    <span>Could not read this preview from the cluster, so whether it exists is unknown. This page keeps trying.</span>
+  </div>
+  {{else}}
+  <div class="attn-empty">
+    <span class="dot dot-red"></span>
+    <span>No preview environment with this tag. It may have been torn down, or expired and been reclaimed.</span>
+  </div>
+  <div class="card-actions"><a href="/previews" class="pill pill-ghost">All previews</a></div>
+  {{end}}
+
+</div>
+{{end}}

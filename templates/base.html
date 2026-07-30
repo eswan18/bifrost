@@ -265,6 +265,121 @@
       })
       .catch(again);
   }
+
+  // --- previews: create / tear down -------------------------------------------
+  //
+  // Two CSRF conventions live in this app and these are the other one. Promote
+  // and rollback above read r.FormValue("csrf"), which is why they are real
+  // <form> POSTs with a hidden input that the JS merely upgrades to fetch. The
+  // preview endpoints instead read an X-CSRF-Token HEADER (verifyMutationCSRF
+  // in internal/web/previews_mutate.go) and take a JSON body — and teardown is
+  // a DELETE, a method HTML forms cannot issue at all. So both controls MUST
+  // go through fetch(); there is no no-JS fallback to degrade to.
+  //
+  // Every listener here is delegated off document rather than bound to the
+  // controls at load. The create form and every teardown modal are rendered
+  // inside #tab-body, which refresh() replaces wholesale on every poll, so
+  // anything bound per-element would stop working after the first swap.
+
+  // previewError writes (or clears) the message slot inside one modal panel.
+  function previewError(scope, msg) {
+    var el = scope && scope.querySelector('.js-preview-error');
+    if (el) el.textContent = msg;
+  }
+
+  // previewFailure turns a non-202 into what to tell the user. The server owns
+  // the wording for 400 (branch/ttl validation) and 409 (the tag is busy), so
+  // its {"error": …} is surfaced VERBATIM rather than flattened into a generic
+  // failure. The per-status fallbacks only cover a body we could not read.
+  function previewFailure(status, body) {
+    if (body && body.error) return body.error;
+    if (status === 409) return 'That preview is busy — wait for the current operation to finish.';
+    if (status === 404) return 'That preview no longer exists.';
+    if (status === 403) return 'Your session is no longer valid — reload the page and try again.';
+    if (status === 503) return 'Previews are not configured on this bifrost.';
+    return 'Request failed (HTTP ' + status + ').';
+  }
+
+  // previewMutate runs one preview mutation and reports honestly: 202 hands
+  // the decoded body to onOK, anything else leaves the modal open with the
+  // server's own message in it, so nothing is silently swallowed. It holds the
+  // `mutating` pause for the duration, as promote/rollback do, so a background
+  // swap cannot pull the modal out from under an in-flight request.
+  function previewMutate(method, url, payload, btn, onOK) {
+    var scope = btn.closest('.modal-panel');
+    var label = btn.textContent;
+    previewError(scope, '');
+    btn.disabled = true;
+    btn.textContent = 'Working…';
+    mutating = true;
+    var opts = { method: method, headers: { 'Accept': 'application/json', 'X-CSRF-Token': btn.getAttribute('data-csrf') || '' } };
+    if (payload) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(payload);
+    }
+    function restore(msg) {
+      mutating = false;
+      previewError(scope, msg);
+      btn.disabled = false;
+      btn.textContent = label;
+      schedule(anyActive() ? ACTIVE : IDLE);
+    }
+    fetch(url, opts)
+      .then(function (r) {
+        // An expired session redirects to /auth/login, which fetch follows to
+        // a 200 HTML page — reload into it, exactly as refresh() does, rather
+        // than reporting a nonsensical "failed (HTTP 200)".
+        if (r.redirected) { location.reload(); return null; }
+        return r.json().catch(function () { return null; }).then(function (body) { return { status: r.status, body: body }; });
+      })
+      .then(function (res) {
+        if (res === null) return;
+        if (res.status !== 202) { restore(previewFailure(res.status, res.body)); return; }
+        mutating = false;
+        btn.disabled = false;
+        btn.textContent = label;
+        onOK(res.body || {});
+      })
+      .catch(function () { restore('Could not reach bifrost — check your connection and try again.'); });
+  }
+
+  document.addEventListener('submit', function (e) {
+    var form = e.target.closest('form.js-preview-create');
+    if (!form) return;
+    e.preventDefault();
+    var btn = form.querySelector('button[type="submit"]');
+    if (!btn) return;
+    var branch = (form.elements.branch.value || '').trim();
+    var ttl = (form.elements.ttl.value || '').trim();
+    // ttl and autoUpdate are OMITTED entirely when unset rather than sent
+    // empty/false: the API reads an absent ttl as "never expires" (and "" is
+    // not a parseable duration), and an absent autoUpdate as opted out.
+    var payload = { branch: branch };
+    if (ttl) payload.ttl = ttl;
+    if (form.elements.autoUpdate.checked) payload.autoUpdate = true;
+    previewMutate('POST', '/api/previews', payload, btn, function (res) {
+      form.reset();
+      closeModal();
+      // The tag exists the moment the 202 lands, but the namespace behind it
+      // does not yet — the create shows up as a busy row first and turns into
+      // "creating" once Up reaches EnsureNamespace, so the copy promises the
+      // work, not the phase.
+      showNotice('Creating preview ' + (res.tag || branch) + ' from ' + branch + '…');
+      schedule(0);
+    });
+  });
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('button.js-preview-down');
+    if (!btn) return;
+    e.preventDefault();
+    var tag = btn.getAttribute('data-tag') || '';
+    previewMutate('DELETE', '/api/previews/' + encodeURIComponent(tag), null, btn, function () {
+      closeModal();
+      showNotice('Tearing down preview ' + tag + '…');
+      schedule(0);
+    });
+  });
 })();
 </script>
 {{end}}
