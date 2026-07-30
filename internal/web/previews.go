@@ -64,6 +64,76 @@ type previewRecord struct {
 	// omitempty keeps it out of the JSON for almost every record; a consumer
 	// must read a missing key as false.
 	Busy bool `json:"busy,omitempty"`
+	// BuiltImages reports what each member's last SUCCESSFUL build produced
+	// (bifrost/built-images — see internal/preview's builtImagesAnnotation),
+	// keyed by service name. A member absent from the map has nothing
+	// recorded for it — an older preview predating this annotation, or one
+	// whose most recent build never succeeded — and that absence, like a
+	// wholly missing annotation, is this field's clean zero value (nil map,
+	// omitted from the JSON) rather than an error; see
+	// parseBuiltImagesAnnotation. It exists so a caller (the CLI, polling
+	// across a re-run of `up`) can diff this map before and after and tell
+	// whether anything was actually rebuilt: an unchanged preview reports the
+	// identical commit for every member, which Step cannot show once the run
+	// reaches ready (Step is cleared to "" on success, and a re-run that
+	// reuses every image can finish inside a single poll interval).
+	BuiltImages map[string]builtImageRecord `json:"builtImages,omitempty"`
+}
+
+// builtImageRecord is the JSON shape of one previewRecord.BuiltImages entry:
+// the full commit a member's image was built from, and the short SHA that
+// build produced (render.go's `preview-<short sha>` image tag). Mirrors
+// internal/preview's builtImage field-for-field — same two fields, same
+// reason neither is derived from the other (see that type's doc) — but is
+// its own type rather than a reuse of it: builtImage is unexported, and nothing
+// forces this package's wire shape to move in lockstep with that package's
+// internal representation.
+type builtImageRecord struct {
+	Commit   string `json:"commit"`
+	ShortSHA string `json:"shortSha"`
+}
+
+// parseBuiltImagesAnnotation reads bifrost/built-images into
+// previewRecord.BuiltImages. It is a local reimplementation of
+// internal/preview's parseBuiltImages/builtImage, not a call into them: both
+// are unexported, and — more to the point — every other bifrost/* annotation
+// this file reads back that is written only by internal/preview (branch,
+// apps, step, error, auto-update) is likewise read here as a literal,
+// per-package copy of the format rather than a shared helper (see the note
+// atop that package's own annotation-key constants: a key "read only outside
+// this package" stays a literal at its single point of use). The annotation's
+// TEXT is the real contract between the two packages; this function is this
+// package's own reader of it.
+//
+// Same fail-safe shape as parseBuiltImages, and for the same reason: a
+// malformed or half-empty entry is dropped rather than reported, so a value
+// bifrost itself wrote but can no longer parse degrades to "nothing built for
+// this member" — never an error, and never surfaced any differently than an
+// absent annotation. Returns nil, matching this field's documented zero
+// value, whenever nothing valid was found — including for raw == "" — so a
+// caller (and reflect.DeepEqual in a test) sees exactly the same thing for
+// "no such annotation" and "an annotation with nothing readable in it".
+func parseBuiltImagesAnnotation(raw string) map[string]builtImageRecord {
+	var built map[string]builtImageRecord
+	for _, pair := range strings.Split(raw, ",") {
+		svc, rest, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		commit, shortSHA, ok := strings.Cut(rest, ":")
+		if !ok {
+			continue
+		}
+		svc, commit, shortSHA = strings.TrimSpace(svc), strings.TrimSpace(commit), strings.TrimSpace(shortSHA)
+		if svc == "" || commit == "" || shortSHA == "" {
+			continue
+		}
+		if built == nil {
+			built = map[string]builtImageRecord{}
+		}
+		built[svc] = builtImageRecord{Commit: commit, ShortSHA: shortSHA}
+	}
+	return built
 }
 
 // phaseBusy is the phase carried by a synthesized record — a tag the
@@ -115,7 +185,8 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 		// autoUpdatable): "true" and nothing else means on, so absent, ""
 		// (what an Up without auto-update writes) and any other value all
 		// read as off.
-		AutoUpdate: ns.Annotations["bifrost/auto-update"] == "true",
+		AutoUpdate:  ns.Annotations["bifrost/auto-update"] == "true",
+		BuiltImages: parseBuiltImagesAnnotation(ns.Annotations["bifrost/built-images"]),
 	}
 	if since := ns.Annotations["bifrost/step-since"]; since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
