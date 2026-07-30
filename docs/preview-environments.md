@@ -210,6 +210,16 @@ ingress class staging uses.
    Every member's build runs, every time — there is no check for "this SHA
    already has a preview image." Step: `building {service} (i/n)`, rewritten
    per member.
+
+   A build that ends in anything but `SUCCESS` fails the preview with the
+   build's **console log URL** in `bifrost/error`: `build for footstrike-api:
+   build ended with status FAILURE: https://console.cloud.google.com/cloud-build/builds/…`.
+   The link is the point — a bare status names a symptom and leaves you
+   hand-navigating the Cloud Build console guessing which run was yours. If
+   Cloud Build returned no log URL, the message carries the build ID instead
+   (`… status FAILURE (build <id>)`, enough for `gcloud builds log <id>`)
+   rather than a link to nowhere. The URL only: build *logs* are never
+   fetched, for the same reason pod logs aren't (step 8).
 5. **Neon branch** (step: `branching databases`): for every member with a
    registry `neon:` reference,
    find-or-create a `preview-<tag>` branch off that project's default branch
@@ -715,8 +725,9 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   the same `ttl`, not omitting it.
 - **A `failed` preview keeps showing its last step, on purpose.** `bifrost/step`
   is cleared on `ready` but retained on `failed`, so the row reads "failed ·
-  building footstrike-api (1/2) — build ended with status FAILURE" for as long
-  as that namespace exists. It describes the run that failed, not something in
+  building footstrike-api (1/2) — build for footstrike-api: build ended with
+  status FAILURE: https://console.cloud.google.com/cloud-build/builds/…" for
+  as long as that namespace exists. It describes the run that failed, not something in
   flight. Re-running `up` clears both at the start of the retry (step 3), and a
   preview whose namespace is `Terminating` reports neither — the annotations
   are still on the namespace, but the API record and the UI row suppress them,

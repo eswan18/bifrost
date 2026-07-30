@@ -1105,6 +1105,70 @@ func TestUpBuildFailureSetsPhaseFailed(t *testing.T) {
 	}
 }
 
+// A failed build's message must point at the build's log, not merely name a
+// status: the URL is what turns bifrost/error from a fact into a next step,
+// and it has to survive all the way into the annotation the UI and `ib
+// preview up` read, not just into the error Up returns.
+func TestUpBuildFailureErrorCarriesLogURL(t *testing.T) {
+	const logURL = "https://console.cloud.google.com/cloud-build/builds/b1?project=1234"
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{
+		"trig-api": {{Status: "FAILURE", LogURL: logURL}},
+	}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected Up to fail when a build fails, got nil")
+	}
+	if !strings.Contains(err.Error(), logURL) {
+		t.Errorf("error = %q, want it to carry the build's log URL %q", err.Error(), logURL)
+	}
+
+	got := d.kube.namespaces["preview-hae-cadence"].annotations["bifrost/error"]
+	if !strings.Contains(got, logURL) {
+		t.Errorf("bifrost/error = %q, want it to carry the build's log URL %q", got, logURL)
+	}
+	// Single line, and short enough to read in a table cell: this string is
+	// served over the API and rendered into a grid row.
+	if strings.ContainsAny(got, "\n\r") {
+		t.Errorf("bifrost/error = %q, want a single line", got)
+	}
+	if len(got) > 200 {
+		t.Errorf("bifrost/error is %d chars (%q), want something a table cell can show", len(got), got)
+	}
+}
+
+// With no LogURL to link — an API response that omitted it — the message must
+// degrade to something still actionable (the build ID, enough for `gcloud
+// builds log`) rather than a dangling pointer to nowhere.
+func TestUpBuildFailureWithoutLogURLDegradesCleanly(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{
+		"trig-api": {{Status: "FAILURE"}}, // LogURL deliberately empty
+	}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected Up to fail when a build fails, got nil")
+	}
+	got := d.kube.namespaces["preview-hae-cadence"].annotations["bifrost/error"]
+	if strings.Contains(got, "http") {
+		t.Errorf("bifrost/error = %q, want no link at all when the build reported no LogURL", got)
+	}
+	// A trailing separator with nothing after it is exactly the dangling
+	// "see: " this guards against.
+	if strings.HasSuffix(strings.TrimSpace(got), ":") {
+		t.Errorf("bifrost/error = %q, want no dangling trailing separator", got)
+	}
+	// fakeGCB returns the triggerID as the build ID.
+	if !strings.Contains(got, "trig-api") {
+		t.Errorf("bifrost/error = %q, want the build ID as the fallback handle", got)
+	}
+	if !strings.Contains(got, "FAILURE") {
+		t.Errorf("bifrost/error = %q, want it to still report the build status", got)
+	}
+}
+
 func TestUpBuildPollRespectsContextCancellation(t *testing.T) {
 	d := newTwoMemberDeps(t)
 	// footstrike-api's build never leaves WORKING; footstrike-dashboard's

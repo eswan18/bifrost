@@ -6,12 +6,26 @@ import (
 	cloudbuild "google.golang.org/api/cloudbuild/v1"
 )
 
+// build is a mainline (`{repo}-build` trigger) build, the kind the Apps tab
+// exists to show.
 func build(repo, sha, status string) *cloudbuild.Build {
 	return &cloudbuild.Build{
-		Status:        status,
-		LogUrl:        "https://console.cloud.google.com/build/" + sha,
-		Substitutions: map[string]string{"REPO_NAME": repo, "SHORT_SHA": sha},
+		Status: status,
+		LogUrl: "https://console.cloud.google.com/build/" + sha,
+		Substitutions: map[string]string{
+			"REPO_NAME": repo, "SHORT_SHA": sha, "TRIGGER_NAME": repo + "-build",
+		},
 	}
+}
+
+// previewBuild is the same thing from the `{repo}-preview-build` trigger:
+// identical REPO_NAME, so only TRIGGER_NAME tells the two apart. Substitution
+// names and values match what the Cloud Build API really returns for these
+// triggers.
+func previewBuild(repo, sha, status string) *cloudbuild.Build {
+	b := build(repo, sha, status)
+	b.Substitutions["TRIGGER_NAME"] = repo + "-preview-build"
+	return b
 }
 
 func TestLatestByRepo(t *testing.T) {
@@ -31,6 +45,29 @@ func TestLatestByRepo(t *testing.T) {
 	}
 	if b := got["identity"]; b.Status != "FAILURE" || b.SHA != "def5678" {
 		t.Errorf("identity = %+v, want FAILURE def5678", b)
+	}
+}
+
+// A failed preview build must not become its service's fleet build status:
+// the Apps tab would otherwise read "✗ build failed" for a service whose
+// main is perfectly healthy.
+func TestLatestByRepoExcludesPreviewBuilds(t *testing.T) {
+	builds := []*cloudbuild.Build{
+		previewBuild("footstrike-api", "bad0000", "FAILURE"), // newest, someone's branch
+		build("footstrike-api", "g00d123", "SUCCESS"),        // the real mainline state
+		previewBuild("identity", "prev111", "SUCCESS"),       // only ever preview-built
+	}
+	got := latestByRepo(builds)
+
+	b, ok := got["footstrike-api"]
+	if !ok {
+		t.Fatalf("footstrike-api missing from %v, want its mainline build", got)
+	}
+	if b.Status != "SUCCESS" || b.SHA != "g00d123" {
+		t.Errorf("footstrike-api = %+v, want the mainline SUCCESS g00d123, not the failed preview build", b)
+	}
+	if _, ok := got["identity"]; ok {
+		t.Errorf("identity = %+v, want no entry at all: its only build is a preview build", got["identity"])
 	}
 }
 
