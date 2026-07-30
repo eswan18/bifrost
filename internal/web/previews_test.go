@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/kube"
 )
 
@@ -616,6 +617,289 @@ func desktopAgeCell(t *testing.T, body, title string) string {
 	return body[start : start+end+len("</span>")]
 }
 
+// desktopRow isolates one preview's desktop jobs-grid row, for the same
+// reason desktopAgeCell isolates its AGE cell: the mobile job-card renders
+// the same tag, branch, phase and health text, so a body-wide Contains can be
+// satisfied by the mobile card while the desktop grid row is broken. Every
+// assertion about the six-column layout has to be attributable to the row
+// itself.
+//
+// It matches on the PREVIEW cell's detail-page link, which is the row's first
+// grid child and (unlike the bare tag text) appears nowhere else in the
+// desktop grid.
+func desktopRow(t *testing.T, body, tag string) string {
+	t.Helper()
+	for _, chunk := range strings.Split(body, `<div class="jobs-grid jobs-row">`)[1:] {
+		end := strings.Index(chunk, "</div>")
+		if end == -1 {
+			continue
+		}
+		if row := chunk[:end]; strings.Contains(row, `<span class="mono w6"><a href="/previews/`+tag+`"`) {
+			return row
+		}
+	}
+	t.Fatalf("no desktop jobs-grid row for preview %q in body", tag)
+	return ""
+}
+
+// countGridCells counts a desktop row's top-level grid children. jobs-grid is
+// a fixed six-column layout SHARED with jobs.html, so a row that renders a
+// seventh (or fifth) child silently misaligns both tabs.
+//
+// It tracks nesting depth rather than matching indentation: a cell added on
+// the same line as an existing one is still a seventh grid child, and an
+// indentation-based count would wave it through. Nested elements (the APPS
+// cell's links, preview-phase's c-red error, the teardown trigger inside the
+// PREVIEW cell) are correctly not counted — keeping them nested is exactly
+// how those templates stay within six columns. The row contains no void
+// elements, so every open tag here really does close.
+func countGridCells(row string) int {
+	cells, depth := 0, 0
+	for {
+		i := strings.IndexByte(row, '<')
+		if i < 0 {
+			return cells
+		}
+		row = row[i+1:]
+		j := strings.IndexByte(row, '>')
+		if j < 0 {
+			return cells
+		}
+		tag := row[:j]
+		row = row[j+1:]
+		if strings.HasPrefix(tag, "/") {
+			depth--
+			continue
+		}
+		if depth == 0 {
+			cells++
+		}
+		if !strings.HasSuffix(tag, "/") {
+			depth++
+		}
+	}
+}
+
+// TestPreviewsPageShowsCreateForm covers the create half of the tab's new
+// controls. Until this existed the Previews tab was read-only and `ib preview
+// up` was the only way to make a preview — which is a poor answer on a phone,
+// the reason bifrost exists at all.
+//
+// The form deliberately is NOT the plain <form method="POST"> promote and
+// rollback use. Those endpoints read r.FormValue("csrf"); POST /api/previews
+// reads the X-CSRF-Token HEADER (verifyMutationCSRF) and takes a JSON body,
+// so the submit must be intercepted — hence the js-preview-create hook the
+// assertions below pin alongside the fields themselves.
+func TestPreviewsPageShowsCreateForm(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-x", "x", "footstrike-api", "ready")}}
+	h, sess := newTestHandlers(t, k)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	for _, want := range []string{
+		// The trigger and the panel are the established CSS-only modal
+		// idiom (style.css's .modal:target), so the form opens with no JS
+		// at all — only the POST itself needs fetch().
+		`<a href="#modal-preview-create"`,
+		`<div id="modal-preview-create" class="modal">`,
+		`<a href="#close" class="modal-backdrop"`,
+		// The fetch() hook and the endpoint it targets.
+		`class="modal-rows js-preview-create"`,
+		`action="/api/previews"`,
+		// Branch (required), TTL (optional), auto-update (optional).
+		`<input type="text" name="branch"`,
+		`<input type="text" name="ttl"`,
+		`<input type="checkbox" name="autoUpdate">`,
+		`<button type="submit" class="pill pill-primary" data-csrf=`,
+		// The slot the handler writes a 400's or 409's server-owned message
+		// into. Without it every failure would be invisible.
+		`class="c-red js-preview-error"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("create form is missing %s", want)
+		}
+	}
+
+	// Branch is the one required field, and the browser's own validation is
+	// what stops an empty submit before the fetch ever runs (the submit event
+	// doesn't fire for an invalid form), so it has to be on the input rather
+	// than left to the server's 400.
+	start := strings.Index(body, `<input type="text" name="branch"`)
+	if start == -1 {
+		t.Fatal("no branch input to inspect")
+	}
+	branchInput := body[start : start+strings.Index(body[start:], ">")]
+	if !strings.Contains(branchInput, "required") {
+		t.Errorf("branch input = %q, want it marked required", branchInput)
+	}
+	// TTL must NOT be required — a preview with no TTL never expires, and
+	// that is the default by design.
+	start = strings.Index(body, `<input type="text" name="ttl"`)
+	if ttlInput := body[start : start+strings.Index(body[start:], ">")]; strings.Contains(ttlInput, "required") {
+		t.Errorf("ttl input = %q, want it optional", ttlInput)
+	}
+}
+
+// TestPreviewsPageCarriesCSRFToken pins the token the fetch()-driven controls
+// send as X-CSRF-Token. verifyMutationCSRF skips verification only when there
+// is NO session — the bearer path the CLI uses; the browser always has one and
+// so always needs the header, and a control that can't produce the token is a
+// control that can only 403.
+func TestPreviewsPageCarriesCSRFToken(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{nsInfo("preview-x", "x", "footstrike-api", "ready")}}
+	h, sess := newTestHandlers(t, k)
+	token := csrf(h, sess)
+
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	// data-csrf specifically, not the bare token: base.html renders the
+	// promote/rollback modals on every dashboard page, and their hidden
+	// "csrf" form inputs already carry the same value — so a Contains(token)
+	// would pass happily with the preview controls carrying nothing at all.
+	if !strings.Contains(body, `data-csrf="`+token+`"`) {
+		t.Error("preview controls do not carry the session's CSRF token as data-csrf")
+	}
+	if strings.Contains(body, `data-csrf=""`) {
+		t.Error("a preview control rendered an empty CSRF token, which can only 403")
+	}
+
+	// The fragment must carry it too. Both controls live inside #tab-body,
+	// which the background poll replaces wholesale every 4–30s; a token
+	// present only on the full page would leave every control dead after the
+	// first swap.
+	frag := httptest.NewRecorder()
+	h.PreviewsFragment(frag, authed(t, "GET", "/partial/previews", "", sess))
+	if frag.Code != http.StatusOK {
+		t.Fatalf("fragment code = %d", frag.Code)
+	}
+	if !strings.Contains(frag.Body.String(), `data-csrf="`+token+`"`) {
+		t.Error("the polled fragment drops the CSRF token, so controls would stop working after the first refresh")
+	}
+}
+
+// TestPreviewsPageShowsTeardownControl covers the teardown half: a control on
+// every real preview, on both surfaces, behind the same CSS-only confirmation
+// modal the rollback flow uses.
+//
+// The count of 2 is what makes this mean anything — it pins the desktop grid
+// row AND the mobile card. An assertion that only searched the whole body
+// would be satisfied by the mobile card alone while the desktop cell was
+// broken, exactly the trap TestPreviewsPage documents for the PHASE cell.
+func TestPreviewsPageShowsTeardownControl(t *testing.T) {
+	k := &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "ready"),
+	}}
+	h, sess := newTestHandlers(t, k)
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if n := strings.Count(body, `href="#modal-preview-down-hae-cadence"`); n != 2 {
+		t.Errorf("teardown trigger rendered %d times, want 2 (desktop row + mobile card)", n)
+	}
+	// Desktop: folded INTO the PREVIEW cell next to the tag it acts on. A
+	// seventh grid column is not available — jobs-grid is a fixed six-column
+	// layout shared with jobs.html.
+	row := desktopRow(t, body, "hae-cadence")
+	if !strings.Contains(row, `<span class="mono w6"><a href="/previews/hae-cadence" class="app-name">hae-cadence</a> <a href="#modal-preview-down-hae-cadence"`) {
+		t.Errorf("desktop row = %q, want the teardown trigger inside the PREVIEW cell beside the tag link", row)
+	}
+	if n := countGridCells(row); n != 6 {
+		t.Errorf("desktop row has %d top-level grid cells, want exactly 6 (jobs-grid is shared with jobs.html)", n)
+	}
+	// Mobile: a real full-size target rather than the desktop row's inline ✕
+	// — the phone is the use case this whole feature exists for.
+	if !strings.Contains(body, `<div class="card-actions"><a href="#modal-preview-down-hae-cadence" class="pill-block pill-ghost">`) {
+		t.Error("mobile card is missing its teardown action")
+	}
+	// One modal for both triggers, so the two never fight over an element id.
+	if n := strings.Count(body, `id="modal-preview-down-hae-cadence"`); n != 1 {
+		t.Errorf("teardown modal rendered %d times, want exactly 1 shared by both triggers", n)
+	}
+	// The confirm is a <button> carrying the tag and the header token, not a
+	// form: HTML forms cannot issue DELETE, and the endpoint will not read a
+	// form-encoded csrf value.
+	if !strings.Contains(body, `<button type="button" class="pill pill-primary js-preview-down" data-tag="hae-cadence" data-csrf="`+csrf(h, sess)+`">`) {
+		t.Error("teardown confirm is not a js-preview-down button carrying the tag and CSRF token")
+	}
+	if !strings.Contains(body, `class="c-red js-preview-error"`) {
+		t.Error("teardown modal has no slot for the server's 404/409 message")
+	}
+}
+
+// TestPreviewsPageBusyRecordRendersWithoutTeardown covers the record
+// assemblePreviews synthesizes for a tag the orchestrator holds that has NO
+// namespace behind it (busyRecord): phase "busy" and almost nothing else — no
+// branch, no apps, no URLs, a zero CreatedAt. It is the one record on this tab
+// that isn't derived from a namespace, so it is the one that breaks a row
+// renderer written against the normal case.
+//
+// It must also offer no teardown. DELETE /api/previews/{tag} looks the tag up
+// through previewByTag, which deliberately does NOT synthesize, so it would
+// answer 404: a control here could only ever fail, and offering one would be
+// worse than offering none.
+func TestPreviewsPageBusyRecordRendersWithoutTeardown(t *testing.T) {
+	h, sess := newTestHandlers(t, &fakeKube{})
+	h.Orch = &fakeOrchestration{busyTags: map[string]bool{"training-plans": true}}
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if strings.Contains(body, "<no value>") {
+		t.Error("synthesized busy record rendered '<no value>' (a nil field reference)")
+	}
+	// No trigger on either surface, and no modal. Matching the bare tag
+	// substring (rather than a scoped cell) is deliberate: it fails no matter
+	// which of the three places the control leaked into.
+	if strings.Contains(body, "modal-preview-down-training-plans") {
+		t.Error("a busy tag with no namespace must not offer teardown — the DELETE would 404")
+	}
+	// The row itself is still a well-formed six-cell grid row, with the bare
+	// tag in the PREVIEW cell and the claim in the PHASE cell.
+	row := desktopRow(t, body, "training-plans")
+	if n := countGridCells(row); n != 6 {
+		t.Errorf("busy row has %d top-level grid cells, want exactly 6: %q", n, row)
+	}
+	if !strings.Contains(row, `<span class="mono w6"><a href="/previews/training-plans" class="app-name">training-plans</a></span>`) {
+		t.Errorf("busy row = %q, want a PREVIEW cell holding only the tag link, with no teardown trigger", row)
+	}
+	if !strings.Contains(row, `<span class="c-mut">busy</span>`) {
+		t.Errorf("busy row = %q, want the synthesized phase rendered", row)
+	}
+	// A zero CreatedAt renders no age, so the AGE cell must omit its tooltip
+	// rather than emit an empty one (jobs.html's own idiom), and the mobile
+	// card must not leave the separator that would have preceded the age.
+	if strings.Contains(body, `title=""`) {
+		t.Error("zero CreatedAt left an empty title attribute behind")
+	}
+	if strings.Contains(body, "· </div>") {
+		t.Error("mobile card left a dangling separator where the empty age would be")
+	}
+	// The create form is still there: a tab showing only a busy tag is
+	// exactly when someone wants to know what else they can do.
+	if !strings.Contains(body, `<div id="modal-preview-create" class="modal">`) {
+		t.Error("create form missing from a page whose only record is synthesized")
+	}
+}
+
 // TestPreviewsPageFutureExpiryShowsRemainingTime covers a preview created
 // with --ttl whose expiry hasn't arrived yet: the AGE cell must show the
 // remaining time, not the absolute instant.
@@ -857,6 +1141,347 @@ func TestPreviewsFragment(t *testing.T) {
 	// No page chrome: a poll response is swapped into #tab-body verbatim.
 	if strings.Contains(body, "<!DOCTYPE") || strings.Contains(body, "Sign out") {
 		t.Error("fragment should not include full-page chrome")
+	}
+}
+
+// --- per-preview detail page --------------------------------------------------
+
+// detailPage renders GET /previews/{tag}. The path value is set explicitly
+// because these tests call the handler directly rather than through the mux
+// pattern that would otherwise populate it.
+func detailPage(t *testing.T, h *Handlers, sess *auth.Session, tag string) string {
+	t.Helper()
+	req := authed(t, "GET", "/previews/"+tag, "", sess)
+	req.SetPathValue("tag", tag)
+	rec := httptest.NewRecorder()
+	h.Preview(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// TestPreviewDetailPageShowsEverythingWithURLsProminent is the page's reason
+// to exist: the tab can only afford one cramped APPS cell for a preview's
+// URLs, and the URLs are the thing anyone actually wants from a preview.
+//
+// The assertion on each URL pins the FULL anchor — href, target and the URL
+// itself as the visible link text — because a name-only link (which is all
+// the tab's preview-apps block renders) would satisfy a looser "is the URL on
+// the page somewhere" check while leaving the URL itself unreadable and
+// uncopyable, i.e. leaving the page pointless.
+func TestPreviewDetailPageShowsEverythingWithURLsProminent(t *testing.T) {
+	ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api,footstrike-dashboard", "ready")
+	ns.Annotations["bifrost/auto-update"] = "true"
+	ns.Annotations["bifrost/expires-at"] = time.Now().Add(6*time.Hour + 5*time.Minute).UTC().Format(time.RFC3339)
+	h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{ns}})
+
+	body := detailPage(t, h, sess, "hae-cadence")
+
+	for _, app := range []string{"footstrike-api", "footstrike-dashboard"} {
+		u := "https://" + app + "-hae-cadence.preview.footstrike.run"
+		want := `<a href="` + u + `" target="_blank" rel="noopener" class="app-name">` + u + `</a>`
+		if !strings.Contains(body, want) {
+			t.Errorf("%s's URL is not rendered as a prominent link (want %s)", app, want)
+		}
+		// Each URL is a labelled tile, not a run-together list.
+		if !strings.Contains(body, `<div class="tile-label">`+app+`</div>`) {
+			t.Errorf("%s has no labelled URL tile", app)
+		}
+	}
+
+	// Every remaining field of previewRecord, plus the page chrome that makes
+	// this a real dashboard page rather than a bare fragment.
+	for _, want := range []string{
+		`<div class="modal-title mono">hae-cadence</div>`,
+		`<span>Branch</span><span class="mono c-ink">hae-cadence</span>`,
+		`<span>Phase</span><span class="mono c-ink">ready</span>`,
+		`<span>Health</span><span class="mono c-ink">unknown</span>`,
+		`<span>Auto-update</span><span class="mono c-ink">on</span>`,
+		`title="2026-07-27 12:00 UTC"`, // created-at, as the tab renders it
+		"expires in 6h",                // expiry, via the shared preview-expiry block
+		`<a href="/previews" class="jobs-link">`,
+		`<a href="/previews" class="tab active">Previews`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detail page is missing %s", want)
+		}
+	}
+	if strings.Contains(body, "<no value>") {
+		t.Error("detail page rendered '<no value>' (a nil field reference)")
+	}
+}
+
+// TestPreviewDetailPageCreatingNarratesStepAndPollsFast is the live-progress
+// half of the feature. base.html's poller drops from 30s to 4s purely because
+// a [data-active] sits inside #tab-body, and re-fetches whatever <body>'s
+// data-refresh points at — so a per-tag fragment URL plus that attribute is
+// the entire mechanism by which this page narrates `ib preview up` live.
+//
+// The settled subtest is what makes the active one mean anything: on an idle
+// fleet nothing else may carry the attribute. The leading space matters —
+// base.html's polling JS mentions 'data-active' and '[data-active]' on every
+// page, so a bare substring would false-positive.
+func TestPreviewDetailPageCreatingNarratesStepAndPollsFast(t *testing.T) {
+	t.Run("creating", func(t *testing.T) {
+		ns := nsInfo("preview-x", "x", "footstrike-api", "creating")
+		ns.Annotations["bifrost/step"] = "branching databases"
+		ns.Annotations["bifrost/step-since"] = time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+		h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{ns}})
+
+		body := detailPage(t, h, sess, "x")
+
+		if !strings.Contains(body, "creating · branching databases") {
+			t.Error("the current step is not narrated beside the phase")
+		}
+		if !strings.Contains(body, "· running 2m") {
+			t.Error("the step does not report how long it has been running")
+		}
+		if !strings.Contains(body, `<div class="preview-detail" data-active>`) {
+			t.Error("a creating preview must mark the page data-active so it polls on the fast cadence")
+		}
+		if !strings.Contains(body, `data-refresh="/partial/previews/x"`) {
+			t.Error("the page must poll its own per-tag fragment, not the whole Previews tab")
+		}
+	})
+
+	t.Run("settled", func(t *testing.T) {
+		h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{
+			nsInfo("preview-x", "x", "footstrike-api", "ready"),
+		}})
+
+		body := detailPage(t, h, sess, "x")
+
+		if !strings.Contains(body, `<div class="preview-detail">`) {
+			t.Error("a settled preview must render the container without data-active")
+		}
+		if strings.Contains(body, " data-active") {
+			t.Error("nothing is in flight and the fleet is idle: nothing should be data-active")
+		}
+		// No step, so no elapsed time and no dangling separator either.
+		if strings.Contains(body, "· running") {
+			t.Error("a ready preview has no running step and must not claim one")
+		}
+	})
+}
+
+// TestPreviewDetailPageFailedShowsError covers the third phase: a failed
+// preview keeps its last step (recordFromNamespace retains it deliberately)
+// and surfaces bifrost/error in c-red, so the page answers "failed doing
+// what, and why" rather than just "failed".
+func TestPreviewDetailPageFailedShowsError(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "failed")
+	ns.Annotations["bifrost/step"] = "building footstrike-api (1/2)"
+	ns.Annotations["bifrost/error"] = "build ended with status FAILURE"
+	h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{ns}})
+
+	body := detailPage(t, h, sess, "x")
+
+	if !strings.Contains(body, `<span class="c-red">build ended with status FAILURE</span>`) {
+		t.Error("a failed preview must show its error in c-red")
+	}
+	if !strings.Contains(body, "failed · building footstrike-api (1/2)") {
+		t.Error("a failed preview must still narrate the step it died on")
+	}
+	if !strings.Contains(body, `<span class="dot dot-red"></span>`) {
+		t.Error("a failed preview must read as failed at a glance, not as amber in-progress")
+	}
+}
+
+// TestPreviewDetailPageBusyTagClickThrough is the edge the list creates and
+// the API deliberately refuses to smooth over. A tag can be claimed with no
+// namespace behind it (an Up before EnsureNamespace, a Down still deleting
+// Neon branches); assemblePreviews synthesizes a row for it so the state is
+// visible, but previewByTag still 404s — DeletePreviewJSON depends on that
+// lookup meaning "there is a namespace". So the user can click a row and land
+// on a tag the by-tag read says doesn't exist.
+//
+// The page must say what is actually happening, and keep itself data-active so
+// it turns into the real preview on its own.
+func TestPreviewDetailPageBusyTagClickThrough(t *testing.T) {
+	h, sess := newTestHandlers(t, &fakeKube{})
+	h.Orch = &fakeOrchestration{busyTags: map[string]bool{"training-plans": true}}
+
+	body := detailPage(t, h, sess, "training-plans")
+
+	if !strings.Contains(body, "This preview is mid-operation") {
+		t.Error("a claimed tag with no namespace must be explained, not left looking broken")
+	}
+	if strings.Contains(body, "No preview environment with this tag") {
+		t.Error("a tag the list just showed must not read as nonexistent")
+	}
+	if !strings.Contains(body, `<div class="preview-detail" data-active>`) {
+		t.Error("a mid-operation tag must poll fast so the page becomes the real preview on its own")
+	}
+	if strings.Contains(body, "<no value>") {
+		t.Error("the synthesized record rendered '<no value>' (a nil field reference)")
+	}
+	// Nothing is known beyond the claim, so nothing may be invented: no empty
+	// URL tiles, no 0001-01-01 creation time, no blank tooltip.
+	if strings.Contains(body, `class="tile-label"`) {
+		t.Error("a tag with no namespace has no URLs and must not render an empty URL block")
+	}
+	if strings.Contains(body, "0001-01-01") || strings.Contains(body, `title=""`) {
+		t.Error("a zero CreatedAt leaked into the page")
+	}
+}
+
+// TestPreviewDetailPageUnknownTag covers the two ways there is nothing to
+// show, which must not be conflated: a tag that genuinely isn't a preview,
+// and a cluster read that failed so nobody knows whether it is. The first is
+// a 404 with a real page around it; the second must not claim the preview is
+// gone, and must not leak the raw error.
+func TestPreviewDetailPageUnknownTag(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		h, sess := newTestHandlers(t, &fakeKube{})
+		req := authed(t, "GET", "/previews/nope", "", sess)
+		req.SetPathValue("tag", "nope")
+		rec := httptest.NewRecorder()
+		h.Preview(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("code = %d, want 404 for a tag that is not a preview", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "No preview environment with this tag") {
+			t.Error("an unknown tag must get a clean not-found page")
+		}
+		// A real page, not an empty shell: full chrome plus a way back.
+		for _, want := range []string{
+			`<div class="brand">Bifrost</div>`,
+			`<a href="/previews" class="tab active">Previews`,
+			`<div class="card-actions"><a href="/previews" class="pill pill-ghost">All previews</a></div>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("not-found page is missing %s", want)
+			}
+		}
+		if strings.Contains(body, "<no value>") {
+			t.Error("not-found page rendered '<no value>'")
+		}
+		if strings.Contains(body, `class="tile-label"`) || strings.Contains(body, "<span>Branch</span>") {
+			t.Error("not-found page rendered the detail blocks for a preview that does not exist")
+		}
+	})
+
+	t.Run("cluster read failed", func(t *testing.T) {
+		h, sess := newTestHandlers(t, &fakeKube{namespacesErr: errors.New("boom")})
+		req := authed(t, "GET", "/previews/x", "", sess)
+		req.SetPathValue("tag", "x")
+		rec := httptest.NewRecorder()
+		h.Preview(rec, req)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("code = %d, want 502 — the read failed, so whether the preview exists is unknown", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "Could not read this preview from the cluster") {
+			t.Error("a failed read must say so")
+		}
+		if strings.Contains(body, "No preview environment with this tag") {
+			t.Error("a failed read must not be reported as a preview that doesn't exist")
+		}
+		if strings.Contains(body, "boom") {
+			t.Error("raw kube error leaked into the rendered page")
+		}
+	})
+}
+
+// TestPreviewDetailPageZeroCreatedAt pins the tab's own idiom on this page: a
+// record with no creation time omits the title attribute entirely rather than
+// rendering the zero instant, and the value falls back to an em dash so the
+// DETAILS row is never blank.
+func TestPreviewDetailPageZeroCreatedAt(t *testing.T) {
+	ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+	ns.CreatedAt = time.Time{}
+	h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{ns}})
+
+	body := detailPage(t, h, sess, "x")
+
+	if strings.Contains(body, "0001-01-01") {
+		t.Error("a zero CreatedAt rendered as 0001-01-01")
+	}
+	if strings.Contains(body, `title=""`) {
+		t.Error("a zero CreatedAt left an empty title attribute behind")
+	}
+	if !strings.Contains(body, `<span>Created</span><span class="mono c-ink">—</span>`) {
+		t.Error("a zero CreatedAt must leave a dashed row, not a blank one")
+	}
+}
+
+// TestPreviewsTabLinksRowsToTheDetailPage pins the way in. The count of 2 is
+// what makes it mean anything: it pins the desktop grid row AND the mobile
+// card, and a body-wide check alone would be satisfied by the mobile card
+// while the desktop cell was broken — the trap TestPreviewsPage documents for
+// the PHASE cell.
+//
+// The link is folded INTO the existing PREVIEW cell, so the desktop row still
+// renders exactly six top-level grid children: jobs-grid is a fixed
+// six-column layout shared with jobs.html, and a seventh would misalign both
+// tabs.
+func TestPreviewsTabLinksRowsToTheDetailPage(t *testing.T) {
+	h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "ready"),
+	}})
+	rec := httptest.NewRecorder()
+	h.Previews(rec, authed(t, "GET", "/previews", "", sess))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+
+	if n := strings.Count(body, `<a href="/previews/hae-cadence" class="app-name">hae-cadence</a>`); n != 2 {
+		t.Errorf("tag link rendered %d times, want 2 (desktop row + mobile card)", n)
+	}
+	row := desktopRow(t, body, "hae-cadence")
+	if n := countGridCells(row); n != 6 {
+		t.Errorf("desktop row has %d top-level grid cells, want exactly 6 (jobs-grid is shared with jobs.html): %q", n, row)
+	}
+	if !strings.Contains(body, `<div class="job-card-top"><span class="mono w6"><a href="/previews/hae-cadence" class="app-name">hae-cadence</a></span>`) {
+		t.Error("the mobile card's top line does not link the tag to its detail page")
+	}
+}
+
+// TestPreviewDetailFragmentIsBodyOnlyAndAlwaysOK covers the polled half.
+//
+// The fragment answers 200 even for a tag with nothing behind it, unlike the
+// full page's 404. base.html's refresh() treats a non-ok response as a failed
+// poll — it marks the header stale and swaps nothing — so a preview torn down
+// while its page is open would freeze on stale content instead of turning
+// into the not-found body.
+func TestPreviewDetailFragmentIsBodyOnlyAndAlwaysOK(t *testing.T) {
+	fragment := func(t *testing.T, h *Handlers, sess *auth.Session, tag string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := authed(t, "GET", "/partial/previews/"+tag, "", sess)
+		req.SetPathValue("tag", tag)
+		rec := httptest.NewRecorder()
+		h.PreviewFragment(rec, req)
+		return rec
+	}
+
+	h, sess := newTestHandlers(t, &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "ready"),
+	}})
+
+	rec := fragment(t, h, sess, "hae-cadence")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "https://footstrike-api-hae-cadence.preview.footstrike.run") {
+		t.Error("fragment is missing the preview's URLs")
+	}
+	// No page chrome: the response is swapped into #tab-body verbatim.
+	if strings.Contains(body, "<!DOCTYPE") || strings.Contains(body, "Sign out") {
+		t.Error("fragment should not include full-page chrome")
+	}
+
+	gone := fragment(t, h, sess, "torn-down")
+	if gone.Code != http.StatusOK {
+		t.Fatalf("gone fragment code = %d, want 200 so the poll swaps rather than going stale", gone.Code)
+	}
+	if !strings.Contains(gone.Body.String(), "No preview environment with this tag") {
+		t.Error("a preview torn down while its page is open must swap to the not-found body")
 	}
 }
 

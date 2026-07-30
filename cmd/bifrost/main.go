@@ -221,10 +221,16 @@ func main() {
 	mux.Handle("GET /apps", requireAuth(http.HandlerFunc(webH.Apps)))
 	mux.Handle("GET /jobs", requireAuth(http.HandlerFunc(webH.Jobs)))
 	mux.Handle("GET /previews", requireAuth(http.HandlerFunc(webH.Previews)))
+	// The per-preview detail page. Session auth (requireAuth), NOT the
+	// bearer-tolerant requirePreviewAuth the /api/previews endpoints use: this
+	// is a dashboard page reached by clicking a row, and the CLI has the JSON
+	// API for the same data.
+	mux.Handle("GET /previews/{tag}", requireAuth(http.HandlerFunc(webH.Preview)))
 	mux.Handle("GET /partial/overview", requireAuth(http.HandlerFunc(webH.OverviewFragment)))
 	mux.Handle("GET /partial/apps", requireAuth(http.HandlerFunc(webH.AppsFragment)))
 	mux.Handle("GET /partial/jobs", requireAuth(http.HandlerFunc(webH.JobsFragment)))
 	mux.Handle("GET /partial/previews", requireAuth(http.HandlerFunc(webH.PreviewsFragment)))
+	mux.Handle("GET /partial/previews/{tag}", requireAuth(http.HandlerFunc(webH.PreviewFragment)))
 	mux.Handle("GET /services/{name}/status", requireAuth(http.HandlerFunc(webH.StatusJSON)))
 	mux.Handle("POST /services/{name}/promote", requireAuth(http.HandlerFunc(webH.Promote)))
 	mux.Handle("POST /services/{name}/rollback", requireAuth(http.HandlerFunc(webH.Rollback)))

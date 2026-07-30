@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -68,6 +69,10 @@ type pageVM struct {
 	Overview *overviewData
 	Jobs     *jobsPage
 	Previews []previewRecord
+	// Preview switches the previews template from the tab's list to the
+	// per-preview detail page (previews.html's "tab-body" dispatches on it).
+	// nil on the tab itself and on every other page.
+	Preview *previewDetail
 
 	Message string // error page
 }
@@ -258,6 +263,23 @@ func (h *Handlers) render(w http.ResponseWriter, name string, vm pageVM) {
 		slog.Error("render failed", "template", name, "error", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
 	}
+}
+
+// renderStatus renders a full page under a caller-chosen status — the preview
+// detail page's 404 for an unknown tag, its 502 for a failed cluster read.
+// Unlike render above it buffers first: the status has to be written before
+// the body, so a mid-render failure would otherwise be appended to an already
+// committed 404 rather than reported as the 500 it is.
+func (h *Handlers) renderStatus(w http.ResponseWriter, name string, status int, vm pageVM) {
+	var buf bytes.Buffer
+	if err := h.Renderer.Render(&buf, name, vm); err != nil {
+		slog.Error("render failed", "template", name, "error", err)
+		http.Error(w, "render error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (h *Handlers) renderNamed(w http.ResponseWriter, page, block string, vm pageVM) {
