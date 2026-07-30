@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	cloudbuild "google.golang.org/api/cloudbuild/v1"
@@ -112,14 +113,47 @@ func parseTime(s string) time.Time {
 	return t
 }
 
+// previewTriggerSuffix is what every preview build's trigger is named with
+// ("{service}-preview-build"). The convention is not incidental: the preview
+// orchestrator looks its trigger IDs up by exactly this name (see
+// preview.Orchestrator.TriggerIDs and main.go's previewTriggerIDs), and
+// docs/preview-environments.md's onboarding steps require it, so a preview
+// trigger that didn't match this would already be broken for other reasons.
+const previewTriggerSuffix = "-preview-build"
+
+// isPreviewBuild reports whether b came from a service's preview-build
+// trigger rather than its mainline one.
+//
+// TRIGGER_NAME is a default substitution Cloud Build sets on every
+// trigger-invoked build and returns in the Build resource, so this needs no
+// extra API call and no trigger-ID plumbing. A build without it (a
+// manually-submitted one) is not a preview build — but those carry no
+// REPO_NAME either, so latestByRepo has already dropped them.
+func isPreviewBuild(b *cloudbuild.Build) bool {
+	return strings.HasSuffix(b.Substitutions["TRIGGER_NAME"], previewTriggerSuffix)
+}
+
 // latestByRepo maps repo name → newest build. Builds must be ordered newest
 // first (the API's default ordering); the first build seen per repo wins.
+//
+// Preview builds are excluded outright, not merely ranked below mainline
+// ones. They share their service's REPO_NAME with the mainline builds, so
+// without this a failed preview build — someone's branch that doesn't
+// compile — would become the newest build for that repo and light the
+// service's Apps-tab BUILD cell up as "✗ build failed" while `main` was
+// perfectly healthy: a preview failure masquerading as a fleet failure. The
+// Apps tab is a view of the fleet, and a preview build is not a fleet fact;
+// where it does belong is the Previews tab, which reads the build through the
+// orchestrator (bifrost/error, log URL and all) rather than through here.
 func latestByRepo(builds []*cloudbuild.Build) map[string]BuildStatus {
 	out := map[string]BuildStatus{}
 	for _, b := range builds {
 		repo := b.Substitutions["REPO_NAME"]
 		if repo == "" {
 			continue // manually-submitted build, not from a trigger
+		}
+		if isPreviewBuild(b) {
+			continue
 		}
 		if _, ok := out[repo]; ok {
 			continue

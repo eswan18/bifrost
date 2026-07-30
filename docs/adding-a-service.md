@@ -70,6 +70,13 @@ GCP builds must find a Cloud Build trigger literally named `<name>-build`
 only applies at all if `GCP_PROJECT` is set (`k8s/base/configmap.yaml`);
 leave it unset fleet-wide to disable build badges entirely.
 
+The badge shows the newest **mainline** build only: `gcb.latestByRepo` drops
+builds whose `TRIGGER_NAME` ends in `-preview-build`. A preview build carries
+the same `REPO_NAME` as its service's mainline builds, so without that a
+failed preview of someone's branch would light the service's card up as
+"✗ build failed" while `main` was fine. Preview build state belongs to the
+Previews tab, which reads it from the preview orchestrator instead.
+
 ## 2. Everything else (bifrost doesn't own this)
 
 Bifrost assumes conventions rather than configuring around them (see the

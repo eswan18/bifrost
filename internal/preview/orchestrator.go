@@ -614,9 +614,43 @@ func (o *Orchestrator) awaitBuild(ctx context.Context, buildID string) (string, 
 		// plus CANCELLED (deliberate, not a Failed()). Anything other than a
 		// clean SUCCESS means the run doesn't get a usable image.
 		if status.Status != "SUCCESS" {
-			return "", fmt.Errorf("build ended with status %s", status.Status)
+			return "", buildFailure(buildID, status)
 		}
 		return status.SHA, nil
+	}
+}
+
+// buildFailure turns a non-SUCCESS terminal build into the error that
+// eventually lands in bifrost/error — the string `ib preview up`, `ib preview
+// list`, the Previews tab and the detail page all display verbatim.
+//
+// It carries the build's console LOG URL, because "build ended with status
+// FAILURE" on its own names a status and gives an operator nothing to act on:
+// the next move is always to go read that build's log, and without the link
+// that means hand-navigating the Cloud Build console guessing which run was
+// theirs. The URL is the one piece of build diagnosis that is safe to put
+// here. Build LOGS deliberately are not, and must not be added later — a log
+// line can carry anything, secrets included, and this annotation is served
+// over the API and rendered in a browser (the same reasoning that keeps
+// waitForPods from ever fetching pod logs). A console URL is a pointer, not
+// content: it discloses nothing on its own and still requires the reader's
+// own GCP authorization.
+//
+// LogURL is populated by Cloud Build for every triggered build, failures
+// included, so the linked form is what an operator sees in practice. The
+// bare-status fallback is for the case where the API returned one without it
+// — then the build ID goes in instead, which is enough for `gcloud builds
+// log <id>`, rather than emitting a dangling "see: " that points nowhere.
+// The ID is omitted from the linked form on purpose: the URL already ends in
+// it, and this string has to stay readable in a table cell.
+func buildFailure(buildID string, status gcb.BuildStatus) error {
+	switch {
+	case status.LogURL != "":
+		return fmt.Errorf("build ended with status %s: %s", status.Status, status.LogURL)
+	case buildID != "":
+		return fmt.Errorf("build ended with status %s (build %s)", status.Status, buildID)
+	default:
+		return fmt.Errorf("build ended with status %s", status.Status)
 	}
 }
 

@@ -8,8 +8,15 @@
      muted/error color classes fleet.go already assigns job StateClass — so a
      creating or failed preview reads like "creating · building
      footstrike-api (1/2)" or "failed · building footstrike-api (1/2) —
-     build ended with status FAILURE". A ready preview (Step/Error both "")
-     renders its bare phase, identical to before this was added.
+     build for footstrike-api: build ended with status FAILURE:
+     https://console.cloud.google.com/cloud-build/builds/...". A ready
+     preview (Step/Error both "") renders its bare phase, identical to before
+     this was added.
+
+     .Error can therefore carry a URL. It is interpolated as TEXT, never
+     marked safe and never rendered as a link: html/template escapes it here,
+     which is exactly what must keep happening — an operator-facing error
+     string is not a place to start honoring markup.
 
      The AGE cell additionally folds in .ExpiresAt (via preview-expiry)
      rather than adding a seventh grid column — jobs-grid's CSS is a fixed
