@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +233,72 @@ func TestRecordFromNamespaceAutoUpdate(t *testing.T) {
 				t.Errorf("AutoUpdate = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRecordFromNamespaceBuiltImages pins the bifrost/built-images read: a
+// well-formed annotation surfaces per-member commit/shortSha pairs, an absent
+// annotation degrades to the field's clean zero value (nil map, matching an
+// older preview that predates this annotation entirely) rather than an
+// error, and a malformed one drops only the entries it can't parse — same
+// fail-safe shape as internal/preview's parseBuiltImages, pinned directly by
+// TestBuiltImagesAnnotationRoundTrips in that package.
+func TestRecordFromNamespaceBuiltImages(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api,footstrike-dashboard", "ready")
+		ns.Annotations["bifrost/built-images"] = "footstrike-api=deadbeef0123456789:deadbee,footstrike-dashboard=c0ffee1122334455:c0ffee1"
+
+		got := recordFromNamespace(ns).BuiltImages
+		want := map[string]builtImageRecord{
+			"footstrike-api":       {Commit: "deadbeef0123456789", ShortSHA: "deadbee"},
+			"footstrike-dashboard": {Commit: "c0ffee1122334455", ShortSHA: "c0ffee1"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("BuiltImages = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("absent annotation yields a clean zero value", func(t *testing.T) {
+		ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+		if got := recordFromNamespace(ns).BuiltImages; got != nil {
+			t.Errorf("BuiltImages = %+v, want nil for an absent annotation", got)
+		}
+	})
+
+	t.Run("malformed entries are dropped, not errored", func(t *testing.T) {
+		ns := nsInfo("preview-x", "x", "footstrike-api,footstrike-dashboard", "ready")
+		// footstrike-api's entry is well-formed; footstrike-dashboard's is
+		// missing its short SHA and must not appear at all.
+		ns.Annotations["bifrost/built-images"] = "footstrike-api=deadbeef0123456789:deadbee,footstrike-dashboard=c0ffee1122334455:"
+
+		got := recordFromNamespace(ns).BuiltImages
+		want := map[string]builtImageRecord{"footstrike-api": {Commit: "deadbeef0123456789", ShortSHA: "deadbee"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("BuiltImages = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("wholly unparseable annotation yields the same zero value as absent", func(t *testing.T) {
+		ns := nsInfo("preview-x", "x", "footstrike-api", "ready")
+		ns.Annotations["bifrost/built-images"] = "garbage"
+		if got := recordFromNamespace(ns).BuiltImages; got != nil {
+			t.Errorf("BuiltImages = %+v, want nil for an unparseable annotation", got)
+		}
+	})
+}
+
+// TestPreviewJSONOmitsBuiltImagesWhenAbsent pins the wire shape: an absent
+// annotation must not render as `"builtImages":{}` or `"builtImages":null` —
+// omitempty must drop the key entirely, same contract as autoUpdate/busy
+// above, so an old preview's JSON is byte-for-byte what it always was.
+func TestPreviewJSONOmitsBuiltImagesWhenAbsent(t *testing.T) {
+	h := &Handlers{Kube: &fakeKube{namespaces: []kube.NamespaceInfo{
+		nsInfo("preview-x", "x", "footstrike-api", "ready"),
+	}}}
+	rec := httptest.NewRecorder()
+	h.PreviewsListJSON(rec, httptest.NewRequest("GET", "/api/previews", nil))
+	if body := rec.Body.String(); strings.Contains(body, "builtImages") {
+		t.Errorf("body = %q, want builtImages omitted for a preview with no such annotation", body)
 	}
 }
 

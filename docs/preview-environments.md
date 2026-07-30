@@ -87,6 +87,20 @@ bifrost's own in-process state, not cluster state — and that is exactly why
 it's reported: it's the reason a concurrent `up`/`down` gets a 409, and
 without it nothing in the API said so.
 
+`builtImages` reports what each member's last *successful* build produced
+(`bifrost/built-images` — see step 4, "Build", below), keyed by service name
+as `{"commit": "<full sha>", "shortSha": "<7 chars>"}`. It's `omitempty`, and
+a member missing from the map — including every member, for the whole key to
+be absent — means nothing is recorded for it: an older preview from before
+this field existed, or one whose most recent build never succeeded. That is
+this field's clean zero value, the same one a malformed annotation degrades
+to, never an error. It exists so a caller can diff this map across a re-run
+of `up` and tell whether anything was actually rebuilt: a preview that
+reused every image reports the identical commit for every member, which
+`step` cannot show once the run reaches `ready` — `step` is cleared to `""`
+on success, and a re-run that reuses everything can finish inside a single
+poll interval.
+
 ### Busy with no namespace
 
 A tag can be claimed while **no namespace exists for it**, in both directions:
