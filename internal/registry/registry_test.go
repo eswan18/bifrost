@@ -178,11 +178,14 @@ func TestLoad(t *testing.T) {
 		if !reflect.DeepEqual(svc.Preview.Env, wantEnv) {
 			t.Errorf("Preview.Env = %v, want %v", svc.Preview.Env, wantEnv)
 		}
-		// identity isn't previewable yet in the sense of having a verified
-		// migration invocation -- inventing one would be untested
-		// speculation, so it must stay unset.
-		if svc.Preview.Migrate != nil {
-			t.Errorf("Preview.Migrate = %v, want nil (identity has no verified migrate command)", svc.Preview.Migrate)
+		// identity gained a `migrate` subcommand (identity#127): the
+		// absolute path is deliberate, not a copy-paste slip from
+		// footstrike-api's bare "alembic" -- see the comment beside this key
+		// in registry.yaml for why identity's image needs it and
+		// footstrike-api's doesn't.
+		wantMigrate := []string{"/app/auth-service", "migrate"}
+		if !reflect.DeepEqual(svc.Preview.Migrate, wantMigrate) {
+			t.Errorf("Preview.Migrate = %v, want %v", svc.Preview.Migrate, wantMigrate)
 		}
 	})
 

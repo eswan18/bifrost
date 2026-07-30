@@ -388,6 +388,86 @@ func TestRenderMigrateInitContainer(t *testing.T) {
 	}
 }
 
+// TestRenderIdentityMigrateInitContainer pins the render-layer half of
+// identity's own migrate: entry (internal/registry/registry_test.go pins
+// the registry-parsing half): given the exact two-element command
+// registry.yaml declares for identity -- ["/app/auth-service", "migrate"],
+// an absolute path, unlike footstrike-api's bare "alembic" above -- Render
+// must produce a migrate initContainer whose command is byte-identical to
+// it. TestRenderMigrateInitContainer already proves the generic mechanism
+// (any Migrate slice becomes a "migrate" initContainer sharing the app
+// image/envFrom) against footstrike-api's bare-word command; this test
+// exists because a regression that mangled a command containing a leading
+// "/" specifically (e.g. some future refactor that treated in.Migrate as a
+// single shell string instead of an argv slice) would pass that alembic-
+// shaped input undetected.
+func TestRenderIdentityMigrateInitContainer(t *testing.T) {
+	envConfig := loadEnvConfigFixture(t, "identity")
+	wantCommand := []string{"/app/auth-service", "migrate"}
+	in := RenderInput{
+		Service:    "identity",
+		Tag:        "hae-cadence",
+		ShortSHA:   "abc1234",
+		K8sFiles:   loadK8sFixture(t, "identity"),
+		EnvConfig:  envConfig,
+		SecretName: "identity-preview-secrets",
+		Migrate:    wantCommand,
+	}
+
+	objs, err := Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	dep := findObject(t, objs, "Deployment", "identity")
+
+	initContainers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers")
+	if err != nil || !found || len(initContainers) != 1 {
+		t.Fatalf("initContainers = %v (found=%v, err=%v), want exactly 1", initContainers, found, err)
+	}
+	initContainer, ok := initContainers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initContainers[0] is not a map: %T", initContainers[0])
+	}
+
+	if name, _ := initContainer["name"].(string); name != "migrate" {
+		t.Errorf("initContainer name = %q, want %q", name, "migrate")
+	}
+
+	wantCommandAny := []any{"/app/auth-service", "migrate"}
+	if !reflect.DeepEqual(initContainer["command"], wantCommandAny) {
+		t.Errorf("initContainer command = %v, want %v", initContainer["command"], wantCommandAny)
+	}
+
+	// Same load-bearing image-identity assertion as
+	// TestRenderMigrateInitContainer: a mismatch here would mean the
+	// migration silently ran against the wrong schema version.
+	containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+	if len(containers) != 1 {
+		t.Fatalf("containers = %v, want exactly 1", containers)
+	}
+	appContainer, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("containers[0] is not a map: %T", containers[0])
+	}
+	wantImage := imageRepoBase + "/identity:preview-abc1234"
+	appImage, _ := appContainer["image"].(string)
+	migrateImage, _ := initContainer["image"].(string)
+	if appImage != wantImage {
+		t.Fatalf("app container image = %q, want %q", appImage, wantImage)
+	}
+	if migrateImage != wantImage {
+		t.Errorf("initContainer image = %q, want %q (must match the app container's retagged image exactly)", migrateImage, wantImage)
+	}
+
+	// envFrom must be the identical list the app container gets, so the
+	// migrate step sees DATABASE_URL from the same preview Secret the app
+	// does.
+	if !reflect.DeepEqual(initContainer["envFrom"], appContainer["envFrom"]) {
+		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
+	}
+}
+
 func TestRenderDashboard(t *testing.T) {
 	in := RenderInput{
 		Service:  "footstrike-dashboard",

@@ -757,6 +757,18 @@ up against an out-of-date schema. Omitting `migrate:` renders no
 initContainers at all. Because the whole pod is blocked on it, a failed
 migration is what step 8's readiness wait is most often reporting.
 
+The command is whatever invokes that ability inside the service's own
+runtime image, and the two services that declare one today resolve it
+differently: footstrike-api's `["alembic", "upgrade", "head"]` is a bare
+command because its image puts `.venv/bin` on `PATH` via its own `ENV`;
+identity's `["/app/auth-service", "migrate"]` is an absolute path because
+identity's image never adds its `WORKDIR /app` to `PATH`, so a bare
+`auth-service` would fail the initContainer immediately with "executable
+file not found in $PATH" before the `migrate` subcommand ever ran. Each
+service's entry carries a comment explaining which convention it needs and
+why — don't "simplify" one to match the other without checking that
+service's own Dockerfile first.
+
 Three template forms (`internal/preview/template.go`'s `Eval`), each either a
 literal (no `{{`/`}}`, passed through unchanged) or exactly one
 `{{ func arg }}`:
@@ -970,3 +982,36 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   anything, including secrets, and `bifrost/error` is served over the API.
   Fix the branch and re-run `ib preview up`; teardown (`ib preview down`) is
   unaffected either way.
+- **A `migrate:` key doesn't retroactively cover images built before the
+  service's binary could run it.** Preview images are built from the
+  **preview branch itself**, never main (step 4) — so turning on `migrate:`
+  for a service only helps once every branch anyone previews from also
+  carries that service's ability to run it. identity gained its `migrate`
+  subcommand in identity#127 (main commit `8d50953`); a branch cut before
+  that has an `auth-service` binary with no argument handling at all, so
+  `/app/auth-service migrate` does **not** fail with an unrecognized-command
+  error — it silently ignores the `migrate` argument and runs the ordinary
+  server startup path inside what bifrost intends as the migrate
+  initContainer. Two outcomes follow, depending on the branch:
+  - If the branch's expected schema already matches the Neon-branched
+    staging database (the common case — most stale branches carry no new
+    migrations), `migrations.Verify` passes and the "initContainer" just
+    starts serving HTTP and never exits. The real app container never
+    starts, `kubectl` shows `Init:0/1`, and step 8's readiness wait — which
+    treats the app container's `PodInitializing` as non-fatal, precisely so
+    a real migration has time to finish — burns its full 5-minute bound
+    before failing with a plain `timed out after 5m0s waiting for pods:
+    identity not ready: PodInitializing`. Nothing in that message names the
+    actual cause.
+  - If the branch does carry an unapplied migration, `migrations.Verify`'s
+    existing fail-closed check still catches it and the pod crash-loops
+    exactly as it always did before identity had any `migrate:` wiring —
+    that failure mode is unchanged.
+
+  Either way the fix is the same: rebase the branch onto identity's main
+  past `8d50953`. This is an accepted cost of turning migrations on at all,
+  but the common case's failure signature is an unhelpful generic timeout
+  rather than something that names what happened — if a preview is stuck at
+  `Init:0/1` with no more specific reason than `PodInitializing`, check
+  whether the branch predates the image's `migrate` support before looking
+  anywhere else.
