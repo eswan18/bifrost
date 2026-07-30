@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -184,6 +185,102 @@ func TestErrorStatusSurfaces(t *testing.T) {
 	c := NewWithBaseURL("neon-key", srv.URL)
 	if _, err := c.ListBranches(context.Background(), "proj-abc"); err == nil {
 		t.Error("expected error on 429")
+	}
+}
+
+// TestErrorIncludesBodyExcerpt pins the reason this file exists: Neon puts
+// its explanation of a 4xx in the response body (a free-tier branch limit, a
+// storage limit, ...), and a bare status code throws that away. Without
+// reading the body, the error is indistinguishable from any other failure —
+// this is the only signal such a bound was ever hit.
+func TestErrorIncludesBodyExcerpt(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("POST /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"code":"branch_limit_exceeded","message":"Your project has reached the maximum number of branches allowed for the free plan"}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	_, err := c.CreateBranch(context.Background(), "proj-abc", "preview-hae-cadence", "")
+	if err == nil {
+		t.Fatal("expected an error on 422")
+	}
+	if !strings.Contains(err.Error(), "branch_limit_exceeded") || !strings.Contains(err.Error(), "maximum number of branches") {
+		t.Errorf("error = %q, want it to carry Neon's own explanation of the 422", err)
+	}
+}
+
+// TestErrorEmptyBodyHasNoDanglingSeparator covers the degrade-cleanly case: a
+// non-2xx response that writes no body at all (a bare status-only failure,
+// same as a 429 from a rate limiter with nothing to say) must not leave a
+// trailing ": " with nothing after it.
+func TestErrorEmptyBodyHasNoDanglingSeparator(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	_, err := c.ListBranches(context.Background(), "proj-abc")
+	if err == nil {
+		t.Fatal("expected an error on 429")
+	}
+	const want = "neon GET /projects/proj-abc/branches returned 429"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q (no dangling separator on an empty body)", err.Error(), want)
+	}
+}
+
+// TestErrorBodyExcerptIsCappedAndFlattened covers both halves of the
+// sanitization this string needs before it's safe to reach the bifrost/error
+// annotation (served over bifrost's JSON API and rendered in the browser): a
+// multi-kilobyte body — the shape of an HTML error page from a proxy sitting
+// in front of Neon — must not survive whole, and embedded newlines must not
+// survive at all.
+func TestErrorBodyExcerptIsCappedAndFlattened(t *testing.T) {
+	srv, mux := newTestServer(t)
+	huge := "line one\nline two\n" + strings.Repeat("x", 5000)
+	mux.HandleFunc("GET /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(huge))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	_, err := c.ListBranches(context.Background(), "proj-abc")
+	if err == nil {
+		t.Fatal("expected an error on 502")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "\n") {
+		t.Errorf("error = %q, want whitespace flattened", msg)
+	}
+	if len(msg) > 300 {
+		t.Errorf("error is %d bytes long, want it capped well under the 5000+-byte raw body", len(msg))
+	}
+	if !strings.HasSuffix(msg, "...") {
+		t.Errorf("error = %q, want a truncation marker showing it was cut", msg)
+	}
+}
+
+// TestConnectionURIErrorNeverIncludesBody is the one exception to
+// TestErrorIncludesBodyExcerpt. ConnectionURI's own success response is a
+// credentialed Postgres connection string, so its error path must never
+// surface the response body at all — not merely "usually doesn't", since a
+// general sanitizer built for CamelCase pod reasons and JSON error objects
+// has no reason to recognize a postgres:// URI if one ever appeared here.
+// The body below plants one to prove the exclusion is unconditional, not
+// coincidental.
+func TestConnectionURIErrorNeverIncludesBody(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/connection_uri", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"not_found","message":"branch not found","uri":"postgresql://should_never_appear:pw@ep-x.neon.tech/db"}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	_, err := c.ConnectionURI(context.Background(), "proj-abc", "br-missing", "fitnessdb", "fitness_owner")
+	if err == nil {
+		t.Fatal("expected an error on 404")
+	}
+	const want = "neon GET /projects/proj-abc/connection_uri?branch_id=br-missing&database_name=fitnessdb&role_name=fitness_owner returned 404"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q (no body content at all, credential-shaped or not)", err.Error(), want)
 	}
 }
 

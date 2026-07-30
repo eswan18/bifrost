@@ -503,6 +503,16 @@ still swept. A failure to list *namespaces*, by contrast, aborts the whole pass
 without deleting anything — an empty live set alongside a full branch list is
 indistinguishable from "every preview is an orphan."
 
+Each project's total branch count — everything that same `ListBranches` call
+returned, not just the `preview-*` ones the rules above go on to judge — is
+also logged, at debug, on every sweep. Nothing else in bifrost counts
+branches, storage, compute, or build minutes against Neon's own quotas, so
+this is the only visibility into where a project stands *before* a limit is
+hit, rather than only after (as an opaque Neon error once a create fails
+against one). It's debug rather than info for the same reason "sweep
+reclaimed nothing" is: it's the routine, every-project-every-hour case, not
+something that happened.
+
 **The ordering invariant this rests on.** "A branch with no namespace is an
 orphan" is only true because `Up` calls `EnsureNamespace` **before**
 `branchNeonDatabases`: a preview gets its namespace before it gets its Neon
@@ -721,6 +731,20 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   preview whose namespace is `Terminating` reports neither — the annotations
   are still on the namespace, but the API record and the UI row suppress them,
   so a teardown never reads as a build in progress.
+- **A `failed` phase from step 5 (Neon branch) carries a sanitized excerpt of
+  Neon's own error body**, not just the bare HTTP status — e.g.
+  `neon POST /projects/aged-river-81935268/branches returned 422:
+  {"code":"branch_limit_exceeded","message":"..."}`. Neon puts the actual
+  explanation (a free-tier branch limit, a storage limit, or any other quota)
+  in the response body, and nothing in bifrost otherwise counts branches,
+  storage, compute, or build minutes against those quotas — so that excerpt is
+  the only signal such a bound was ever reached. It's whitespace-flattened and
+  capped (`internal/neon`'s own copy of the `sanitizeReason` convention, since
+  importing `internal/preview` back into `internal/neon` would cycle) before
+  it can reach `bifrost/error`, which is served over the API and rendered in
+  the browser. The one exception is the connection-URI call: its success
+  response is a credentialed connection string, so its error path never reads
+  the response body at all, regardless of what it might contain.
 - **A `failed` phase from the readiness wait means the pods didn't come up**,
   not that anything bifrost did went wrong — the namespace, secrets, Neon
   branch and manifests are all in place, so `kubectl -n preview-<tag>

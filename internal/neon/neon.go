@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -63,7 +64,12 @@ func NewWithBaseURL(apiKey, baseURL string) Client {
 // okStatuses lists the exact status codes the endpoint returns on success;
 // anything else is an error. (Neon's deleteProjectBranch, for one, documents
 // both 200 and 204 as success.)
-func (c *client) do(ctx context.Context, method, path string, body any, out any, okStatuses ...int) error {
+//
+// includeBodyInError controls whether a non-2xx response's body is read at
+// all for the error message — see errBodyExcerpt. It is false only for
+// ConnectionURI's call (see its own doc comment for why), true everywhere
+// else.
+func (c *client) do(ctx context.Context, method, path string, body any, out any, includeBodyInError bool, okStatuses ...int) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -94,7 +100,7 @@ func (c *client) do(ctx context.Context, method, path string, body any, out any,
 		}
 	}
 	if !ok {
-		return fmt.Errorf("neon %s %s returned %d", method, path, resp.StatusCode)
+		return fmt.Errorf("neon %s %s returned %d%s", method, path, resp.StatusCode, errBodyExcerpt(resp.Body, includeBodyInError))
 	}
 	if out == nil {
 		return nil
@@ -102,12 +108,62 @@ func (c *client) do(ctx context.Context, method, path string, body any, out any,
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// maxErrBodyRead bounds how much of a non-2xx response is even READ before
+// errBodyExcerpt trims it further. Neon errors are normally a small JSON
+// object, but a proxy in front of the API can return a multi-kilobyte HTML
+// error page instead, and this must never buffer all of that just to throw
+// most of it away — hence a limited reader rather than io.ReadAll(resp.Body).
+const maxErrBodyRead = 4096
+
+// maxErrBodyExcerpt is the cap actually kept, in runes, after whitespace is
+// flattened. This string can end up in the bifrost/error annotation, which is
+// served over bifrost's JSON API and rendered in the browser — the same
+// exposure internal/preview.sanitizeReason exists for, and this mirrors its
+// cap (160) and its "flatten whitespace, truncate with an ellipsis" shape.
+// The two aren't shared code: internal/preview already imports this package
+// for neon.Client, so importing back here would cycle. Behavior, not the
+// function, is what's kept identical.
+const maxErrBodyExcerpt = 160
+
+// errBodyExcerpt renders a non-2xx response body as ": <excerpt>" for
+// appending to an error, or "" when there's nothing usable to add — so a
+// caller never ends up with a dangling ": " when the body is empty, absent,
+// or excluded.
+//
+// includeBody is the do call's includeBodyInError: when false, the body is
+// never even read.
+func errBodyExcerpt(body io.Reader, includeBody bool) string {
+	if !includeBody {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxErrBodyRead))
+	if err != nil {
+		return ""
+	}
+	excerpt := sanitizeErrBody(string(raw))
+	if excerpt == "" {
+		return ""
+	}
+	return ": " + excerpt
+}
+
+// sanitizeErrBody flattens whitespace and caps length — see maxErrBodyExcerpt
+// for why this duplicates internal/preview.sanitizeReason's behavior instead
+// of calling it.
+func sanitizeErrBody(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxErrBodyExcerpt {
+		s = string(r[:maxErrBodyExcerpt]) + "..."
+	}
+	return s
+}
+
 func (c *client) ListBranches(ctx context.Context, projectID string) ([]Branch, error) {
 	var body struct {
 		Branches []Branch `json:"branches"`
 	}
 	path := "/projects/" + url.PathEscape(projectID) + "/branches"
-	if err := c.do(ctx, http.MethodGet, path, nil, &body, http.StatusOK); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, &body, true, http.StatusOK); err != nil {
 		return nil, err
 	}
 	return body.Branches, nil
@@ -126,7 +182,7 @@ func (c *client) CreateBranch(ctx context.Context, projectID, name, parentID str
 		Branch Branch `json:"branch"`
 	}
 	path := "/projects/" + url.PathEscape(projectID) + "/branches"
-	if err := c.do(ctx, http.MethodPost, path, req, &body, http.StatusCreated); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, req, &body, true, http.StatusCreated); err != nil {
 		return Branch{}, err
 	}
 	return body.Branch, nil
@@ -137,9 +193,26 @@ func (c *client) DeleteBranch(ctx context.Context, projectID, branchID string) e
 	// Neon returns 200 when the branch was deleted, and 204 when it was
 	// already gone; both mean the branch no longer exists, so both count as
 	// success for this idempotent teardown operation.
-	return c.do(ctx, http.MethodDelete, path, nil, nil, http.StatusOK, http.StatusNoContent)
+	return c.do(ctx, http.MethodDelete, path, nil, nil, true, http.StatusOK, http.StatusNoContent)
 }
 
+// ConnectionURI's success response is a credentialed Postgres connection
+// string — the value internal/preview's own doc comments repeatedly warn
+// must never be logged or embedded in an error (see branchNeonDatabases and
+// fail in orchestrator.go: "it's a secret" / "never a secret value"). Its
+// error path therefore passes includeBodyInError=false and never reads the
+// response body at all, rather than trusting the general sanitizer to notice
+// a URI it wasn't written to look for.
+//
+// This is deliberately conservative, not a reaction to an observed leak:
+// Neon's error responses across the API share one general error shape
+// (a small {code, message} object, per its published spec), not the shape of
+// whatever endpoint failed, so there is no reason to expect getConnectionURI
+// to echo the uri field it failed to produce. But this is the one endpoint
+// whose entire job is handing back credentials, so it gets the one exception
+// that costs nothing: on failure there is no successful URI to report
+// anyway, and every other Neon error already names the operation and status
+// code without it.
 func (c *client) ConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error) {
 	q := url.Values{
 		"branch_id":     {branchID},
@@ -150,7 +223,7 @@ func (c *client) ConnectionURI(ctx context.Context, projectID, branchID, databas
 		URI string `json:"uri"`
 	}
 	path := "/projects/" + url.PathEscape(projectID) + "/connection_uri?" + q.Encode()
-	if err := c.do(ctx, http.MethodGet, path, nil, &body, http.StatusOK); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, &body, false, http.StatusOK); err != nil {
 		return "", err
 	}
 	return body.URI, nil

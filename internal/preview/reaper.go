@@ -281,6 +281,15 @@ func (o *Orchestrator) PurgeOrphanedBranches(ctx context.Context, now time.Time)
 			errs = append(errs, fmt.Errorf("orphan sweep %s: list branches: %w", project, err))
 			continue
 		}
+		// Nothing anywhere else in bifrost counts branches, storage, compute,
+		// or build minutes against Neon's own quotas, so this is the only
+		// signal of where a project stands before a limit is hit rather than
+		// only after (a Neon error surfacing one). It costs nothing beyond
+		// what ListBranches above already fetched, and — like "sweep
+		// reclaimed nothing" in RunReaper — it fires every project, every
+		// hour, forever, which is exactly why it's debug rather than info:
+		// routine state, not something that happened.
+		slog.Debug("preview: orphan sweep branch count", "project", project, "count", len(branches))
 		for _, b := range branches {
 			tag, named := strings.CutPrefix(b.Name, previewNSPrefix)
 			if !named || tag == "" {
