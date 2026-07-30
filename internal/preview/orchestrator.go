@@ -31,6 +31,20 @@ var ErrBusy = errors.New("preview: orchestration already in progress for this ta
 // generic failure: it is a wait-and-retry condition, not a broken preview.
 var ErrTerminating = errors.New("preview: the previous teardown of this preview is still in progress; retry once it finishes")
 
+// ErrTagCollision reports that the tag's namespace already exists and was
+// created for a DIFFERENT branch. TagForBranch is many-to-one (see tag.go), so
+// two branch names can derive the same tag; without this the second Up would
+// silently adopt the first's environment — its namespace, and its Neon branch
+// with whatever migrations the first branch applied — and a later Down on that
+// tag would destroy both.
+//
+// Distinguished from ErrBusy and ErrTerminating — and from every other Up
+// failure — because it is neither a wait-and-retry condition nor a broken
+// preview: nothing will clear it on its own, and it needs a human decision
+// (rename the branch, or tear the other preview down). The error wrapping it
+// names both branches so that decision can be made from the message alone.
+var ErrTagCollision = errors.New("preview: this preview tag already belongs to a different branch; rename the branch, or tear the existing preview down")
+
 // buildPollInterval is how often Up polls Cloud Build for a preview build's
 // status. A var (not a const) so tests can shrink it instead of waiting on
 // the real interval.
@@ -198,15 +212,18 @@ type UpOptions struct {
 // Every stage past EnsureNamespace that fails — the readiness wait
 // included — marks the namespace bifrost/phase=failed with a sanitized
 // bifrost/error annotation before returning; stage-1 validation failures
-// (bad membership, an unresolvable dashboard triple), and the
-// still-Terminating refusal that immediately precedes EnsureNamespace, all
-// return before the namespace is ever touched, so they never leave a zombie
-// behind.
+// (bad membership, an unresolvable dashboard triple), and both pre-flight
+// refusals that immediately precede EnsureNamespace (a still-Terminating
+// namespace, and one another branch already owns — see
+// refuseUnusableNamespace), all return before the namespace is ever touched,
+// so they never leave a zombie behind.
 //
 // Idempotent re-`Up` (e.g. after a bifrost restart mid-creation, or a
 // deliberate re-POST once the branch has new commits) is the recovery path:
 // EnsureNamespace, CopySecret, and ApplyObjects all merge/replace rather than
 // erroring on "already exists", and Neon branch creation is scan-then-create.
+// The refusals above are scoped so as not to touch it: re-running the SAME
+// branch is exactly what they let through.
 //
 // opts carries the run's optional state (expiry, auto-update); see
 // UpOptions, whose zero value — no expiry, no auto-update — is the default.
@@ -259,7 +276,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 	}
 
 	ns := previewNamespace(tag)
-	if err := o.refuseTerminating(ctx, ns); err != nil {
+	if err := o.refuseUnusableNamespace(ctx, ns, tag, branch); err != nil {
 		return err
 	}
 	if err := o.Kube.EnsureNamespace(ctx, ns,
@@ -339,12 +356,25 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 	return nil
 }
 
-// refuseTerminating fails the run, before it has done anything, when ns
-// already exists and Kubernetes is deleting it.
+// refuseUnusableNamespace fails the run, before it has done anything, when ns
+// already exists in a state this Up must not proceed into. There are two, both
+// decided off the single GetNamespace below — one API call, taken immediately
+// before EnsureNamespace — and each carrying its own sentinel so the API layer
+// and the CLI can tell them apart:
 //
-// It exists because EnsureNamespace cannot report this. The API server
-// happily accepts a metadata update on a namespace in phase Terminating, so
-// EnsureNamespace SUCCEEDS against one — there is no error for Up to catch,
+//   - Kubernetes is deleting the namespace (ErrTerminating).
+//   - the namespace was created for a DIFFERENT branch that derives the same
+//     tag (ErrTagCollision).
+//
+// An existing namespace for the SAME branch is the ordinary case and is
+// untouched by either: re-running `ib preview up` on a branch is the
+// documented recovery path, and the auto-update watcher re-runs Up on the
+// recorded branch every time a member's SHA moves.
+//
+// The Terminating check exists because EnsureNamespace cannot report it. The
+// API server happily accepts a metadata update on a namespace in phase
+// Terminating, so EnsureNamespace SUCCEEDS against one — there is no error
+// for Up to catch,
 // and Up used to walk straight on into a run that could not possibly finish:
 // both Cloud Builds run, the Neon branches get created, and the first call
 // that tries to CREATE something inside the doomed namespace (copySecrets) is
@@ -379,11 +409,39 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // and `ib preview list` would show nothing at all meanwhile. The caller gets
 // a named error and decides.
 //
+// The different-branch check exists because TagForBranch is many-to-one: by
+// truncation (feature/add-user-profile-avatars-v1 and ...-v2 share their first
+// maxTagLen characters) and, independently, by character folding with no
+// truncation at all (feat/foo, feat_foo and feat-foo all fold to feat-foo).
+// Every layer underneath quietly merged the two branches together and not one
+// of them warned. EnsureNamespace merges, overwriting bifrost/branch with the
+// newcomer's name; ensureNeonBranch finds the existing preview-<tag> branch by
+// name and REUSES it, inheriting whatever migrations the first branch's
+// migrate initContainer applied; and a later `ib preview down` on that tag
+// destroys both previews at once. The second developer gets the first
+// developer's database and schema, and neither is told.
+//
+// It is caught here rather than made impossible in TagForBranch on purpose —
+// see the note in tag.go: appending a hash to truncated tags closes only the
+// truncation path, leaves folding wide open, and would change the tag of every
+// existing long-branch preview, orphaning its namespace and its Neon branch.
+// The refusal is the general fix and costs no extra API call, since the
+// annotations are already in hand from the read above.
+//
+// A namespace carrying NO bifrost/branch annotation is deliberately NOT
+// refused. Absence is not evidence of a collision — a preview created before
+// bifrost recorded the branch, or a namespace left behind by a partial or
+// out-of-band run, looks exactly like this — and refusing would strand it:
+// nothing but a manual `ib preview down` could ever get past the guard again,
+// including the very re-run that would repair it. Proceeding also fixes it,
+// because the EnsureNamespace immediately below writes the annotation this
+// read went looking for.
+//
 // A GetNamespace that fails aborts the run too. A namespace bifrost cannot
 // read is not evidence that it is safe to build into — the same reading the
 // expiry sweep applies to its own re-read — and proceeding on an unknown is
 // precisely the bug being fixed here.
-func (o *Orchestrator) refuseTerminating(ctx context.Context, ns string) error {
+func (o *Orchestrator) refuseUnusableNamespace(ctx context.Context, ns, tag, branch string) error {
 	existing, found, err := o.Kube.GetNamespace(ctx, ns)
 	if err != nil {
 		return fmt.Errorf("preview: Up: check namespace %s: %w", ns, err)
@@ -391,8 +449,19 @@ func (o *Orchestrator) refuseTerminating(ctx context.Context, ns string) error {
 	// Absent is the ordinary recreate-after-teardown path once the delete has
 	// actually finished: nothing to refuse, and EnsureNamespace below creates
 	// it fresh.
-	if found && existing.Phase == "Terminating" {
+	if !found {
+		return nil
+	}
+	// Terminating first: a namespace on its way out is about to stop existing,
+	// so whichever branch it belonged to is the less useful thing to say about
+	// it, and "retry once the teardown finishes" is the actionable verdict.
+	if existing.Phase == "Terminating" {
 		return fmt.Errorf("preview: Up: namespace %s is still Terminating: %w", ns, ErrTerminating)
+	}
+	if owner := existing.Annotations[branchAnnotationKey]; owner != "" && owner != branch {
+		return fmt.Errorf(
+			"preview: Up: preview tag %q (namespace %s) already belongs to branch %q, so branch %q cannot use it — both branch names derive the same tag: %w",
+			tag, ns, owner, branch, ErrTagCollision)
 	}
 	return nil
 }

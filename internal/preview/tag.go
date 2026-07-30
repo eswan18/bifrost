@@ -13,6 +13,24 @@ const maxTagLen = 30
 // character outside [a-z0-9-] is dropped; runs of '-' collapse to one;
 // leading and trailing '-' are trimmed; and the result is capped at
 // maxTagLen characters, trimming a trailing '-' the cut may leave behind.
+//
+// The mapping is MANY-TO-ONE, and is deliberately left that way. Two
+// independent paths collide: truncation
+// ("feature/add-user-profile-avatars-v1" and "...-v2" share their first
+// maxTagLen characters) and character folding, with no truncation involved at
+// all ("feat/foo", "feat_foo" and "feat-foo" all fold to "feat-foo").
+// TestTagForBranchIsManyToOne pins both, so the property stays a known
+// characteristic of this function rather than folklore.
+//
+// Do NOT "fix" it by appending a hash of the branch to a truncated tag. That
+// closes only the truncation path while leaving folding — which needs no long
+// branch name at all — wide open, and it would change the tag of every
+// existing long-branch preview, orphaning that preview's namespace and its
+// Neon branch from the `ib preview down` that should have reclaimed them. The
+// general fix is at the point of use instead: Up refuses to run against a
+// namespace another branch already owns (refuseUnusableNamespace and
+// ErrTagCollision in orchestrator.go), which catches both paths and every
+// other one a future edit here might introduce.
 func TagForBranch(branch string) string {
 	lower := strings.ToLower(branch)
 

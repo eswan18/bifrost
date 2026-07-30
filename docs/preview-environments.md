@@ -1,7 +1,9 @@
 # Preview environments
 
 Ephemeral, per-branch environments overlaid on staging: `ib preview up <branch>`
-stands up namespace `preview-<tag>` (`<tag>` = a slug of the branch name),
+stands up namespace `preview-<tag>` (`<tag>` = a slug of the branch name — see
+"Branch → tag" below, including what happens when two branches slug to the
+same one),
 containing only the apps whose repo has that branch pushed — everything else
 a preview app talks to resolves cross-namespace to shared staging.
 
@@ -119,6 +121,68 @@ Preview apps are reachable at `{app}-<tag>.preview.footstrike.run`,
 tailnet-only via the same shared `staging-ingress` Tailscale LB + `nginx`
 ingress class staging uses.
 
+## Branch → tag
+
+`<tag>` is `TagForBranch(branch)` (`internal/preview/tag.go`): the branch
+lowercased, with `/`, `_` and spaces turned into `-`, every other character
+outside `[a-z0-9-]` dropped, runs of `-` collapsed to one, leading and
+trailing `-` trimmed, and the result capped at **30 characters**
+(`maxTagLen` — a trailing `-` the cut leaves behind is trimmed too). So
+`Feat_X` → `feat-x`, `feat/preview API` → `feat-preview-api`, `änderung` →
+`nderung`. A branch whose name has no usable characters at all (`!!!???`)
+derives an empty tag and is rejected synchronously with a 400 (`branch does
+not produce a usable preview tag`).
+
+The tag names everything downstream: the namespace `preview-<tag>`, the Neon
+branch `preview-<tag>`, the hostnames `{app}-<tag>.preview.footstrike.run`,
+and the argument to `ib preview down <tag>`.
+
+### Two branches can derive the same tag
+
+**The mapping is many-to-one**, by two independent paths:
+
+- **truncation** — `feature/add-user-profile-avatars-v1` and `…-v2` share
+  their first 30 characters, so both derive `feature-add-user-profile-avata`.
+- **character folding**, with no truncation involved at all — `feat/foo`,
+  `feat_foo` and `feat-foo` all derive `feat-foo`.
+
+An `up` for a branch whose tag another branch's preview already holds is
+**refused** (step 3 of the lifecycle below), with `preview.ErrTagCollision`
+and a message naming both branches. Nothing is built, branched or applied, and
+the incumbent preview is left exactly as it was — including its
+`bifrost/branch` annotation.
+
+Before that refusal existed, the second `up` silently *adopted* the first
+preview: `EnsureNamespace` merges, so `bifrost/branch` was overwritten with
+the newcomer; the Neon branch is found by name, so the second branch inherited
+the first's database **and whatever migrations it had applied**; and one
+`ib preview down <tag>` destroyed both. No layer warned.
+
+Two ways out, and which one is right is yours to decide — bifrost can't:
+
+- **rename your branch** so it derives a different tag, then re-run `up`.
+  For a truncation collision the change has to land inside the first 30
+  characters; appending to the end of an already-too-long name changes
+  nothing. For a folding collision, change more than the separator.
+- **tear the other preview down** — `ib preview down <tag>` — if it's finished
+  with, then re-run `up`.
+
+The tag is deliberately **not** disambiguated with a hash of the branch name.
+That would close only the truncation path, leave folding (which needs no long
+branch name at all) wide open, and change the tag of every existing
+long-branch preview — orphaning its namespace and its Neon branch from the
+`down` that should have reclaimed them. The refusal is the general fix; see
+the note on `TagForBranch` in `internal/preview/tag.go`.
+
+**Note where the refusal surfaces.** `POST /api/previews` still answers
+**202**: `Up` runs in a background goroutine and the response has already
+been sent by the time the check runs, exactly as for `ErrTerminating`. The
+refusal is a `preview create failed` line in bifrost's logs, and the tag's own
+record is untouched — so `GET /api/previews/<tag>`, `ib preview list` and the
+Previews tab all go on describing **the other branch's** preview, at whatever
+phase it was already in. A tag showing a `BRANCH` that isn't the one you just
+ran `up` for is the symptom.
+
 ## Lifecycle (`Up`)
 
 1. **Resolve membership**: for every service in the registry
@@ -134,15 +198,38 @@ ingress class staging uses.
    resolved against an empty staging baseline, before the namespace or
    anything else is touched. This fails fast, cleanly, if — for
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
-3. **Refuse a namespace that's still terminating**, then **ensure the
-   namespace**. The refusal is a single `GetNamespace` immediately before the
-   write below: if `preview-<tag>` still exists in Kubernetes phase
-   `Terminating`, the run aborts right there with a distinguishable error
-   (`preview.ErrTerminating`, "the previous teardown of this preview is still
-   in progress; retry once it finishes") having triggered nothing.
+3. **Refuse an unusable namespace**, then **ensure the namespace**. The
+   refusals are a single `GetNamespace` immediately before the write below
+   (`refuseUnusableNamespace` in `orchestrator.go` — one API call, two
+   verdicts, each with its own error value so the caller can tell them apart),
+   and either one aborts the run right there having triggered nothing:
 
-   It's needed because the API server accepts a metadata update on a
-   terminating namespace, so `EnsureNamespace` **succeeds** against one and
+   - `preview-<tag>` exists in Kubernetes phase `Terminating` →
+     `preview.ErrTerminating` ("the previous teardown of this preview is still
+     in progress; retry once it finishes"). Checked first: a namespace on its
+     way out is about to stop existing, so whose it was is the less useful
+     thing to say about it.
+   - `preview-<tag>` exists carrying a `bifrost/branch` annotation naming a
+     **different** branch → `preview.ErrTagCollision`, in an error naming both
+     branches and the tag. See "Two branches can derive the same tag" above.
+
+   A namespace for the **same** branch is the ordinary case and passes both:
+   re-running `up` is the documented recovery path (see below and Gotchas), and
+   the auto-update watcher re-runs `Up` on the recorded branch every time a
+   member's SHA moves — a check that fired on the mere presence of a namespace
+   would break both, permanently.
+
+   A namespace carrying **no** `bifrost/branch` annotation at all also passes:
+   absence isn't evidence of a collision (a preview predating the annotation,
+   or one left by a partial or out-of-band run, looks exactly like this), and
+   refusing would strand it — nothing but a manual `ib preview down` could get
+   past the check again, including the re-run that would repair it. The
+   `EnsureNamespace` immediately below writes the annotation, so the state
+   heals itself.
+
+   The terminating half is needed because the API server accepts a metadata
+   update on a terminating namespace, so `EnsureNamespace` **succeeds**
+   against one and
    there is no error to catch. Without the check, tearing a preview down and
    immediately recreating it ran both Cloud Builds and branched Neon against a
    namespace that was disappearing the whole time, dying two and a half
@@ -266,8 +353,10 @@ Any failure after step 3 sets `bifrost/phase: failed` with a sanitized
 **deliberately leaves `bifrost/step`/`bifrost/step-since` in place** — the last
 step is half the diagnostic (which stage it died in, and when), so it's kept
 alongside the error rather than cleared; see Gotchas for how that reads. A
-failure in steps 1–2 returns before the namespace exists, so it never leaves a
-zombie namespace.
+failure in steps 1–2, and either of step 3's two refusals, returns before the
+namespace is written to at all, so none of them leaves a zombie namespace —
+or, in the collision case, scribbles anything onto the preview that already
+owns the tag.
 
 `Up` is safe to re-run: `EnsureNamespace`/`CopySecret`/apply are idempotent,
 and Neon branch creation is scan-then-create. This is also the recovery path
@@ -647,6 +736,14 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   thing that runs a preview build without a human asking is bifrost's own
   auto-update watcher (see "Following a branch"), and only for a preview that
   explicitly opted in — it invokes the same manual trigger.
+- **Two branches can want the same preview, and the second one loses.** Tags
+  are a lossy slug of the branch name (30-character cap, and `/`/`_`/space all
+  fold to `-`), so `feat/foo` and `feat_foo` — or two long branches differing
+  only past character 30 — are the same preview as far as bifrost is
+  concerned. The second `up` is refused rather than merged, but only in
+  bifrost's logs: the POST already returned `202`, so what you see is your tag
+  sitting there against somebody else's branch. Rename your branch or tear
+  their preview down; see "Two branches can derive the same tag" above.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `ib preview up <branch>` — safe, since every stage is
   idempotent — but it **always re-runs every member's preview build** (no
