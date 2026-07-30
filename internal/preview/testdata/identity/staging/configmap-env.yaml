@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-staging-env-config
+data:
+  JWT_ISSUER: "https://identity-staging.tailc06f30.ts.net"
+  STORAGE_BUCKET: "identity-dev"
+  STORAGE_PUBLIC_URL: "https://pub-c93149aa99214d2ab2fb3d1e01b7ef4f.r2.dev"

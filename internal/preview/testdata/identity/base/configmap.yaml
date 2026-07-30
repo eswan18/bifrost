@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-config
+data:
+  EMAIL_FROM: "noreply@mail.identity.ethanswan.com"
+  EMAIL_PROVIDER: "resend"
+  HTTP_ADDRESS: ":8080"
+  STORAGE_PROVIDER: "s3"
+  STORAGE_ENDPOINT: "https://8f74e735ece73e939bbe9e4c7e791e4a.r2.cloudflarestorage.com"
+  STORAGE_REGION: "auto"

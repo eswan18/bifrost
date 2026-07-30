@@ -86,5 +86,14 @@ identity:
       project: plain-heart-27630935
       database: neondb
       role: app
+    # Absolute "/app/auth-service", NOT bare "auth-service" like
+    # footstrike-api's bare "alembic" above: identity's Dockerfile sets
+    # WORKDIR /app and copies the binary to /app/auth-service
+    # (COPY --from=builder /build/auth-service .), but never adds /app to
+    # PATH via ENV the way footstrike-api's image puts .venv/bin on PATH. A
+    # bare "auth-service" here would fail the initContainer immediately with
+    # "executable file not found in $PATH", before the migrate subcommand
+    # ever ran. Verified against identity/Dockerfile.
+    migrate: ["/app/auth-service", "migrate"]
     env:
       JWT_ISSUER: "{{ url self }}"
