@@ -59,7 +59,7 @@ described in step 3 of the lifecycle.
 
 A record carries `tag`, `branch`, `apps`, `phase`, `health`, `createdAt`,
 `urls`, plus the progress trio: `step` (what `Up` is doing right now, e.g.
-`building footstrike-api (1/2)`), `stepSince` (RFC3339 — a timestamp, not a
+`building footstrike-api, footstrike-dashboard`), `stepSince` (RFC3339 — a timestamp, not a
 duration, so a poller computes elapsed time locally instead of watching it go
 stale between polls), and `error` (the failure cause, same string as the
 `bifrost/error` annotation). Those three are omitted from the JSON when empty,
@@ -292,11 +292,54 @@ ran `up` for is the symptom.
    what lets the auto-update watcher re-run a preview without extending its
    deadline; `internal/preview`'s `UpOptions` carries both this and the
    auto-update flag, and says so at length.
-4. **Build**: run each member's `{service}-preview-build` Cloud Build trigger and
-   wait for it (`buildPollInterval`, 10s), collecting the resulting short SHA.
-   Every member's build runs, every time — there is no check for "this SHA
-   already has a preview image." Step: `building {service} (i/n)`, rewritten
-   per member.
+4. **Build**: get every member an image for the commit step 1 resolved. A
+   member whose commit **already has an image** is not rebuilt at all; whatever
+   is left is built **concurrently**. Step: one write for the whole stage —
+   `building footstrike-api, footstrike-dashboard`, or
+   `building footstrike-dashboard (reusing footstrike-api)` when only some
+   members need building, or `reusing images for footstrike-api,
+   footstrike-dashboard` when none do.
+
+   **The skip is decided off `bifrost/built-images`, never off
+   `bifrost/source-shas`**, and the distinction is the whole reason that second
+   annotation exists. `source-shas` is written at the *top* of the run, before
+   the builds it names have run (step 3 — deliberately, so a failing build
+   can't hot-loop the auto-updater). So "the SHA didn't change" does **not**
+   mean "an image exists": after a *failed* build the commit is recorded and
+   nothing was ever pushed. `built-images` is written only *after* the build
+   stage succeeds, so an entry in it means exactly one thing — a
+   `preview-<short sha>` image for that commit is in Artifact Registry.
+
+   Its format is comma-joined `service=<full commit>:<short sha>` in
+   `bifrost/apps` order, e.g.
+   `footstrike-api=c58881f6…:c58881f,footstrike-dashboard=e07e33ab…:e07e33a`.
+   Both halves are needed and neither is derived from the other: the **full
+   commit** is the only thing comparable against a later `BranchSHA` call
+   (that's the skip decision), and the **short SHA** is what becomes the
+   image's `preview-<sha>` tag when the build is skipped. `$SHORT_SHA` is in
+   fact the first 7 characters of `$COMMIT_SHA` (checked against 200 real
+   builds in this project — 200/200), but it is recorded rather than
+   recomputed, because the commit a build builds is resolved by *Cloud Build*
+   from the branch name at trigger-run time, not from the SHA bifrost got from
+   GitHub moments earlier. A commit landing in that window would make a derived
+   tag name an image no build ever pushed. Recording what the build reported
+   makes the tag exact; pairing it with the commit bifrost resolved leaves that
+   same window fail-safe (the next run sees a difference and rebuilds).
+
+   A member is skipped **iff** its currently-resolved commit equals the commit
+   in its `built-images` entry, and then the recorded short SHA is what step 7
+   renders — a real reuse of the existing image, not a rebuild in disguise. A
+   first-ever create has nothing recorded and therefore builds everything, as
+   it always did.
+
+   Each build still runs its `{service}-preview-build` trigger and is polled to
+   a terminal status (`buildPollInterval`, 10s). What changed is that
+   `RunTrigger` returns as soon as Cloud Build accepts the build, so **all** the
+   triggers are started before **any** of them is waited on: an n-member preview
+   costs one build's wall time rather than n. Builds are bounded by member count
+   (rarely more than two or three), so there is no worker pool. Nothing is ever
+   cancelled — a build left running in Cloud Build after the run has failed is
+   harmless, and cheaper than the machinery to stop it.
 
    A build that ends in anything but `SUCCESS` fails the preview with the
    build's **console log URL** in `bifrost/error`: `build for footstrike-api:
@@ -307,6 +350,16 @@ ran `up` for is the symptom.
    (`… status FAILURE (build <id>)`, enough for `gcloud builds log <id>`)
    rather than a link to nowhere. The URL only: build *logs* are never
    fetched, for the same reason pod logs aren't (step 8).
+
+   With the builds concurrent, the failure names **which member** failed, and
+   it is always the first in `bifrost/apps` order among those that failed —
+   deterministic, rather than whichever goroutine lost first. Only one failure
+   can be the `bifrost/error` annotation, which has to stay a single readable
+   line; if a second member's build failed too, it is logged rather than
+   dropped. Nothing is recorded in `bifrost/built-images` for a run whose build
+   stage failed — not even for a sibling whose own build succeeded, since a run
+   that failed is not evidence about which images survived it. The cost is one
+   redundant rebuild on the retry.
 5. **Neon branch** (step: `branching databases`): for every member with a
    registry `neon:` reference,
    find-or-create a `preview-<tag>` branch off that project's default branch
@@ -370,7 +423,30 @@ owns the tag.
 
 `Up` is safe to re-run: `EnsureNamespace`/`CopySecret`/apply are idempotent,
 and Neon branch creation is scan-then-create. This is also the recovery path
-for a stuck `creating` (see "Gotchas").
+for a stuck `creating` (see "Gotchas"), and it is the path step 4 is tuned
+for — a re-run rebuilds only the members whose commits actually moved, so
+re-running `up` on a branch nobody has pushed to costs no builds at all.
+
+### What a skipped build does not get you
+
+Two consequences are accepted rather than solved, and both are worth knowing
+before you go looking for them:
+
+- **A skipped member keeps its old base image.** Same commit and same
+  Dockerfile means the app layer is byte-identical, but the
+  `python:3.13-slim` / `alpine:latest` underneath it is whatever was current
+  when the image was first built. A preview that has been re-run for a week
+  without that member changing is a week behind on base-image patches. Force a
+  rebuild by pushing a commit to that repo, or tear the preview down and
+  recreate it (a fresh namespace has no `bifrost/built-images` to reuse).
+- **A skipped build trusts that the image is still in Artifact Registry.**
+  There is no cleanup policy today, so nothing deletes preview images; if one
+  were deleted by hand, the skip would apply a Deployment naming a tag that
+  isn't there. The failure is clean — `ImagePullBackOff`, caught by the
+  readiness wait (step 8), which fails the preview with that as the reason —
+  but note the interaction: **a future image-cleanup policy would need a
+  retention window longer than previews live**, or it would start breaking
+  re-runs of previews that are still in use.
 
 ### Progress annotations
 
@@ -383,6 +459,19 @@ annotation is logged and swallowed, never a reason `Up` fails — and bounded by
 a tighter timeout than the failure annotation, since they sit inline on the
 creation path (`stepAnnotateTimeout` vs `failAnnotateTimeout` in
 `orchestrator.go`).
+
+The build stage is one step for the whole stage, not one per member. It used
+to read `building footstrike-api (1/2)`, rewritten as each build started; both
+halves of that stopped being true once the builds became concurrent (there is
+no first-then-second) and skippable (n is not the member count). It now names
+what is actually happening — see step 4 for the three shapes it takes.
+
+`bifrost/built-images` is written in its own call, after the build stage
+succeeds. Unlike a step it is a fact rather than prose, and unlike
+`bifrost/phase` a failure to write it is logged and swallowed: it can only ever
+cost one redundant rebuild (the next run finds no record and builds), which is
+strictly better than failing a preview whose images are all built and pushed
+over a bookkeeping write.
 
 Membership resolution (step 1) is not narrated: it finishes before the
 namespace exists, so there's nothing to annotate yet.
@@ -473,9 +562,14 @@ For each preview namespace annotated `bifrost/auto-update: "true"`, one poll:
 2. calls `BranchSHA` once per member;
 3. if **any** member's branch SHA differs from the recorded one, re-runs the
    ordinary `Orchestrator.Up` — the same one `ib preview up` runs, so every
-   member is rebuilt and re-applied and the Neon branch (with its data) is
-   found rather than re-created. There is no partial update: `Up` is
+   member is re-applied and the Neon branch (with its data) is found rather
+   than re-created. There is no partial update at the *deploy* level: `Up` is
    all-or-nothing.
+
+   It is partial at the *build* level, and that is the point. A push to one of
+   a preview's repos used to rebuild every member of that preview, every two
+   minutes' worth of pushes; step 4's skip means only the repo that moved is
+   rebuilt, and the rest are re-applied from the images they already have.
 
 It's polling rather than a GitHub webhook, deliberately. A tick only ever sees
 where the branch points *now*, so five pushes in a minute coalesce into one
@@ -778,9 +872,9 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   their preview down; see "Two branches can derive the same tag" above.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `ib preview up <branch>` — safe, since every stage is
-  idempotent — but it **always re-runs every member's preview build** (no
-  skip-if-image-exists check), so recovery costs a full rebuild of every app
-  in the preview, not just the one that was mid-flight. The expiry sweep does
+  idempotent, and cheap, since a member whose commit already has an image
+  isn't rebuilt (see step 4). A run that died *before* its builds finished has
+  nothing recorded and does pay for them. The expiry sweep does
   not help here either: `PurgeExpired` treats `phase: creating` as "still in
   flight" and skips it unconditionally — not merely defers it — so a preview
   whose `Up` died with the process (a spot-node preemption is the routine
@@ -836,7 +930,9 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   preview is the one least worth keeping), but if you're debugging a failed
   build, note that the namespace you're reading `kubectl` output from will
   disappear at its `expiresAt`. Re-running `up` without a `ttl` clears the
-  expiry (see below) at the cost of a full rebuild.
+  expiry (see below); since the build that failed recorded no image, that
+  member is rebuilt, but any sibling whose build had succeeded on an earlier
+  run is reused.
 - **Re-running `up` without a `ttl` clears any expiry the tag already
   had** — it does not leave a previous run's `bifrost/expires-at` in place.
   See step 3 of the `Up` lifecycle above for why. Recovering a stuck or
@@ -844,7 +940,7 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   the same `ttl`, not omitting it.
 - **A `failed` preview keeps showing its last step, on purpose.** `bifrost/step`
   is cleared on `ready` but retained on `failed`, so the row reads "failed ·
-  building footstrike-api (1/2) — build for footstrike-api: build ended with
+  building footstrike-api, footstrike-dashboard — build for footstrike-api: build ended with
   status FAILURE: https://console.cloud.google.com/cloud-build/builds/…" for
   as long as that namespace exists. It describes the run that failed, not something in
   flight. Re-running `up` clears both at the start of the retry (step 3), and a

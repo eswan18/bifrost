@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +195,13 @@ type fakeGCB struct {
 	// count (nothing is applied, and the annotations a failed retry writes
 	// are identical to the ones already there).
 	runCalls map[string]int
+	// onGetBuild, if set, runs at the top of every GetBuild call, OUTSIDE the
+	// fake's lock (like fakeGitHub.hook, and unlike everything else here) so
+	// it is safe to block in: that is what lets a test hold one build's poll
+	// open while another build's poll arrives, which is the only way to
+	// observe that the two are really being awaited concurrently rather than
+	// one after the other.
+	onGetBuild func(buildID string)
 }
 
 func (f *fakeGCB) LatestBuilds(context.Context) (map[string]gcb.BuildStatus, error) { return nil, nil }
@@ -220,6 +228,13 @@ func (f *fakeGCB) runCallsFor(triggerID string) int {
 }
 
 func (f *fakeGCB) GetBuild(_ context.Context, buildID string) (gcb.BuildStatus, error) {
+	f.mu.Lock()
+	hook := f.onGetBuild
+	f.mu.Unlock()
+	if hook != nil {
+		hook(buildID)
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.getErr[buildID]; ok {
@@ -859,6 +874,307 @@ func TestUpIsIdempotentOnRerun(t *testing.T) {
 	}
 	if len(d.neon.branches["aged-river-81935268"]) != 1 {
 		t.Errorf("aged-river-81935268 branches after rerun = %+v, want still exactly one (scan-then-create, no duplicate)", d.neon.branches["aged-river-81935268"])
+	}
+}
+
+// ---- Up: build reuse and parallelism -------------------------------------------
+
+// appliedImages returns the app-container image of every Deployment currently
+// applied into ns, keyed by Deployment name. A re-apply replaces the previous
+// entry (see fakeKube.ApplyObjects), so this is "what the most recent run
+// actually deployed" — which is the question a reuse test is asking, and which
+// a scan over the whole applyCalls history cannot answer without also matching
+// the previous run's identical images.
+func (f *fakeKube) appliedImages(ns string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]string{}
+	for _, dep := range f.appliedDeployments[ns] {
+		out[dep.name] = dep.image
+	}
+	return out
+}
+
+// TestUpFirstCreateBuildsEveryMemberAndRecordsWhatItBuilt is the baseline the
+// skip must never break: with nothing recorded from a previous run, every
+// member is built. It also pins bifrost/built-images' format — one
+// `svc=<full commit>:<short sha>` entry per member, comma-joined in
+// bifrost/apps order — since everything downstream (the skip decision, and the
+// image tag rendered without a rebuild) is parsed back out of exactly this
+// string.
+func TestUpFirstCreateBuildsEveryMemberAndRecordsWhatItBuilt(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if got := d.gcb.runCallsFor(trigger); got != 1 {
+			t.Errorf("%s ran %d times on a first create, want 1 — a create with nothing recorded must build every member", trigger, got)
+		}
+	}
+	// The full commit each member resolved to (fakeGitHub's defaultBranchSHA)
+	// paired with the short SHA its build reported (fakeGCB's "<id>-sha") —
+	// deliberately unrelated strings here, so an implementation that derived
+	// the tag from the commit instead of recording it cannot pass.
+	want := "footstrike-api=" + defaultBranchSHA + ":trig-api-sha," +
+		"footstrike-dashboard=" + defaultBranchSHA + ":trig-dash-sha"
+	if got := d.kube.annotations(previewNamespace("hae-cadence"))["bifrost/built-images"]; got != want {
+		t.Errorf("bifrost/built-images = %q, want %q", got, want)
+	}
+}
+
+// TestUpRerunWithNoNewCommitsBuildsNothing is the headline case: re-running
+// `ib preview up` on a branch nobody has pushed to — the documented recovery
+// path, and what the auto-update watcher walks — must not rebuild anything,
+// and must still render and apply a working preview off the images the
+// previous run produced.
+func TestUpRerunWithNoNewCommitsBuildsNothing(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("first Up failed: %v", err)
+	}
+	appliesAfterFirst := d.kube.appliesFor(ns)
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("re-run Up failed: %v", err)
+	}
+
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if got := d.gcb.runCallsFor(trigger); got != 1 {
+			t.Errorf("%s ran %d times across two Ups, want 1 — a re-run with no new commits must rebuild nothing", trigger, got)
+		}
+	}
+	// Not rebuilding must not mean not deploying: the re-run still renders and
+	// applies, using the tags the first run's builds produced.
+	if got := d.kube.appliesFor(ns); got <= appliesAfterFirst {
+		t.Errorf("ApplyObjects calls for %s went %d -> %d, want the re-run to have applied its manifests", ns, appliesAfterFirst, got)
+	}
+	want := map[string]string{"footstrike-api": apiImage, "footstrike-dashboard": dashImage}
+	for svc, image := range want {
+		if got := d.kube.appliedImages(ns)[svc]; got != image {
+			t.Errorf("%s deployed image = %q, want the reused %q", svc, got, image)
+		}
+	}
+	if got := d.kube.annotations(ns)["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase after a build-free re-run = %q, want ready", got)
+	}
+}
+
+// TestUpRerunBuildsOnlyTheMemberWhoseCommitMoved is the point of the whole
+// feature, and the case auto-update hits constantly: someone pushes to ONE of
+// a preview's repos, and only that repo is rebuilt. The load-bearing assertion
+// is the negative one — the untouched member's trigger must never run a second
+// time — because everything else about the run looks identical either way.
+func TestUpRerunBuildsOnlyTheMemberWhoseCommitMoved(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("first Up failed: %v", err)
+	}
+
+	// Only the dashboard's branch moves; the api's stays exactly where it was.
+	d.github.shas = map[string]string{"footstrike-dashboard": "beef99887766554433"}
+	// ...and its rebuild produces a visibly different image tag, so "reused"
+	// and "rebuilt" can't be confused for one another in the applied manifests.
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-dash": {{Status: "SUCCESS", SHA: "newdash"}}}
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("re-run Up failed: %v", err)
+	}
+
+	if got := d.gcb.runCallsFor("trig-api"); got != 1 {
+		t.Errorf("footstrike-api's trigger ran %d times, want 1 — its commit never moved, so the re-run must not have started a build for it at all", got)
+	}
+	if got := d.gcb.runCallsFor("trig-dash"); got != 2 {
+		t.Errorf("footstrike-dashboard's trigger ran %d times, want 2 — its commit moved, so it must be rebuilt", got)
+	}
+
+	images := d.kube.appliedImages(ns)
+	if got := images["footstrike-api"]; got != apiImage {
+		t.Errorf("footstrike-api deployed image = %q, want the reused %q", got, apiImage)
+	}
+	if want := previewImage("footstrike-dashboard", "newdash"); images["footstrike-dashboard"] != want {
+		t.Errorf("footstrike-dashboard deployed image = %q, want the freshly built %q", images["footstrike-dashboard"], want)
+	}
+	// The record advances for the rebuilt member and stands still for the
+	// reused one, so the NEXT re-run can skip both.
+	want := "footstrike-api=" + defaultBranchSHA + ":trig-api-sha," +
+		"footstrike-dashboard=beef99887766554433:newdash"
+	if got := d.kube.annotations(ns)["bifrost/built-images"]; got != want {
+		t.Errorf("bifrost/built-images = %q, want %q", got, want)
+	}
+}
+
+// TestUpRerunAfterAFailedBuildStillRebuilds is the trap this feature is built
+// around. bifrost/source-shas is written BEFORE the builds run (deliberately —
+// it's what stops the auto-update watcher hot-looping on a doomed commit), so
+// after a FAILED build the namespace records the commit while no image was
+// ever pushed. Keying the skip off it would send the next run straight to
+// applying a Deployment whose `preview-<sha>` tag does not exist in Artifact
+// Registry.
+//
+// The preconditions are asserted, not assumed: source-shas really does carry
+// the failed member's commit, and the branch really has not moved, so the only
+// thing that can make the retry rebuild is that the skip consults a record
+// written after success.
+func TestUpRerunAfterAFailedBuildStillRebuilds(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-api": {{Status: "FAILURE"}}}
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err == nil {
+		t.Fatal("first Up succeeded, want the scripted build failure")
+	}
+	ann := d.kube.annotations(ns)
+	if !strings.Contains(ann["bifrost/source-shas"], "footstrike-api="+defaultBranchSHA) {
+		t.Fatalf("precondition: bifrost/source-shas = %q, want the failed run's attempted commit recorded", ann["bifrost/source-shas"])
+	}
+	if got := ann["bifrost/built-images"]; got != "" {
+		t.Fatalf("bifrost/built-images = %q after a failed build, want nothing recorded — no image was produced", got)
+	}
+
+	// The branch has NOT moved (fakeGitHub still reports defaultBranchSHA);
+	// only the build now succeeds.
+	d.gcb.statuses = nil
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("retry Up failed: %v", err)
+	}
+	if got := d.gcb.runCallsFor("trig-api"); got != 2 {
+		t.Errorf("footstrike-api's trigger ran %d times, want 2 — the retry must rebuild a commit whose previous build FAILED, however unchanged bifrost/source-shas is", got)
+	}
+	if got := d.kube.annotations(ns)["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase after the retry = %q, want ready", got)
+	}
+}
+
+// TestUpAwaitsBuildsConcurrently proves the builds overlap rather than merely
+// both happening. Each build's first status poll parks until the OTHER build's
+// poll has arrived: awaited one after the other, the first one waits alone
+// until it gives up, which is what the timedOut flag records. Nothing else
+// about the run distinguishes concurrent from sequential — both orders start
+// both triggers and finish with both images.
+func TestUpAwaitsBuildsConcurrently(t *testing.T) {
+	d := newTwoMemberDeps(t)
+
+	var (
+		mu       sync.Mutex
+		seen     = map[string]bool{}
+		both     = make(chan struct{})
+		closeAll sync.Once
+		timedOut atomic.Bool
+	)
+	d.gcb.onGetBuild = func(buildID string) {
+		mu.Lock()
+		seen[buildID] = true
+		arrived := len(seen)
+		mu.Unlock()
+		if arrived == 2 {
+			closeAll.Do(func() { close(both) })
+		}
+		select {
+		case <-both:
+		case <-time.After(2 * time.Second):
+			timedOut.Store(true)
+		}
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	if timedOut.Load() {
+		t.Error("a build's status poll waited out the bound for the other build's poll to arrive: the two are being awaited one after the other, not concurrently")
+	}
+	images := d.kube.appliedImages("preview-hae-cadence")
+	if images["footstrike-api"] != apiImage || images["footstrike-dashboard"] != dashImage {
+		t.Errorf("deployed images = %v, want both concurrent builds to have completed (%q, %q)", images, apiImage, dashImage)
+	}
+}
+
+// TestUpBuildFailureNamesTheFailingMember: with the builds running
+// concurrently, "a build failed" is no longer self-evidently about the first
+// member — so the failure has to name the one that actually failed, and must
+// not blame a sibling whose build was perfectly fine.
+//
+// It also pins the other half of the "record only what really exists" rule:
+// footstrike-api's build SUCCEEDS here, and nothing is recorded for it either.
+// A run that failed is not evidence about which images survived it, and a
+// half-written record is one more thing a later skip could get wrong; the cost
+// is one redundant rebuild on the retry.
+func TestUpBuildFailureNamesTheFailingMember(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	d.gcb.statuses = map[string][]gcb.BuildStatus{"trig-dash": {{Status: "FAILURE"}}}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected Up to fail when a member's build fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "footstrike-dashboard") {
+		t.Errorf("error = %q, want it to name footstrike-dashboard, whose build failed", err.Error())
+	}
+	if strings.Contains(err.Error(), "footstrike-api:") || strings.Contains(err.Error(), "for footstrike-api") {
+		t.Errorf("error = %q, want it not to blame footstrike-api, whose build succeeded", err.Error())
+	}
+	ann := d.kube.annotations("preview-hae-cadence")
+	if ann["bifrost/phase"] != "failed" {
+		t.Errorf("bifrost/phase = %q, want failed", ann["bifrost/phase"])
+	}
+	if got := ann["bifrost/built-images"]; got != "" {
+		t.Errorf("bifrost/built-images = %q, want nothing recorded for a run whose build stage failed", got)
+	}
+}
+
+// TestBuiltImagesAnnotationRoundTrips pins the format/parse pair directly,
+// including the drops: every malformed entry has to land on "nothing recorded
+// for this member", which buildMembers reads as "must build". The failure
+// direction matters — a lenient parse that invented a member's entry would
+// skip a build and deploy an image tag that was never pushed.
+func TestBuiltImagesAnnotationRoundTrips(t *testing.T) {
+	members := []string{"footstrike-api", "footstrike-dashboard"}
+	built := map[string]builtImage{
+		"footstrike-api":       {Commit: "deadbeef0123456789", ShortSHA: "deadbee"},
+		"footstrike-dashboard": {Commit: "c0ffee1122334455", ShortSHA: "c0ffee1"},
+		"identity":             {Commit: "aaaa1111", ShortSHA: "aaaa111"}, // not a member: not rendered
+	}
+	raw := builtImagesAnnotation(members, built)
+	want := "footstrike-api=deadbeef0123456789:deadbee,footstrike-dashboard=c0ffee1122334455:c0ffee1"
+	if raw != want {
+		t.Fatalf("builtImagesAnnotation = %q, want %q", raw, want)
+	}
+	got := parseBuiltImages(raw)
+	for _, svc := range members {
+		if got[svc] != built[svc] {
+			t.Errorf("parseBuiltImages()[%q] = %+v, want %+v", svc, got[svc], built[svc])
+		}
+	}
+
+	// A member with only half a record renders nothing rather than a
+	// half-entry: an image tag with no commit could never match, and a commit
+	// with no tag would skip the build and then render an empty tag.
+	half := builtImagesAnnotation([]string{"footstrike-api"}, map[string]builtImage{
+		"footstrike-api": {Commit: "deadbeef0123456789"},
+	})
+	if half != "" {
+		t.Errorf("builtImagesAnnotation with no short SHA = %q, want it omitted", half)
+	}
+
+	for _, raw := range []string{
+		"",
+		"footstrike-api",                     // no "="
+		"footstrike-api=deadbeef0123456789",  // no ":"
+		"footstrike-api=:deadbee",            // no commit
+		"footstrike-api=deadbeef0123456789:", // no short sha
+		"=deadbeef0123456789:deadbee",        // no service
+	} {
+		if parsed := parseBuiltImages(raw); len(parsed) != 0 {
+			t.Errorf("parseBuiltImages(%q) = %+v, want nothing recorded", raw, parsed)
+		}
 	}
 }
 
@@ -2178,12 +2494,38 @@ func TestBusyMutexDoesNotBlockUnrelatedTags(t *testing.T) {
 
 // ---- step progress reporting -------------------------------------------------
 
+// distinctSteps extracts the bifrost/step values a run wrote, in order and
+// with consecutive duplicates collapsed. Read from annotationHistory rather
+// than the final state because every earlier step's annotation is overwritten
+// by the next.
+func (f *fakeKube) distinctSteps() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var steps []string
+	for _, snap := range f.annotationHistory {
+		step, ok := snap["bifrost/step"]
+		if !ok {
+			continue
+		}
+		if len(steps) == 0 || steps[len(steps)-1] != step {
+			steps = append(steps, step)
+		}
+	}
+	return steps
+}
+
 // TestUpReportsStepsInOrder pins the sequence and wording of every
-// bifrost/step write across a full two-member happy-path Up: each build
-// (with its position), Neon branching, secret copying, manifest application,
-// and the wait for those manifests' pods — in that order, and nothing else in
-// between. Extracted from annotationHistory (not just the final state) since
-// every earlier step's annotation is overwritten by the next.
+// bifrost/step write across a full two-member happy-path Up: the build stage,
+// Neon branching, secret copying, manifest application, and the wait for those
+// manifests' pods — in that order, and nothing else in between.
+//
+// The build stage is ONE step naming every member being built, deliberately
+// replacing the old per-member "building footstrike-api (1/2)" sequence. Both
+// halves of that wording had stopped being true: the builds now run
+// concurrently (so there is no first-then-second to count off), and a member
+// whose commit already has an image isn't built at all (so n is not the
+// member count). See TestUpStepNarratesReusedAndBuiltMembers for the other two
+// shapes this step takes.
 //
 // Membership resolution is deliberately NOT narrated: it finishes before the
 // namespace exists (so there's nowhere to write it), and a step written after
@@ -2196,20 +2538,10 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 		t.Fatalf("Up failed: %v", err)
 	}
 
-	var steps []string
-	for _, snap := range d.kube.annotationHistory {
-		step, ok := snap["bifrost/step"]
-		if !ok {
-			continue
-		}
-		if len(steps) == 0 || steps[len(steps)-1] != step {
-			steps = append(steps, step)
-		}
-	}
+	steps := d.kube.distinctSteps()
 	want := []string{
 		"", // cleared on entry, by EnsureNamespace's own write
-		"building footstrike-api (1/2)",
-		"building footstrike-dashboard (2/2)",
+		"building footstrike-api, footstrike-dashboard",
 		"branching databases",
 		"copying secrets",
 		"applying manifests",
@@ -2223,6 +2555,40 @@ func TestUpReportsStepsInOrder(t *testing.T) {
 		if steps[i] != w {
 			t.Errorf("step[%d] = %q, want %q", i, steps[i], w)
 		}
+	}
+}
+
+// TestUpStepNarratesReusedAndBuiltMembers covers the two step wordings a
+// re-run produces, which are the whole reason the old "(i/n)" numbering had to
+// go: an operator watching a re-run has to be able to tell what is actually
+// being rebuilt, and "building footstrike-api (1/2)" for a run that rebuilt
+// nothing would be a lie in both halves.
+func TestUpStepNarratesReusedAndBuiltMembers(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("first Up failed: %v", err)
+	}
+
+	// Nothing moved: every member is reused, and the step says so rather than
+	// claiming a build.
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("second Up failed: %v", err)
+	}
+	want := "reusing images for footstrike-api, footstrike-dashboard"
+	if steps := d.kube.distinctSteps(); !slices.Contains(steps, want) {
+		t.Errorf("step sequence = %#v, want it to contain %q", steps, want)
+	}
+
+	// One member moved: the step names the one being built AND the one being
+	// reused, so neither is a surprise.
+	d.github.shas = map[string]string{"footstrike-dashboard": "beef99887766554433"}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("third Up failed: %v", err)
+	}
+	want = "building footstrike-dashboard (reusing footstrike-api)"
+	if steps := d.kube.distinctSteps(); !slices.Contains(steps, want) {
+		t.Errorf("step sequence = %#v, want it to contain %q", steps, want)
 	}
 }
 
@@ -2285,7 +2651,7 @@ func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
 	if ns.annotations["bifrost/phase"] != "failed" {
 		t.Fatalf("bifrost/phase = %q, want failed", ns.annotations["bifrost/phase"])
 	}
-	if ns.annotations["bifrost/step"] != "building footstrike-api (1/2)" {
+	if ns.annotations["bifrost/step"] != "building footstrike-api, footstrike-dashboard" {
 		t.Errorf("bifrost/step on a failed preview = %q, want the last step retained", ns.annotations["bifrost/step"])
 	}
 	if ns.annotations["bifrost/step-since"] == "" {

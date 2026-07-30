@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -225,6 +226,12 @@ type UpOptions struct {
 // The refusals above are scoped so as not to touch it: re-running the SAME
 // branch is exactly what they let through.
 //
+// It is also the path this flow is tuned for, since the auto-update watcher
+// walks it every time a member's branch moves: a member whose commit already
+// has an image from a previous run is not rebuilt at all, and whatever is left
+// builds concurrently rather than one after another (see buildMembers). A
+// first-ever create, having nothing recorded to reuse, builds everything.
+//
 // opts carries the run's optional state (expiry, auto-update); see
 // UpOptions, whose zero value — no expiry, no auto-update — is the default.
 func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) error {
@@ -276,9 +283,24 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 	}
 
 	ns := previewNamespace(tag)
-	if err := o.refuseUnusableNamespace(ctx, ns, tag, branch); err != nil {
+	priorAnnotations, err := o.refuseUnusableNamespace(ctx, ns, tag, branch)
+	if err != nil {
 		return err
 	}
+	// What a PREVIOUS run of this preview last built successfully, read off
+	// the same pre-flight GetNamespace the refusals were decided from rather
+	// than costing a second call. It has to be captured HERE, before the
+	// EnsureNamespace below: that write is what stamps this run's own
+	// bifrost/source-shas on, and buildMembers compares against what the last
+	// successful build recorded, not against anything this run just wrote.
+	//
+	// Note also which annotation the write below does NOT clear:
+	// bifrost/built-images is the one piece of a previous run this one must
+	// inherit rather than reset. Clearing it (as the error/step trio and the
+	// expiry/auto-update pair are cleared, each for its own merge reason)
+	// would make every re-run rebuild everything — which is the entire cost
+	// this reuse exists to remove.
+	prior := parseBuiltImages(priorAnnotations[builtImagesAnnotationKey])
 	if err := o.Kube.EnsureNamespace(ctx, ns,
 		map[string]string{"bifrost/preview": "true"},
 		map[string]string{
@@ -317,10 +339,11 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 		return fmt.Errorf("preview: Up: ensure namespace: %w", err)
 	}
 
-	shortSHAs, err := o.buildMembers(ctx, ns, branch, members)
+	built, err := o.buildMembers(ctx, ns, branch, members, sourceSHAs, prior)
 	if err != nil {
 		return o.fail(ctx, ns, err)
 	}
+	o.recordBuiltImages(ctx, ns, members, built)
 	o.step(ctx, ns, "branching databases")
 	dbURIs, err := o.branchNeonDatabases(ctx, tag, members)
 	if err != nil {
@@ -331,7 +354,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 		return o.fail(ctx, ns, err)
 	}
 	o.step(ctx, ns, "applying manifests")
-	appImages, err := o.renderAndApply(ctx, ns, tag, branch, members, shortSHAs)
+	appImages, err := o.renderAndApply(ctx, ns, tag, branch, members, built)
 	if err != nil {
 		return o.fail(ctx, ns, err)
 	}
@@ -441,29 +464,37 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // read is not evidence that it is safe to build into — the same reading the
 // expiry sweep applies to its own re-read — and proceeding on an unknown is
 // precisely the bug being fixed here.
-func (o *Orchestrator) refuseUnusableNamespace(ctx context.Context, ns, tag, branch string) error {
+//
+// On success it hands back the annotations it read (nil when the namespace
+// doesn't exist yet), because this read is also the run's only look at what a
+// PREVIOUS run left behind, and Up needs one of those annotations —
+// bifrost/built-images, the build-skip record — before EnsureNamespace
+// overwrites the rest of them. Returning the snapshot keeps that a property of
+// the same single API call rather than a second GetNamespace, and keeps the
+// look-then-act window this function documents exactly as narrow as it was.
+func (o *Orchestrator) refuseUnusableNamespace(ctx context.Context, ns, tag, branch string) (map[string]string, error) {
 	existing, found, err := o.Kube.GetNamespace(ctx, ns)
 	if err != nil {
-		return fmt.Errorf("preview: Up: check namespace %s: %w", ns, err)
+		return nil, fmt.Errorf("preview: Up: check namespace %s: %w", ns, err)
 	}
 	// Absent is the ordinary recreate-after-teardown path once the delete has
 	// actually finished: nothing to refuse, and EnsureNamespace below creates
 	// it fresh.
 	if !found {
-		return nil
+		return nil, nil
 	}
 	// Terminating first: a namespace on its way out is about to stop existing,
 	// so whichever branch it belonged to is the less useful thing to say about
 	// it, and "retry once the teardown finishes" is the actionable verdict.
 	if existing.Phase == "Terminating" {
-		return fmt.Errorf("preview: Up: namespace %s is still Terminating: %w", ns, ErrTerminating)
+		return nil, fmt.Errorf("preview: Up: namespace %s is still Terminating: %w", ns, ErrTerminating)
 	}
 	if owner := existing.Annotations[branchAnnotationKey]; owner != "" && owner != branch {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"preview: Up: preview tag %q (namespace %s) already belongs to branch %q, so branch %q cannot use it — both branch names derive the same tag: %w",
 			tag, ns, owner, branch, ErrTagCollision)
 	}
-	return nil
+	return existing.Annotations, nil
 }
 
 // The namespace-annotation keys that are both written here and read back
@@ -483,7 +514,111 @@ const (
 	// autoupdate.go.
 	sourceSHAsAnnotationKey = "bifrost/source-shas"
 	autoUpdateAnnotationKey = "bifrost/auto-update"
+	// builtImagesAnnotationKey records what each member's last SUCCESSFUL
+	// build produced, and is read back by the next run's build stage to skip
+	// rebuilding a commit that already has an image. Deliberately separate
+	// from sourceSHAsAnnotationKey — see builtImagesAnnotation for why the
+	// two cannot be collapsed.
+	builtImagesAnnotationKey = "bifrost/built-images"
 )
+
+// builtImage pairs the commit a member's preview image was built from with
+// the image tag suffix that build actually produced.
+//
+// Two fields rather than one because neither answers the other's question.
+// Commit is a FULL commit SHA, the only thing comparable against what
+// resolveMembers gets from GitHub, so it's what decides "has this member
+// moved since we last built it". ShortSHA is what render.go turns into the
+// image's `preview-<sha>` tag, and it is NOT recomputed from Commit — see
+// builtImagesAnnotation.
+type builtImage struct {
+	Commit   string
+	ShortSHA string
+}
+
+// builtImagesAnnotation renders "<svc>=<commit>:<short sha>" entries,
+// comma-joined in members order (sorted, so the value is stable), in the same
+// style as bifrost/apps and bifrost/source-shas. Members with nothing recorded
+// are omitted rather than emitted empty, so a half-populated annotation is
+// only ever missing entries, never carrying meaningless ones.
+//
+// It exists because bifrost/source-shas CANNOT be used to decide whether a
+// member needs rebuilding, however similar the two look. source-shas is
+// written at the TOP of the run, before the builds it describes have run at
+// all — deliberately, so a preview whose build keeps failing records the
+// commit it attempted and the auto-update watcher stops re-running it every
+// two minutes (see sourceSHAsAnnotation). "The SHA didn't change" therefore
+// does not imply "an image exists": after a FAILED build the SHA is recorded
+// and no image was ever pushed. Skipping on that evidence would apply a
+// Deployment pointing at a tag that does not exist.
+//
+// This one is written only AFTER the build stage succeeds (see
+// Orchestrator.recordBuiltImages), so its presence for a member means exactly
+// one thing: a `preview-<short sha>` image for that commit was pushed to
+// Artifact Registry.
+//
+// The short SHA is recorded rather than derived from the commit, even though
+// Cloud Build's $SHORT_SHA is in practice the first 7 characters of
+// $COMMIT_SHA (verified against 200 real builds in this project, preview
+// builds included: 200/200 a 7-character prefix). Two reasons, and the second
+// is the load-bearing one:
+//
+//   - the value is Cloud Build's substitution, not bifrost's convention.
+//     awaitBuild reads it back off the build (gcb.BuildStatus.SHA) and this
+//     package never parses it; a derivation would be bifrost silently
+//     asserting a contract it does not own.
+//   - the commit a build builds is resolved by CLOUD BUILD, from the branch
+//     name RunTrigger passes, at trigger-run time — not from the SHA
+//     resolveMembers got from GitHub moments earlier. A commit landing in
+//     that window makes the two differ, and a derived tag would then name an
+//     image no build ever pushed.
+//
+// Recording what the build reported makes the tag exact by construction.
+// Pairing it with the commit bifrost RESOLVED (rather than the one Cloud
+// Build built, which GetBuild doesn't report) leaves that same window
+// fail-SAFE: the next run resolves the newer commit, sees a difference, and
+// rebuilds.
+func builtImagesAnnotation(members []string, built map[string]builtImage) string {
+	pairs := make([]string, 0, len(members))
+	for _, svc := range members {
+		b := built[svc]
+		if b.Commit == "" || b.ShortSHA == "" {
+			continue
+		}
+		pairs = append(pairs, svc+"="+b.Commit+":"+b.ShortSHA)
+	}
+	return strings.Join(pairs, ",")
+}
+
+// parseBuiltImages reads bifrost/built-images back into service -> builtImage.
+// It is the exact inverse of builtImagesAnnotation, which is the only thing
+// that writes that annotation.
+//
+// Every malformed or half-empty entry is dropped rather than failing the read,
+// and every drop lands on the same side: the member reads as having nothing
+// built, which buildMembers treats as "must build". An annotation bifrost
+// can't parse therefore costs one redundant build, never a Deployment pointing
+// at an image that was never produced. Same reading parseSourceSHAs applies,
+// for the same fail-safe reason.
+func parseBuiltImages(raw string) map[string]builtImage {
+	built := map[string]builtImage{}
+	for _, pair := range strings.Split(raw, ",") {
+		svc, rest, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		commit, shortSHA, ok := strings.Cut(rest, ":")
+		if !ok {
+			continue
+		}
+		svc, commit, shortSHA = strings.TrimSpace(svc), strings.TrimSpace(commit), strings.TrimSpace(shortSHA)
+		if svc == "" || commit == "" || shortSHA == "" {
+			continue
+		}
+		built[svc] = builtImage{Commit: commit, ShortSHA: shortSHA}
+	}
+	return built
+}
 
 // expiresAtAnnotation renders expiresAt as RFC3339, or "" for the zero time
 // (no expiry). Absolute rather than a duration so the reaper never has to
@@ -527,6 +662,11 @@ func autoUpdateAnnotation(on bool) string {
 // whose build fails still records the SHA it attempted, so the next tick sees
 // no difference and leaves it alone until someone pushes a new commit. See
 // PollAutoUpdates.
+//
+// That same ordering is precisely why this annotation must NOT be used to
+// decide whether a member needs rebuilding — a SHA recorded here can belong to
+// a build that never produced an image. bifrost/built-images is the annotation
+// for that question; see builtImagesAnnotation.
 func sourceSHAsAnnotation(members []string, shas map[string]string) string {
 	pairs := make([]string, 0, len(members))
 	for _, svc := range members {
@@ -636,14 +776,66 @@ func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]str
 	return members, shas, nil
 }
 
-// buildMembers runs (and awaits) each member's preview build trigger,
-// returning the resulting short SHA per service. ns is only for step()'s
-// progress narration — every other kube write for a preview happens
-// elsewhere in Up.
-func (o *Orchestrator) buildMembers(ctx context.Context, ns, branch string, members []string) (map[string]string, error) {
-	shortSHAs := make(map[string]string, len(members))
-	for i, svc := range members {
-		o.step(ctx, ns, fmt.Sprintf("building %s (%d/%d)", svc, i+1, len(members)))
+// buildMembers gets every member an image for this run's commit, and returns
+// what each one ended up with. A member whose commit already has an image from
+// a previous run is not rebuilt at all; the rest are built CONCURRENTLY. ns is
+// only for step()'s progress narration — every other kube write for a preview
+// happens elsewhere in Up.
+//
+// sourceSHAs is what resolveMembers resolved each member's branch to for THIS
+// run; prior is what the last successful build recorded
+// (bifrost/built-images). A member is skipped iff the two agree — its
+// currently-resolved commit is exactly the commit whose image was last built —
+// and then its recorded short SHA is carried straight through to render, which
+// is what makes the skip a real reuse of the existing `preview-<sha>` image
+// rather than a rebuild in disguise. See builtImagesAnnotation for why prior
+// must come from that annotation and never from bifrost/source-shas.
+//
+// The returned map covers every member, skipped and built alike, so the
+// caller can both render and re-record all of them.
+//
+// Two consequences of skipping are accepted rather than solved, and are
+// documented in docs/preview-environments.md:
+//
+//   - a skipped member keeps its OLD BASE IMAGE. Same commit and same
+//     Dockerfile means an identical app layer, but not a newer
+//     python:3.13-slim / alpine:latest underneath it.
+//   - if the image has been deleted from Artifact Registry, the skip applies a
+//     Deployment naming an image that is gone. There is no cleanup policy
+//     today; the failure is clean when there is one (ImagePullBackOff, caught
+//     by the readiness wait), but any future policy needs a retention window
+//     longer than previews live.
+func (o *Orchestrator) buildMembers(
+	ctx context.Context,
+	ns, branch string,
+	members []string,
+	sourceSHAs map[string]string,
+	prior map[string]builtImage,
+) (map[string]builtImage, error) {
+	built := make(map[string]builtImage, len(members))
+	var needed []string
+	for _, svc := range members {
+		if b, ok := prior[svc]; ok && b.Commit == sourceSHAs[svc] {
+			built[svc] = b
+			continue
+		}
+		needed = append(needed, svc)
+	}
+
+	o.step(ctx, ns, buildStepText(members, needed))
+	if len(needed) == 0 {
+		return built, nil
+	}
+
+	// Start every trigger first — RunTrigger returns as soon as Cloud Build
+	// has accepted the build — and only then wait on any of them, so an
+	// n-member preview costs one build's wall time rather than n. A start
+	// failure aborts before any waiting: whatever already started keeps
+	// running in Cloud Build, which is harmless (nothing consumes an image
+	// this run won't reach) and much cheaper than cancellation machinery.
+	type startedBuild struct{ svc, buildID string }
+	started := make([]startedBuild, 0, len(needed))
+	for _, svc := range needed {
 		triggerID := o.TriggerIDs[svc+"-preview-build"]
 		if triggerID == "" {
 			return nil, fmt.Errorf("no preview build trigger configured for %s", svc)
@@ -652,13 +844,109 @@ func (o *Orchestrator) buildMembers(ctx context.Context, ns, branch string, memb
 		if err != nil {
 			return nil, fmt.Errorf("starting build for %s: %w", svc, err)
 		}
-		sha, err := o.awaitBuild(ctx, buildID)
-		if err != nil {
-			return nil, fmt.Errorf("build for %s: %w", svc, err)
-		}
-		shortSHAs[svc] = sha
+		started = append(started, startedBuild{svc: svc, buildID: buildID})
 	}
-	return shortSHAs, nil
+
+	// One goroutine per started build, each writing only its own slot, so the
+	// results need no lock. Bounded by member count (rarely more than two or
+	// three), so no worker pool: awaitBuild is a sleep-and-poll loop, not work.
+	shortSHAs := make([]string, len(started))
+	errs := make([]error, len(started))
+	var wg sync.WaitGroup
+	for i, b := range started {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			shortSHAs[i], errs[i] = o.awaitBuild(ctx, b.buildID)
+		}()
+	}
+	wg.Wait()
+
+	// Collected in `needed` order (which is members order, sorted), so a
+	// multi-failure run always reports the same member rather than whichever
+	// goroutine happened to lose first.
+	var firstErr error
+	for i, b := range started {
+		if errs[i] != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("build for %s: %w", b.svc, errs[i])
+				continue
+			}
+			// Only one failure can be the bifrost/error annotation, which has
+			// to stay a single readable line (see buildFailure); the rest
+			// would otherwise vanish, so they're logged instead of dropped.
+			slog.Warn("preview: another member's build also failed",
+				"ns", ns, "service", b.svc, "err", errs[i])
+			continue
+		}
+		built[b.svc] = builtImage{Commit: sourceSHAs[b.svc], ShortSHA: shortSHAs[i]}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return built, nil
+}
+
+// buildStepText narrates the build stage for an operator watching `ib preview
+// up` (or the Previews tab) sit still for minutes. The old wording numbered a
+// sequence — "building footstrike-api (1/2)", rewritten per member — which is
+// no longer true in either direction: the builds run concurrently, so there is
+// no 1-then-2, and some members may not be built at all.
+//
+// So it states what is actually happening, in members order, in one write for
+// the whole stage:
+//
+//	building footstrike-api, footstrike-dashboard
+//	building footstrike-dashboard (reusing footstrike-api)
+//	reusing images for footstrike-api, footstrike-dashboard
+//
+// The last case still gets a step rather than none. It is the one an operator
+// is most likely to be confused by ("why didn't my change show up?"), and it
+// is what a failure in a LATER stage will leave behind as its retained
+// diagnostic.
+func buildStepText(members, needed []string) string {
+	if len(needed) == 0 {
+		return "reusing images for " + strings.Join(members, ", ")
+	}
+	text := "building " + strings.Join(needed, ", ")
+	var reused []string
+	for _, svc := range members {
+		if !slices.Contains(needed, svc) {
+			reused = append(reused, svc)
+		}
+	}
+	if len(reused) > 0 {
+		text += " (reusing " + strings.Join(reused, ", ") + ")"
+	}
+	return text
+}
+
+// recordBuiltImages writes bifrost/built-images for what the build stage just
+// settled on — the whole map, freshly-built and reused members alike, so the
+// annotation always describes the CURRENT membership and stale entries for a
+// member that has since left the preview are pruned rather than accumulated.
+//
+// Called only after the build stage SUCCEEDS. That ordering is the entire
+// point of the annotation (see builtImagesAnnotation): recorded before, or on
+// failure, it would claim an image exists for a build that never produced one,
+// and the next run would skip straight to applying a Deployment naming a tag
+// that isn't there.
+//
+// Best-effort, like step()'s write and unlike fail()'s: a failure here is
+// logged and swallowed rather than failing an otherwise-healthy preview. It
+// can only ever cost one redundant rebuild — the next run finds no record (or
+// a stale one), and rebuilds — which is strictly better than failing a preview
+// whose images are all built and pushed over a bookkeeping write. It is a
+// separate call rather than folded into the "branching databases" step write
+// because the two have opposite semantics: this one is a fact about the
+// cluster, that one is cosmetic prose.
+func (o *Orchestrator) recordBuiltImages(ctx context.Context, ns string, members []string, built map[string]builtImage) {
+	if err := o.Kube.AnnotateNamespace(ctx, ns, map[string]string{
+		builtImagesAnnotationKey: builtImagesAnnotation(members, built),
+	}); err != nil {
+		slog.Warn("preview: recording built images failed; the next run will rebuild rather than reuse",
+			"ns", ns, "err", err)
+	}
 }
 
 // awaitBuild polls buildID every buildPollInterval until it reaches a
@@ -801,7 +1089,7 @@ func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []str
 // previous run's (see podsForMember), and a reconstruction that drifted from
 // what render really produced would silently match nothing and time out
 // every preview.
-func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, shortSHAs map[string]string) (map[string]string, error) {
+func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, built map[string]builtImage) (map[string]string, error) {
 	appImages := make(map[string]string, len(members))
 	for _, svc := range members {
 		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Fleet.RepoFor(svc), branch)
@@ -827,7 +1115,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		objs, err := Render(RenderInput{
 			Service:    svc,
 			Tag:        tag,
-			ShortSHA:   shortSHAs[svc],
+			ShortSHA:   built[svc].ShortSHA,
 			K8sFiles:   k8sFiles,
 			EnvConfig:  envConfig,
 			SecretName: secretName,
