@@ -1,8 +1,10 @@
 package preview
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -656,6 +658,72 @@ func TestPurgeOrphanedBranchesDeletesNothingWhenNamespacesCannotBeListed(t *test
 	}
 	assertPurged(t, purged)
 	d.assertBranchKept(t, orphanProjAPI, "preview-live")
+}
+
+// ---- branch-count visibility ------------------------------------------------
+
+// captureDebugLogs points the default slog logger at a buffer for the
+// duration of the calling test, at a level low enough to catch Debug, and
+// restores the previous default on cleanup. The orphan sweep's branch-count
+// line is deliberately Debug (see PurgeOrphanedBranches), so a handler left
+// at the package default (Info) would silently see nothing.
+func captureDebugLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// TestPurgeOrphanedBranchesLogsBranchCountPerProject covers the one new piece
+// of visibility this sweep adds on top of its existing deletion logic:
+// nothing else in bifrost counts branches, storage, compute, or build minutes
+// against Neon's quotas, so this line is the only signal of where a project
+// stands BEFORE a quota bound is hit rather than only after (a Neon error
+// surfacing one). It must come from the same ListBranches call the deletion
+// logic already makes — no new API call — so the count is exactly what was
+// listed, unfiltered by the orphan rules that run afterward.
+func TestPurgeOrphanedBranchesLogsBranchCountPerProject(t *testing.T) {
+	d := newOrphanDeps()
+	// Two branches in orphanProjAPI, one of them not even preview-shaped —
+	// the count is every branch ListBranches returned, not just the ones the
+	// orphan rules go on to consider.
+	d.addBranch(orphanProjAPI, "preview-one", sweepNow.Add(-30*time.Minute))
+	d.addBranch(orphanProjAPI, "main", sweepNow.Add(-30*24*time.Hour))
+	d.addBranch(orphanProjIdentity, "preview-solo", sweepNow.Add(-30*time.Minute))
+
+	buf := captureDebugLogs(t)
+	if _, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow); err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "project="+orphanProjAPI) || !strings.Contains(out, "count=2") {
+		t.Errorf("log output = %q, want a line with project=%s count=2", out, orphanProjAPI)
+	}
+	if !strings.Contains(out, "project="+orphanProjIdentity) || !strings.Contains(out, "count=1") {
+		t.Errorf("log output = %q, want a line with project=%s count=1", out, orphanProjIdentity)
+	}
+}
+
+// TestPurgeOrphanedBranchesLogsZeroForAProjectWithNoBranches makes sure the
+// count line fires even when there is nothing to count: an empty project is
+// exactly the state that later fills up toward a quota, and "nothing to
+// report" must not mean "nothing logged" — it must read count=0, not be
+// silently skipped.
+func TestPurgeOrphanedBranchesLogsZeroForAProjectWithNoBranches(t *testing.T) {
+	d := newOrphanDeps() // neither project has any branches at all
+
+	buf := captureDebugLogs(t)
+	if _, err := d.orch.PurgeOrphanedBranches(context.Background(), sweepNow); err != nil {
+		t.Fatalf("PurgeOrphanedBranches failed: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "project="+orphanProjAPI) || !strings.Contains(out, "count=0") {
+		t.Errorf("log output = %q, want a line with project=%s count=0", out, orphanProjAPI)
+	}
 }
 
 // ---- RunReaper ---------------------------------------------------------------
