@@ -342,9 +342,50 @@ ran `up` for is the symptom.
 
    A member is skipped **iff** its currently-resolved commit equals the commit
    in its `built-images` entry, and then the recorded short SHA is what step 7
-   renders — a real reuse of the existing image, not a rebuild in disguise. A
-   first-ever create has nothing recorded and therefore builds everything, as
-   it always did.
+   renders — a real reuse of the existing image, not a rebuild in disguise.
+
+   **When the annotation has no entry for a member at all**, and only then,
+   bifrost falls back to asking Cloud Build whether that commit was already
+   built successfully (`gcb.Client.FindSuccessfulBuild`). This is the reuse
+   that survives a **teardown**: `built-images` lives on the namespace and
+   `down` deletes the namespace, so an `up` → `down` → `up` at the same commit
+   has nothing recorded — yet the images are still in Artifact Registry under
+   exactly the tags the rebuild would recreate. Cloud Build's history outlives
+   the namespace, so it can be asked instead. A hit is recorded in
+   `built-images` exactly as a real build would be, so the *next* run takes the
+   cheap annotation path rather than querying again.
+
+   The ordering matters and is what keeps the ordinary paths free. An entry
+   that **disagrees** is still an answer — the member moved, so it is built,
+   with no lookup — so a live preview's re-run, including every auto-update
+   tick, costs exactly the API calls it always did. Only a run that would
+   otherwise have built blind pays for a lookup: a first-ever create (which
+   then builds everything, as it always did) and a recreate after teardown.
+
+   The lookup asks Cloud Build rather than Artifact Registry **deliberately**,
+   even though the registry answers the more direct question ("does the image
+   exist?"). bifrost already holds a Cloud Build client and the service account
+   already has `cloudbuild.builds.viewer`, so this needs no new dependency, no
+   IAM change and no `pulumi up`; the registry would need all three. What that
+   trades away is exactness: a successful build is a *proxy* for a live image,
+   and the two diverge only if an image is deleted after being built — the
+   same exposure the annotation path above already carries (see "What a skipped
+   build does not get you").
+
+   The query itself is one `builds.list` call per uncovered member, filtered
+   server-side to `trigger_id=<the service's preview trigger> AND
+   status="SUCCESS"` over a single bounded page (100), with the **commit
+   matched client-side**. The commit is deliberately not pushed into the
+   filter: Cloud Build accepts `substitutions.COMMIT_SHA=…` but does not
+   reliably evaluate that namespace — `substitutions.COMMIT_SHA!="<sha>"`
+   returns exactly the one build *with* that SHA, silently treating `!=` as
+   `=` — so the correctness-relevant predicate is evaluated locally against a
+   page the honored fields (`trigger_id`, `status`) have already narrowed.
+   There is no pagination: a commit whose build has fallen off the first page
+   reads as "not built" and costs one rebuild, never a wrong answer. A lookup
+   that **errors** does the same — could-not-tell and not-found both mean
+   "build it", which is the safe direction, and a Cloud Build blip must never
+   fail a preview that could simply be built.
 
    Each build still runs its `{service}-preview-build` trigger and is polled to
    a terminal status (`buildPollInterval`, 10s). What changed is that
@@ -450,17 +491,23 @@ before you go looking for them:
   Dockerfile means the app layer is byte-identical, but the
   `python:3.13-slim` / `alpine:latest` underneath it is whatever was current
   when the image was first built. A preview that has been re-run for a week
-  without that member changing is a week behind on base-image patches. Force a
-  rebuild by pushing a commit to that repo, or tear the preview down and
-  recreate it (a fresh namespace has no `bifrost/built-images` to reuse).
+  without that member changing is a week behind on base-image patches. **The
+  only way to force a rebuild is to push a commit to that repo.** Tearing the
+  preview down and recreating it does *not* do it: the recreate finds the same
+  successful build in Cloud Build's history and reuses the same image, which is
+  the point of the teardown-surviving lookup in step 4.
 - **A skipped build trusts that the image is still in Artifact Registry.**
   There is no cleanup policy today, so nothing deletes preview images; if one
   were deleted by hand, the skip would apply a Deployment naming a tag that
-  isn't there. The failure is clean — `ImagePullBackOff`, caught by the
-  readiness wait (step 8), which fails the preview with that as the reason —
-  but note the interaction: **a future image-cleanup policy would need a
-  retention window longer than previews live**, or it would start breaking
-  re-runs of previews that are still in use.
+  isn't there. This is true of **both** reuse paths and to exactly the same
+  degree: `bifrost/built-images` records that a build succeeded, and the Cloud
+  Build lookup asks whether a build succeeded — neither one asks Artifact
+  Registry whether the image is still there, so both are proxies that diverge
+  only if an image is deleted after being built. The failure is clean —
+  `ImagePullBackOff`, caught by the readiness wait (step 8), which fails the
+  preview with that as the reason — but note the interaction: **a future
+  image-cleanup policy would need a retention window longer than previews
+  live**, or it would start breaking re-runs of previews that are still in use.
 
 ### Progress annotations
 
@@ -899,8 +946,11 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `ib preview up <branch>` — safe, since every stage is
   idempotent, and cheap, since a member whose commit already has an image
-  isn't rebuilt (see step 4). A run that died *before* its builds finished has
-  nothing recorded and does pay for them. The expiry sweep does
+  isn't rebuilt (see step 4). A run that died *before* its builds finished
+  recorded nothing, but it doesn't necessarily pay for them either: nothing
+  cancels a build once Cloud Build has accepted it, so a build that went on to
+  succeed after bifrost lost the thread is found by step 4's build lookup and
+  reused. Only a member whose build never succeeded is really rebuilt. The expiry sweep does
   not help here either: `PurgeExpired` treats `phase: creating` as "still in
   flight" and skips it unconditionally — not merely defers it — so a preview
   whose `Up` died with the process (a spot-node preemption is the routine

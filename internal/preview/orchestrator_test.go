@@ -202,9 +202,49 @@ type fakeGCB struct {
 	// observe that the two are really being awaited concurrently rather than
 	// one after the other.
 	onGetBuild func(buildID string)
+
+	// priorBuilds is Cloud Build's build HISTORY as FindSuccessfulBuild sees
+	// it: triggerID -> commit -> the short SHA that build produced. Empty by
+	// default, so an unconfigured fake reports every commit as never built —
+	// which is what a first-ever create really faces, and what keeps every
+	// pre-existing test building exactly as much as it did before.
+	priorBuilds map[string]map[string]string
+	// findErr fails FindSuccessfulBuild for a trigger: "bifrost could not
+	// tell", which must degrade to building rather than to failing the run.
+	findErr map[string]error
+	// findCalls counts FindSuccessfulBuild calls per trigger. It is the only
+	// witness that the LIVE-preview path never consults Cloud Build at all: a
+	// re-run over a healthy preview builds nothing and applies the same images
+	// whether or not the lookup happened, so no other assertion can see it.
+	findCalls map[string]int
 }
 
 func (f *fakeGCB) LatestBuilds(context.Context) (map[string]gcb.BuildStatus, error) { return nil, nil }
+
+func (f *fakeGCB) FindSuccessfulBuild(_ context.Context, triggerID, commit string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.findCalls == nil {
+		f.findCalls = map[string]int{}
+	}
+	f.findCalls[triggerID]++
+	if err, ok := f.findErr[triggerID]; ok {
+		return "", false, err
+	}
+	shortSHA, ok := f.priorBuilds[triggerID][commit]
+	if !ok {
+		return "", false, nil
+	}
+	return shortSHA, true, nil
+}
+
+// findCallsFor reads a trigger's FindSuccessfulBuild count under the fake's
+// lock — safe to call while a background watcher goroutine is running.
+func (f *fakeGCB) findCallsFor(triggerID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.findCalls[triggerID]
+}
 
 func (f *fakeGCB) RunTrigger(_ context.Context, triggerID, _ string) (string, error) {
 	f.mu.Lock()
@@ -1051,6 +1091,275 @@ func TestUpRerunAfterAFailedBuildStillRebuilds(t *testing.T) {
 	}
 	if got := d.kube.annotations(ns)["bifrost/phase"]; got != "ready" {
 		t.Errorf("bifrost/phase after the retry = %q, want ready", got)
+	}
+}
+
+// ---- Up: reuse that survives a teardown -------------------------------------
+//
+// bifrost/built-images lives on the preview's namespace and Down deletes the
+// namespace, so an up -> down -> up at the same commit has nothing recorded to
+// reuse. These cover the fallback that closes that gap: when — and only when —
+// the annotation has no entry for a member, Cloud Build is asked whether the
+// commit was already built successfully.
+//
+// The fake answers at the interface boundary (found / not-found / error),
+// which is where the orchestrator's own behavior lives. What counts as a
+// findable build — SUCCESS only, newest first, a usable SHORT_SHA — is the
+// gcb package's contract and is tested against the real implementation there
+// (TestSuccessfulBuildFor, TestFindSuccessfulBuild*).
+
+// priorBuiltImages is a Cloud Build history in which BOTH members' current
+// commit has already been built successfully, under image tags that are
+// visibly different from the ones a fresh build would produce ("<trigger>-sha")
+// — so an image reused from the lookup can never be mistaken for one this run
+// built.
+func priorBuiltImages() map[string]map[string]string {
+	return map[string]map[string]string{
+		"trig-api":  {defaultBranchSHA: "coldapi"},
+		"trig-dash": {defaultBranchSHA: "colddash"},
+	}
+}
+
+// TestUpAfterDownReusesImagesWithoutBuilding is the entire point of the
+// feature: tear a preview down and bring it straight back up at the same
+// commit, and nothing is rebuilt.
+//
+// The load-bearing assertion is the negative one — RunTrigger is never called
+// — because a run that rebuilt would look identical in every other respect: it
+// would reach ready, apply both members, and record built-images too. Only the
+// image tags and the absence of builds tell the two apart.
+func TestUpAfterDownReusesImagesWithoutBuilding(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+	d.gcb.priorBuilds = priorBuiltImages()
+
+	if err := d.orch.Down(ctx, "hae-cadence"); err != nil {
+		t.Fatalf("Down failed: %v", err)
+	}
+	if _, exists := d.kube.namespaces[ns]; exists {
+		t.Fatalf("precondition: %s still exists after Down, so its bifrost/built-images was never lost", ns)
+	}
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up after Down failed: %v", err)
+	}
+
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if got := d.gcb.runCallsFor(trigger); got != 0 {
+			t.Errorf("%s ran %d builds, want 0 — the images for this commit already exist and the run must reuse them", trigger, got)
+		}
+	}
+	images := d.kube.appliedImages(ns)
+	want := map[string]string{
+		"footstrike-api":       previewImage("footstrike-api", "coldapi"),
+		"footstrike-dashboard": previewImage("footstrike-dashboard", "colddash"),
+	}
+	for svc, image := range want {
+		if images[svc] != image {
+			t.Errorf("%s deployed image = %q, want the already-built %q", svc, images[svc], image)
+		}
+	}
+	if got := d.kube.annotations(ns)["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready — reusing must still produce a working preview", got)
+	}
+}
+
+// TestUpAfterDownRecordsWhatItReusedSoTheNextRunNeedsNoLookup: a member reused
+// from the build lookup has to be written into bifrost/built-images exactly as
+// a real build would be. Otherwise every subsequent re-run of a recreated
+// preview — including every auto-update tick — would fall through to the
+// lookup again forever, paying an API call per member per tick for an answer
+// the namespace could have held.
+func TestUpAfterDownRecordsWhatItReusedSoTheNextRunNeedsNoLookup(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+	d.gcb.priorBuilds = priorBuiltImages()
+
+	if err := d.orch.Down(ctx, "hae-cadence"); err != nil {
+		t.Fatalf("Down failed: %v", err)
+	}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up after Down failed: %v", err)
+	}
+
+	want := "footstrike-api=" + defaultBranchSHA + ":coldapi," +
+		"footstrike-dashboard=" + defaultBranchSHA + ":colddash"
+	if got := d.kube.annotations(ns)["bifrost/built-images"]; got != want {
+		t.Fatalf("bifrost/built-images = %q, want %q — a reused image must be recorded exactly as a built one is", got, want)
+	}
+
+	lookupsAfterRecreate := map[string]int{
+		"trig-api": d.gcb.findCallsFor("trig-api"), "trig-dash": d.gcb.findCallsFor("trig-dash"),
+	}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("second Up failed: %v", err)
+	}
+	for trigger, before := range lookupsAfterRecreate {
+		if before == 0 {
+			t.Fatalf("precondition: %s was never looked up during the recreate", trigger)
+		}
+		if got := d.gcb.findCallsFor(trigger); got != before {
+			t.Errorf("%s build lookups went %d -> %d across the follow-up run, want no change: the recorded annotation must answer it", trigger, before, got)
+		}
+	}
+}
+
+// TestUpLivePreviewRerunNeverConsultsCloudBuild guards the common path this
+// feature must not tax. A re-run over a live preview — the documented recovery
+// path, and what the auto-update watcher walks every two minutes — has an
+// annotation entry for every member, which is authoritative and free. Nothing
+// else in the run can witness a stray lookup: it would return the same images,
+// apply the same manifests and reach ready either way, just having spent an
+// API call per member per tick to learn what the namespace already said.
+func TestUpLivePreviewRerunNeverConsultsCloudBuild(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	d.gcb.priorBuilds = priorBuiltImages()
+
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("first Up failed: %v", err)
+	}
+	// The first create legitimately looks (it has nothing recorded); only what
+	// happens once the namespace holds a record is under test here.
+	before := map[string]int{
+		"trig-api": d.gcb.findCallsFor("trig-api"), "trig-dash": d.gcb.findCallsFor("trig-dash"),
+	}
+
+	// Re-run with nothing moved: both members are covered by the annotation.
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("re-run Up failed: %v", err)
+	}
+	// ...and again with ONE member's commit moved, which is what an
+	// auto-update tick looks like. An entry that DISAGREES is still an answer:
+	// the member moved, so it is built, with no lookup.
+	d.github.shas = map[string]string{"footstrike-dashboard": "beef99887766554433"}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("moved-commit Up failed: %v", err)
+	}
+
+	for trigger, n := range before {
+		if got := d.gcb.findCallsFor(trigger); got != n {
+			t.Errorf("%s build lookups went %d -> %d over two re-runs of a live preview, want no change — bifrost/built-images already covers every member", trigger, n, got)
+		}
+	}
+	// The moved member is still rebuilt (the annotation said it moved), and
+	// the untouched one still rides its recorded entry.
+	if got := d.gcb.runCallsFor("trig-dash"); got != 1 {
+		t.Errorf("trig-dash ran %d builds, want 1 — the member whose commit moved must still be rebuilt", got)
+	}
+	if got := d.gcb.runCallsFor("trig-api"); got != 0 {
+		t.Errorf("trig-api ran %d builds, want 0 — its commit never moved", got)
+	}
+	images := d.kube.appliedImages("preview-hae-cadence")
+	if want := previewImage("footstrike-api", "coldapi"); images["footstrike-api"] != want {
+		t.Errorf("footstrike-api deployed image = %q, want %q carried through by the annotation", images["footstrike-api"], want)
+	}
+	if want := previewImage("footstrike-dashboard", "trig-dash-sha"); images["footstrike-dashboard"] != want {
+		t.Errorf("footstrike-dashboard deployed image = %q, want the freshly built %q", images["footstrike-dashboard"], want)
+	}
+}
+
+// TestUpAfterDownStillBuildsWhenTheCommitWasNeverBuiltSuccessfully covers both
+// halves of "not found": a commit Cloud Build has no record of, and one whose
+// only build FAILED. The gcb client reports them identically — a failed build
+// produced no image, so it is not a findable build (see
+// TestSuccessfulBuildFor's "only a failed build at this commit") — and the
+// orchestrator must build in both cases rather than reaching for a tag that
+// does not exist in Artifact Registry.
+func TestUpAfterDownStillBuildsWhenTheCommitWasNeverBuiltSuccessfully(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+	// Cloud Build's history holds nothing usable for this commit: for the api
+	// because the only build of it failed, for the dashboard because it has
+	// never been built at all. Both surface here as not-found.
+	d.gcb.priorBuilds = map[string]map[string]string{"trig-api": {}, "trig-dash": {}}
+
+	if err := d.orch.Down(ctx, "hae-cadence"); err != nil {
+		t.Fatalf("Down failed: %v", err)
+	}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up after Down failed: %v", err)
+	}
+
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if got := d.gcb.findCallsFor(trigger); got != 1 {
+			t.Errorf("%s was looked up %d times, want 1 — a recreate has no annotation and must ask", trigger, got)
+		}
+		if got := d.gcb.runCallsFor(trigger); got != 1 {
+			t.Errorf("%s ran %d builds, want 1 — no successful build exists for this commit, so it must be built", trigger, got)
+		}
+	}
+	images := d.kube.appliedImages(ns)
+	if images["footstrike-api"] != apiImage || images["footstrike-dashboard"] != dashImage {
+		t.Errorf("deployed images = %v, want the freshly built %q and %q", images, apiImage, dashImage)
+	}
+}
+
+// TestUpFirstCreateStillBuildsEverythingDespiteTheLookup is the other common
+// path that must not regress: a brand-new preview for a brand-new branch. It
+// now consults Cloud Build (it has no annotation to consult instead), and the
+// lookup finding nothing must leave the run building exactly as much as it
+// always did. The lookup-call assertion is what stops this from passing
+// vacuously — without it, an implementation that never asked would look the
+// same.
+func TestUpFirstCreateStillBuildsEverythingDespiteTheLookup(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+	for _, trigger := range []string{"trig-api", "trig-dash"} {
+		if got := d.gcb.findCallsFor(trigger); got != 1 {
+			t.Errorf("%s was looked up %d times, want 1", trigger, got)
+		}
+		if got := d.gcb.runCallsFor(trigger); got != 1 {
+			t.Errorf("%s ran %d builds, want 1 — a first create with nothing built anywhere must build every member", trigger, got)
+		}
+	}
+	images := d.kube.appliedImages("preview-hae-cadence")
+	if images["footstrike-api"] != apiImage || images["footstrike-dashboard"] != dashImage {
+		t.Errorf("deployed images = %v, want %q and %q", images, apiImage, dashImage)
+	}
+}
+
+// TestUpBuildLookupFailureBuildsRatherThanFailingTheRun: the lookup is an
+// optimization, so "bifrost could not tell" has to mean the same thing as "no
+// such build" — build it. A lookup error that propagated would turn a Cloud
+// Build blip into a failed preview, which is strictly worse than the rebuild
+// this feature exists to avoid.
+func TestUpBuildLookupFailureBuildsRatherThanFailingTheRun(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	ctx := context.Background()
+	const ns = "preview-hae-cadence"
+	d.gcb.priorBuilds = priorBuiltImages()
+	// Only the api's lookup fails, so the same run also proves the failure is
+	// scoped to its own member rather than poisoning the whole stage.
+	d.gcb.findErr = map[string]error{"trig-api": errors.New("cloudbuild: 503 backend error")}
+
+	if err := d.orch.Down(ctx, "hae-cadence"); err != nil {
+		t.Fatalf("Down failed: %v", err)
+	}
+	if err := d.orch.Up(ctx, "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed despite the build lookup being best-effort: %v", err)
+	}
+
+	if got := d.gcb.runCallsFor("trig-api"); got != 1 {
+		t.Errorf("trig-api ran %d builds, want 1 — an unanswerable lookup must fall back to building", got)
+	}
+	if got := d.gcb.runCallsFor("trig-dash"); got != 0 {
+		t.Errorf("trig-dash ran %d builds, want 0 — one member's lookup failing must not stop another's from being used", got)
+	}
+	if got := d.kube.annotations(ns)["bifrost/phase"]; got != "ready" {
+		t.Errorf("bifrost/phase = %q, want ready", got)
+	}
+	images := d.kube.appliedImages(ns)
+	if images["footstrike-api"] != apiImage {
+		t.Errorf("footstrike-api deployed image = %q, want the freshly built %q", images["footstrike-api"], apiImage)
+	}
+	if want := previewImage("footstrike-dashboard", "colddash"); images["footstrike-dashboard"] != want {
+		t.Errorf("footstrike-dashboard deployed image = %q, want the reused %q", images["footstrike-dashboard"], want)
 	}
 }
 
