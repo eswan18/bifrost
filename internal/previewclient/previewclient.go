@@ -269,6 +269,39 @@ func (c *Client) List(ctx context.Context) ([]previewapi.Record, error) {
 	return resp.Previews, nil
 }
 
+// Get fetches one preview by tag.
+//
+// A *NotFoundError here means bifrost has no namespace behind the tag, which
+// is NOT the same as "no such preview" — see NotFoundError. `bif preview up`
+// reads it as "not created yet" both before the POST and throughout the poll
+// loop; nothing else calls this.
+func (c *Client) Get(ctx context.Context, tag string) (*previewapi.Record, error) {
+	var rec previewapi.Record
+	if err := c.do(ctx, http.MethodGet, "/api/previews/"+tag, nil, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// Create asks bifrost to create or update the preview for a branch.
+//
+// The response is a 202 sent as soon as the request is accepted: membership
+// resolution, pre-flight and EnsureNamespace all run afterward in a detached
+// goroutine. So the record returned here carries only what bifrost can know
+// synchronously — the tag it derived and a "creating" phase — and is a partial
+// previewapi.Record rather than a description of anything that exists yet.
+// Everything else comes from polling Get.
+//
+// Its Tag is authoritative and the caller must use it in preference to any tag
+// it derived itself: bifrost, not the CLI, decides what a branch is called.
+func (c *Client) Create(ctx context.Context, req previewapi.CreateRequest) (*previewapi.Record, error) {
+	var rec previewapi.Record
+	if err := c.do(ctx, http.MethodPost, "/api/previews", req, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
 // Delete tears down one preview. A *NotFoundError here means bifrost has no
 // such preview; whether that is an error is the caller's call (for `bif
 // preview down` it is).

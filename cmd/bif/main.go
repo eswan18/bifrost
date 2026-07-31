@@ -46,11 +46,12 @@ Usage:
     bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
     bif promote <app>        # Compare staging vs prod, offer to promote
     bif promote <app> -y     # Promote without confirmation
-    bif preview list         # Table of preview environments, TTL remaining
-    bif preview down <tag>   # Tear down (confirm unless -y/--yes)
-
-Not ported yet — run this with the Python CLI:
-    ib preview up <branch> [--ttl 8h] [--auto-update] [--no-wait]`
+    bif preview list                      # Table of preview environments, TTL remaining
+    bif preview up <branch>               # Create/update, show live progress, print URLs
+    bif preview up <branch> --ttl 8h      # Same, but auto-expire after 8h
+    bif preview up <branch> --no-wait     # Fire and return the tag
+    bif preview up <branch> --auto-update # Same, but redeploy when the branch moves
+    bif preview down <tag>                # Tear down (confirm unless -y/--yes)`
 
 // argoNamespace is where the ArgoCD Applications live. `bif status` never
 // touches them — it reads pods — but kube.New wants it, and `bif promote` will.

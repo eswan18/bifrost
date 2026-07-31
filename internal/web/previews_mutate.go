@@ -48,17 +48,13 @@ const asyncOrchestrationTimeout = 30 * time.Minute
 // omitting ttl entirely still means "never expires".
 const maxPreviewTTL = 30 * 24 * time.Hour
 
-// createPreviewRequest is POST /api/previews's JSON body. TTL is an optional
+// POST /api/previews's JSON body is previewapi.CreateRequest, shared with the
+// CLI that sends it rather than declared once on each side. TTL is an optional
 // Go duration string ("8h", "90m"); absent or empty means the preview never
 // expires, which is the default by design (see the plan's constraints).
 // AutoUpdate opts the preview into following its branch — absent means false,
 // and a re-POST without it turns auto-update back off, exactly as a re-POST
 // without a ttl clears the expiry.
-type createPreviewRequest struct {
-	Branch     string `json:"branch"`
-	TTL        string `json:"ttl,omitempty"`
-	AutoUpdate bool   `json:"autoUpdate,omitempty"`
-}
 
 // CreatePreviewJSON serves POST /api/previews. It validates just enough to
 // answer synchronously (branch present, tag derivable, not already busy),
@@ -88,7 +84,7 @@ func (h *Handlers) CreatePreviewJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req createPreviewRequest
+	var req previewapi.CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return

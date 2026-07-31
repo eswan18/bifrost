@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -27,6 +28,11 @@ type capturedRequest struct {
 	UserAgent     string
 	Authorization string
 	Accept        string
+	// Body is the raw request bytes. `preview up` is the only command that
+	// sends one, and what is in it — whether "ttl" and "autoUpdate" are
+	// present at all — is the difference between a preview that expires and
+	// one that does not.
+	Body string
 }
 
 // fakeBifrost is an httptest server standing in for the preview API, plus the
@@ -45,6 +51,9 @@ func newFakeBifrost(t *testing.T, h http.HandlerFunc) *fakeBifrost {
 	t.Helper()
 	f := &fakeBifrost{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// Put it back: the handler under test is entitled to read it too.
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		f.mu.Lock()
 		f.got = append(f.got, capturedRequest{
 			Method:        r.Method,
@@ -52,6 +61,7 @@ func newFakeBifrost(t *testing.T, h http.HandlerFunc) *fakeBifrost {
 			UserAgent:     r.Header.Get("User-Agent"),
 			Authorization: r.Header.Get("Authorization"),
 			Accept:        r.Header.Get("Accept"),
+			Body:          string(body),
 		})
 		f.mu.Unlock()
 		h(w, r)

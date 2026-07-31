@@ -16,7 +16,10 @@
 // internal/web from the CLI outright.
 package previewapi
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Record is one preview environment as GET /api/previews/{tag} returns it, and
 // as GET /api/previews returns each element of its list.
@@ -81,6 +84,79 @@ type Record struct {
 	// reaches ready (Step is cleared to "" on success, and a re-run that
 	// reuses every image can finish inside a single poll interval).
 	BuiltImages map[string]BuiltImage `json:"builtImages,omitempty"`
+}
+
+// UnmarshalJSON decodes a Record, tolerating a stepSince that is not a usable
+// RFC3339 instant: an unparseable or timezone-naive value leaves StepSince
+// zero — "the server didn't tell us when this step started" — instead of
+// failing the whole record.
+//
+// This is not defensive decoration. StepSince is a time.Time, so without this
+// ONE bad character in that field would fail the entire GET, and the caller
+// that reads it most is `bif preview up`'s poll loop, which would lose the
+// whole record — phase, error, URLs — over a cosmetic elapsed-time display.
+// ib.py hit the Python-shaped version of exactly this: a timezone-naive
+// stepSince raised an uncaught TypeError out of its elapsed-time arithmetic
+// and killed the poll loop mid-run, and its fix (treat it as unusable, fall
+// back to a locally tracked start) is what this reproduces one layer earlier,
+// where Go's typed decode puts the hazard.
+//
+// The policy is not new either: internal/web already swallows an unparseable
+// bifrost/step-since annotation and leaves this field zero (see
+// recordFromNamespace), so bifrost itself never emits a malformed value. This
+// applies the same reading to the wire, so a non-bifrost server, a proxy, or a
+// future format change degrades one field instead of the response.
+//
+// Every other field decodes exactly as the struct tags say. Marshalling is
+// untouched — the server has no MarshalJSON here and its output is unchanged.
+func (r *Record) UnmarshalJSON(data []byte) error {
+	// wire has none of Record's methods, so decoding into it cannot recurse
+	// back into this one. The shadowing StepSince sits at depth 0 and so wins
+	// over the embedded one at depth 1, which is what keeps encoding/json from
+	// ever parsing the timestamp itself.
+	type wire Record
+	var v struct {
+		wire
+		StepSince json.RawMessage `json:"stepSince"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*r = Record(v.wire)
+	r.StepSince = time.Time{}
+
+	var s string
+	if err := json.Unmarshal(v.StepSince, &s); err != nil {
+		// Absent, null, or not a string at all. Absence is the ordinary case —
+		// the field is omitzero and a ready preview has no current step.
+		return nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		r.StepSince = t
+	}
+	return nil
+}
+
+// CreateRequest is POST /api/previews's JSON body: the shape `bif preview up`
+// sends and internal/web's CreatePreviewJSON decodes.
+//
+// It lives here for the same reason Record does — "ttl" and "autoUpdate" are
+// key names two programs have to agree on, and a server-side rename that the
+// CLI did not follow would go on returning 202 while silently creating a
+// preview without the expiry or the branch-following that was asked for. That
+// is the exact failure warnIfTTLDropped exists to catch after the fact; sharing
+// the type stops it at compile time instead.
+//
+// TTL is a Go duration string ("8h", "90m"). Absent or empty means the preview
+// never expires, which is the default by design, so omitempty and an explicit
+// "" are the same request as far as the server is concerned (it trims and
+// treats empty as no expiry — see internal/web's TestCreatePreviewEmptyTTLIsNoExpiry).
+// AutoUpdate is opt-in: omitempty keeps the key out entirely when it is false,
+// which is what a re-POST that means "stop following the branch" looks like.
+type CreateRequest struct {
+	Branch     string `json:"branch"`
+	TTL        string `json:"ttl,omitempty"`
+	AutoUpdate bool   `json:"autoUpdate,omitempty"`
 }
 
 // BuiltImage is the JSON shape of one Record.BuiltImages entry: the full

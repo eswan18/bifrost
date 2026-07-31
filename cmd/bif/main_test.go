@@ -56,10 +56,13 @@ func TestDispatch(t *testing.T) {
 			wantOut:  []string{"Usage: bif preview <list|up|down> ..."},
 		},
 		{
-			name:     "preview up is still the Python's",
-			args:     []string{"preview", "up", "my-branch"},
+			// Rejected on argv alone (the equals form of --ttl is not parsed —
+			// see parseUpArgs), so nothing is dialled and noPreview's panic
+			// stands as proof of it.
+			name:     "preview up rejects a bad invocation without connecting",
+			args:     []string{"preview", "up", "my-branch", "--ttl=8h"},
 			wantCode: 1,
-			wantOut:  []string{"bif preview up is not ported to Go yet"},
+			wantOut:  []string{previewUpUsage},
 		},
 		{
 			name:     "unknown preview subcommand",
@@ -71,7 +74,7 @@ func TestDispatch(t *testing.T) {
 			name:     "usage advertises the ported preview subcommands",
 			args:     nil,
 			wantCode: 1,
-			wantOut:  []string{"bif preview list", "bif preview down <tag>"},
+			wantOut:  []string{"bif preview list", "bif preview up <branch>", "bif preview down <tag>"},
 		},
 	}
 	for _, tc := range tests {
