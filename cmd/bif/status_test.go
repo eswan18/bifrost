@@ -83,7 +83,7 @@ func exec(t *testing.T, cluster *fakeCluster, args ...string) (string, int) {
 func execStdin(t *testing.T, cluster *fakeCluster, stdin string, args ...string) (string, int) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect)
+	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, noPreview)
 	return stdout.String(), code
 }
 
@@ -595,7 +595,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		})
+		}, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -618,7 +618,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect)
+	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, noPreview)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
@@ -635,7 +635,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 func TestConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"status"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return nil, errors.New("no kubeconfig") })
+		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, noPreview)
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
@@ -651,7 +651,7 @@ func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
 	code := run(context.Background(), []string{"status", "bifrost", "-q"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return cluster, nil })
+		func() (promoter, error) { return cluster, nil }, noPreview)
 	if stdout.String() != "" || code != 0 {
 		t.Errorf("stdout = %q, exit = %d; want in-sync (no output, 0) with the job pod ignored", stdout.String(), code)
 	}

@@ -130,7 +130,7 @@ func promoteOne(ctx context.Context, cluster promoter, app string, stagingImages
 
 	outf(stdout, "\n→ Promote prod to: %s\n", status.NewProdTag)
 
-	if !yes && !confirm(stdin, stdout) {
+	if !yes && !confirm(stdin, stdout, "\nProceed? [y/N] ") {
 		outln(stdout, "Aborted.")
 		return 0
 	}
@@ -176,8 +176,13 @@ func writeFoundImages(w io.Writer, images []string) {
 // raises EOFError there and dies with a traceback (exit 1); this prints
 // "Aborted." and exits 0. Both refuse the write, which is the property that
 // matters, and a traceback is not behaviour worth porting.
-func confirm(stdin io.Reader, stdout io.Writer) bool {
-	outf(stdout, "\nProceed? [y/N] ")
+//
+// The prompt is a parameter because `bif preview down` asks a different
+// question ("Tear down preview <tag>? [y/N] ") on identical terms. The two
+// irreversible commands in this CLI accept the same keystroke, and that stays
+// true by construction rather than by two copies agreeing.
+func confirm(stdin io.Reader, stdout io.Writer, prompt string) bool {
+	outf(stdout, "%s", prompt)
 	line, _ := bufio.NewReader(stdin).ReadString('\n')
 	return strings.ToLower(strings.TrimSpace(line)) == "y"
 }

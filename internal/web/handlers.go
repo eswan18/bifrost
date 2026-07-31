@@ -15,6 +15,7 @@ import (
 	"github.com/eswan18/bifrost/internal/config"
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/previewapi"
 	"github.com/eswan18/bifrost/internal/promote"
 	"github.com/eswan18/bifrost/internal/registry"
 )
@@ -68,7 +69,7 @@ type pageVM struct {
 	Apps     []appView
 	Overview *overviewData
 	Jobs     *jobsPage
-	Previews []previewRecord
+	Previews []previewapi.Record
 	// Preview switches the previews template from the tab's list to the
 	// per-preview detail page (previews.html's "tab-body" dispatches on it).
 	// nil on the tab itself and on every other page.

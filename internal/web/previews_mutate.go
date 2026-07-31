@@ -10,6 +10,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/preview"
+	"github.com/eswan18/bifrost/internal/previewapi"
 )
 
 // orchestration is the subset of *preview.Orchestrator the preview endpoints
@@ -240,8 +241,13 @@ func (h *Handlers) verifyMutationCSRF(w http.ResponseWriter, r *http.Request) bo
 
 // writeJSONError writes a JSON {"error": msg} body with status, matching the
 // read endpoints' error shape (PreviewsListJSON/PreviewJSON in previews.go).
+//
+// It encodes previewapi.ErrorResponse rather than a map literal because msg is
+// what `bif preview` prints verbatim on a failure: the CLI decodes that type,
+// so the key both sides use is declared once instead of spelled "error" here
+// and again in the client.
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": msg})
+	_ = json.NewEncoder(w).Encode(previewapi.ErrorResponse{Error: msg})
 }
