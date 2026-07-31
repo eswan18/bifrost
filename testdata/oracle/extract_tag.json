@@ -1,0 +1,42 @@
+[
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+    "tag": "abc1234"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging",
+    "tag": "abc1234-staging"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod",
+    "tag": "abc1234-prod"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest",
+    "tag": "latest"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost",
+    "tag": "latest"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:",
+    "tag": ""
+  },
+  {
+    "image": "localhost:5000/bifrost:abc1234",
+    "tag": "abc1234"
+  },
+  {
+    "image": "localhost:5000/bifrost",
+    "tag": "5000/bifrost"
+  },
+  {
+    "image": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost@sha256:0123456789abcdef0123456789abcdef",
+    "tag": "0123456789abcdef0123456789abcdef"
+  },
+  {
+    "image": "",
+    "tag": "latest"
+  }
+]

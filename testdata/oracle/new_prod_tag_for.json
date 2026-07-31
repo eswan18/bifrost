@@ -1,0 +1,116 @@
+[
+  {
+    "stagingTag": "abc1234",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234",
+    "prodTag": "abc1234",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "def5678-prod",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "abc1234-prod",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234",
+    "prodTag": "latest",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "prod",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "latest",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234",
+    "prodTag": "def5678-prod",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234",
+    "prodTag": null,
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": null,
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234",
+    "prodTag": "",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-staging",
+    "prodTag": "",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234-staging-extra",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "my-staging-branch",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234-prod"
+  },
+  {
+    "stagingTag": "abc1234staging",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-STAGING",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "abc1234-prod",
+    "prodTag": "def5678-prod",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  },
+  {
+    "stagingTag": "",
+    "prodTag": "def5678",
+    "stagingSha": "abc1234",
+    "newProdTag": "abc1234"
+  }
+]

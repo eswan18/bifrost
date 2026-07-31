@@ -1,0 +1,22 @@
+[
+  {
+    "app": "bifrost",
+    "deployedImage": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+    "imageBaseFromAppName": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "deployedImage": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod",
+    "imageBaseFromAppName": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard"
+  },
+  {
+    "app": "footstrike-api",
+    "deployedImage": "us-central1-docker.pkg.dev/ethans-services/containers/fitness-api:abc1234",
+    "imageBaseFromAppName": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-api"
+  },
+  {
+    "app": "bifrost",
+    "deployedImage": "localhost:5000/bifrost:abc1234",
+    "imageBaseFromAppName": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost"
+  }
+]
