@@ -392,7 +392,7 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	slog.Info("promote attempt", "user", sess.Email, "service", app,
 		"env", "prod", "from", s.ProdTag, "to", s.NewProdTag)
 
-	newImage := replaceTag(staging[0], s.NewProdTag)
+	newImage := promote.ReplaceTag(staging[0], s.NewProdTag)
 	if err := h.Kube.PatchAppImage(r.Context(), app, "prod", newImage); err != nil {
 		slog.Error("promote failed", "user", sess.Email, "service", app,
 			"from", s.ProdTag, "to", s.NewProdTag, "error", err)
@@ -559,11 +559,6 @@ func backTo(r *http.Request) string {
 	default:
 		return "/"
 	}
-}
-
-// replaceTag swaps the tag on a full image ref, keeping the registry path.
-func replaceTag(image, tag string) string {
-	return promote.ImageBase(image) + ":" + tag
 }
 
 // buildPipelineURL links a service to its Cloud Build trigger's build history

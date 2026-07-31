@@ -20,10 +20,25 @@ import (
 // synthesizes one single-container pod per image rather than returning images
 // directly, so the tests exercise kube.Images (Job-pod exclusion, deduping)
 // on the way through instead of stepping over it.
+//
+// It also records every PatchAppImage call, which is how the promote tests
+// tell a promotion from a refusal: a decision that should not write must leave
+// patches empty, and "no write happened" is not something an output assertion
+// can establish.
 type fakeCluster struct {
 	images map[string][]string
 	errs   map[string]error
 	calls  []string
+
+	patches  []patchCall
+	patchErr error
+}
+
+// patchCall is one write to an ArgoCD Application, as promote asked for it.
+type patchCall struct {
+	app   string
+	env   string
+	image string
 }
 
 func (f *fakeCluster) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
@@ -45,18 +60,30 @@ func (f *fakeCluster) ListPods(_ context.Context, ns string) ([]kube.PodInfo, er
 	return pods, nil
 }
 
-func (f *fakeCluster) connect() (podLister, error) { return f, nil }
+func (f *fakeCluster) PatchAppImage(_ context.Context, app, env, image string) error {
+	f.patches = append(f.patches, patchCall{app: app, env: env, image: image})
+	return f.patchErr
+}
+
+func (f *fakeCluster) connect() (promoter, error) { return f, nil }
 
 const testRegistry = "us-central1-docker.pkg.dev/ethans-services/containers"
 
 func image(app, tag string) string { return fmt.Sprintf("%s/%s:%s", testRegistry, app, tag) }
 
-// exec runs one whole ib invocation against the fake and returns its stdout
-// and exit code.
+// exec runs one whole bif invocation against the fake and returns its stdout
+// and exit code. Stdin is empty, so a command that reads it gets EOF —
+// promote's tests that care pass their own (see execStdin).
 func exec(t *testing.T, cluster *fakeCluster, args ...string) (string, int) {
 	t.Helper()
+	return execStdin(t, cluster, "", args...)
+}
+
+// execStdin is exec with the operator's keystrokes supplied.
+func execStdin(t *testing.T, cluster *fakeCluster, stdin string, args ...string) (string, int) {
+	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), args, &stdout, &stderr, cluster.connect)
+	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect)
 	return stdout.String(), code
 }
 
@@ -139,7 +166,7 @@ var verboseDivergences = map[string]divergence{
 		pythonVerdict: indeterminate,
 		goStdout: "\nbifrost deployment status:\n" + strings.Repeat("-", 50) +
 			"\n  staging: abc1234\n  prod:    latest\n" +
-			"\n✗ Out of sync\n  To promote: ib promote bifrost\n  This will deploy abc1234 to prod\n",
+			"\n✗ Out of sync\n  To promote: bif promote bifrost\n  This will deploy abc1234 to prod\n",
 		goVerdict: outOfSync,
 		why:       "prod unpinned on a mutable tag; ib.py status() needs both SHAs, ib.py promote() does not (bifrost#30)",
 	},
@@ -149,7 +176,7 @@ var verboseDivergences = map[string]divergence{
 		pythonVerdict: indeterminate,
 		goStdout: "\nfootstrike-dashboard deployment status:\n" + strings.Repeat("-", 50) +
 			"\n  staging: abc1234-staging\n  prod:    prod\n" +
-			"\n✗ Out of sync\n  To promote: ib promote footstrike-dashboard\n  This will deploy abc1234-prod to prod\n",
+			"\n✗ Out of sync\n  To promote: bif promote footstrike-dashboard\n  This will deploy abc1234-prod to prod\n",
 		goVerdict: outOfSync,
 		why:       "same, on the {sha}-{env} tagging scheme",
 	},
@@ -168,14 +195,46 @@ var quietDivergences = map[string]divergence{
 	},
 }
 
+// The out-of-sync hint is the one line where `bif status` deliberately does
+// not reproduce the oracle's bytes: ib.py names itself, and this names the
+// binary the reader is already running, because as of `bif promote` that hint
+// is true and `ib promote` is the one that is going away. Nothing else about
+// the line moves — same indent, same position, same following line.
+const (
+	oraclePromoteHint = "  To promote: ib promote "
+	bifPromoteHint    = "  To promote: bif promote "
+)
+
+// retargetPromoteHint applies that one substitution to a captured ib.py
+// output, so the golden comparison stays byte-exact everywhere else instead of
+// being weakened to a "contains" check.
+func retargetPromoteHint(oracleStdout string) string {
+	return strings.ReplaceAll(oracleStdout, oraclePromoteHint, bifPromoteHint)
+}
+
 // TestStatusRenderingMatchesOracle is the golden comparison: for every cluster
 // state ib.py was captured against, `bif status` must print exactly what ib.py
 // printed and return the same verdict — byte for byte, including the table
-// alignment, the blank lines and the ⚠/✓/✗ glyphs.
+// alignment, the blank lines and the ⚠/✓/✗ glyphs. The single exception is the
+// promote hint; see retargetPromoteHint.
 func TestStatusRenderingMatchesOracle(t *testing.T) {
 	rows, err := oracle.Load[statusRow]("status.json")
 	if err != nil {
 		t.Fatalf("load fixture: %v", err)
+	}
+
+	// Guard the substitution before relying on it. If ib.py's captured output
+	// no longer contains the hint at all, retargetPromoteHint is a silent
+	// no-op and every out-of-sync row would then be asserting that `bif
+	// status` prints no hint whatsoever — a passing test for a broken tool.
+	hinted := 0
+	for _, r := range rows {
+		if strings.Contains(r.VerboseStdout, oraclePromoteHint) {
+			hinted++
+		}
+	}
+	if hinted == 0 {
+		t.Fatalf("no fixture row contains %q; the promote-hint rewrite is a no-op and this test no longer checks the hint", oraclePromoteHint)
 	}
 
 	for _, mode := range []struct {
@@ -188,7 +247,7 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 		{
 			name:        "verbose",
 			quiet:       false,
-			stdout:      func(r statusRow) string { return r.VerboseStdout },
+			stdout:      func(r statusRow) string { return retargetPromoteHint(r.VerboseStdout) },
 			ret:         func(r statusRow) *bool { return r.VerboseReturn },
 			divergences: verboseDivergences,
 		},
@@ -329,6 +388,26 @@ func TestUnparseableProdTagIsOutOfSync(t *testing.T) {
 				t.Errorf("verbose exit = %d, want 1", code)
 			}
 		})
+	}
+}
+
+// TestOutOfSyncHintNamesBif: the hint has to name a command that exists and
+// does the thing. It said `ib promote` while promote lived only in the Python;
+// now that `bif promote` is the implementation, pointing at `ib` would send an
+// operator to the CLI this one is replacing.
+func TestOutOfSyncHintNamesBif(t *testing.T) {
+	c := fleet(t)
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+	out, code := exec(t, c, "status", "bifrost")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(out, bifPromoteHint+"bifrost\n") {
+		t.Errorf("status does not offer `bif promote bifrost`:\n%s", out)
+	}
+	if strings.Contains(out, oraclePromoteHint) {
+		t.Errorf("status still points at the Python CLI:\n%s", out)
 	}
 }
 
@@ -512,8 +591,8 @@ func TestStatusReadsEveryRegistryNamespace(t *testing.T) {
 func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	connected := false
-	code := run(context.Background(), []string{"status", "bifrsot"}, &stdout, &stderr,
-		func() (podLister, error) {
+	code := run(context.Background(), []string{"status", "bifrsot"}, strings.NewReader(""), &stdout, &stderr,
+		func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
 		})
@@ -539,7 +618,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost"}, &stdout, &stderr, c.connect)
+	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
@@ -555,8 +634,8 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 // an indeterminate status. ib.py would traceback here.
 func TestConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status"}, &stdout, &stderr,
-		func() (podLister, error) { return nil, errors.New("no kubeconfig") })
+	code := run(context.Background(), []string{"status"}, strings.NewReader(""), &stdout, &stderr,
+		func() (promoter, error) { return nil, errors.New("no kubeconfig") })
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
@@ -571,8 +650,8 @@ func TestConnectFailureExitsNonZero(t *testing.T) {
 func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
-	code := run(context.Background(), []string{"status", "bifrost", "-q"}, &stdout, &stderr,
-		func() (podLister, error) { return cluster, nil })
+	code := run(context.Background(), []string{"status", "bifrost", "-q"}, strings.NewReader(""), &stdout, &stderr,
+		func() (promoter, error) { return cluster, nil })
 	if stdout.String() != "" || code != 0 {
 		t.Errorf("stdout = %q, exit = %d; want in-sync (no output, 0) with the job pod ignored", stdout.String(), code)
 	}
@@ -581,6 +660,12 @@ func TestJobPodsExcluded(t *testing.T) {
 // jobCluster serves a namespace holding one live pod plus a leftover Job pod
 // on an older image.
 type jobCluster struct{}
+
+// PatchAppImage exists to satisfy promoter; a status test that reached it
+// would be a status test performing a write.
+func (jobCluster) PatchAppImage(_ context.Context, app, env, image string) error {
+	panic("status must not patch: " + app + "/" + env + " -> " + image)
+}
 
 func (jobCluster) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error) {
 	pods := []kube.PodInfo{{

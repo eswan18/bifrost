@@ -9,7 +9,6 @@ import (
 
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/promote"
-	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // podLister is the slice of kube.Client that `bif status` needs: pods, and
@@ -57,21 +56,14 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 	// is what retires ib.py's hand-maintained SERVICES, and it costs nothing
 	// against the offline requirement: registry.yaml is go:embed'd, so this is
 	// a parse of bytes already inside the binary.
-	reg, err := registry.Load()
-	if err != nil {
-		outf(stderr, "Error: loading the service registry: %v\n", err)
+	apps, ok := loadApps(stderr)
+	if !ok {
 		return 1
 	}
-	apps := reg.Names()
 
 	if len(args) > 0 {
-		// Validated before connecting, so a typo'd service name fails the same
-		// way whether or not the cluster is reachable. Mirrors ib.py's
-		// validate_app, including printing to stdout.
 		app := args[0]
-		if !slices.Contains(apps, app) {
-			outf(stdout, "Unknown service: %s\n", app)
-			outf(stdout, "Known services: %s\n", strings.Join(apps, ", "))
+		if !validateApp(stdout, apps, app) {
 			return 1
 		}
 		apps = []string{app}
@@ -158,7 +150,11 @@ func statusOne(w io.Writer, app string, stagingImages, prodImages []string, quie
 		outln(w, "\n✓ In sync")
 	case promote.OutOfSync:
 		outln(w, "\n✗ Out of sync")
-		outf(w, "  To promote: ib promote %s\n", app)
+		// ib.py points at itself here; this points at this binary, because as
+		// of `bif promote` the hint is true. It is the one line of status
+		// output that deliberately differs from the oracle — see
+		// oraclePromoteHint in status_test.go.
+		outf(w, "  To promote: bif promote %s\n", app)
 		outf(w, "  This will deploy %s to prod\n", status.NewProdTag)
 	default:
 		// Indeterminate: the table is the whole answer, and ib.py still ends

@@ -112,37 +112,54 @@ the same fleet list (`internal/registry`), driven from a terminal instead of a b
 That directory has to be on your `PATH`; `make install` says so if it isn't.
 `make build-bif` drops a binary in the working directory instead.
 
-**Until `promote` and `preview` are ported, this binary is a strict subset of
-the Python `ib`** (uv installs that one to `~/.local/bin/ib`), which still owns
-those two commands. The names differ precisely so both can be installed: a Go
-binary called `ib` would shadow the Python one on `PATH` and silently take
-`promote` and `preview` away — the kind of thing you discover mid-incident.
+**Until `preview` is ported, this binary is a strict subset of the Python `ib`**
+(uv installs that one to `~/.local/bin/ib`), which still owns that command. The
+names differ precisely so both can be installed: a Go binary called `ib` would
+shadow the Python one on `PATH` and silently take `preview` away — the kind of
+thing you discover mid-incident.
 
     bif status               # every service
     bif status <app>         # one service's staging and prod images
     bif status -q            # list out-of-sync services (* = mid-deploy)
     bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
+    bif promote <app>        # compare staging vs prod, then ask before promoting
+    bif promote <app> -y     # promote without the prompt
 
-Exit codes are a contract: **1** only when a service is definitely out of sync,
-in every form, with or without `-q`. Mid-deploy, missing pods and an unreadable
-staging tag all exit **0** — a script asking "is there anything to promote?"
-gets "no", not an error, when the answer isn't knowable yet.
+Exit codes are a contract: `status` exits **1** only when a service is
+definitely out of sync, in every form, with or without `-q`. Mid-deploy, missing
+pods and an unreadable staging tag all exit **0** — a script asking "is there
+anything to promote?" gets "no", not an error, when the answer isn't knowable
+yet. `promote` exits **1** when it refuses (no deployment on either side, a
+staging rollout in flight) or when the patch fails; declining the prompt exits
+**0**, because nothing went wrong.
+
+`promote` writes one thing: a kustomize images override on the `<app>-prod`
+ArgoCD Application, which is what `ib promote` has always done. A staging image
+mismatch refuses — the artifact isn't settled, so promoting might ship the wrong
+one — while a prod mismatch only warns, since re-pinning prod is how a bad
+rollout gets corrected.
 
 `bif` reaches the cluster directly through client-go and never calls bifrost's
 API. That is deliberate and load-bearing: `bif promote bifrost` is how bifrost
 gets recovered when bifrost is down, so it cannot depend on bifrost being up.
 The service list is `go:embed`ed, so it needs no network either.
 
-`ib promote` and `ib preview` are still `infra/ib.py`; the Go `ib` says so
-rather than pretending they don't exist.
+`ib preview` is still `infra/ib.py`; `bif` says so rather than pretending it
+doesn't exist.
 
-### One deliberate difference from `ib.py`
+### Two deliberate differences from `ib.py`
 
 An **unparseable prod tag** (`latest`, `prod` — see "Unpinned prod" below) reads
 as *out of sync* here, where `ib.py`'s `status` called it indeterminate. Go is
 right: `ib.py`'s own `promote` promotes from that state, and calling it unknown
-is the bug behind bifrost#30. The visible cost is that `ib status -q` now prints
+is the bug behind bifrost#30. The visible cost is that `bif status -q` now prints
 the service and exits **1** where the Python printed nothing and exited **0**.
+
+The **kustomize override key** comes from the image that's running, not from the
+service's name. `ib.py` builds it as `<registry>/<app>`, so for a service whose
+image repository is named something else it writes an override matching nothing
+— kustomize ignores it, the promote reports success, and prod doesn't move.
+`footstrike-api` is exactly that service: its image path is still `fitness-api`.
 
 ## Tests
 

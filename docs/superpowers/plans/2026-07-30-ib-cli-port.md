@@ -58,7 +58,7 @@ Build the safety net before porting anything. This is what makes the port TDD ra
 2. **`promote.Status` drops the tags `ib.py` still displays** when one side is mid-deploy or has no pods. Task 2 needs the tags from somewhere else, or `Status` has to widen.
 3. **The kustomize override key** — `ib.py` builds it from `REGISTRY + app name`, `promote.ImageBase` parses it from the running image. Identical for the fleet as named today; Go is right and Task 3 must not port `ib.py`'s version.
 
-Also for Task 3: the patch bodies are semantically identical but not byte-identical (`json.dumps` emits `": "` separators, `encoding/json` does not).
+Also for Task 3: the patch bodies are semantically identical but not byte-identical (`json.dumps` emits `": "` separators, `encoding/json` does not), so Task 3's "byte-equivalent" wording had to be read as equivalent-after-decoding — corrected in place below.
 
 ---
 
@@ -92,15 +92,23 @@ The task that justifies the project. **Read Task 1's findings before starting.**
 - Create: `cmd/bif/promote.go`, `cmd/bif/promote_test.go`
 - Modify: `internal/kube` if a patch helper is needed
 
-- [ ] **Step 1:** Port the decision path using `internal/promote` directly. No tag math may be reimplemented in `cmd/bif` — if something is missing, add it to `internal/promote` where the server shares it.
+- [x] **Step 1:** Port the decision path using `internal/promote` directly. No tag math may be reimplemented in `cmd/bif` — if something is missing, add it to `internal/promote` where the server shares it.
 
-- [ ] **Step 2:** Port the write. `ib.py` shells out to `kubectl patch application <app>-prod -n argocd --type=merge -p '<json>'` with a kustomize images override. In Go this is a dynamic-client merge patch on the ArgoCD Application CR. **The resulting patch must be byte-equivalent to the Python's** — assert that against a captured fixture, because this is the step that changes what runs in production.
+- [x] **Step 2:** Port the write. `ib.py` shells out to `kubectl patch application <app>-prod -n argocd --type=merge -p '<json>'` with a kustomize images override. In Go this is a dynamic-client merge patch on the ArgoCD Application CR. **The resulting patch must be semantically equivalent to the Python's** — assert that against a captured fixture by decoding both sides, because this is the step that changes what runs in production. (It cannot be byte-equivalent: `json.dumps` emits `": "` and `", "` separators and `encoding/json` emits neither. A merge patch is parsed, not compared, so the effect is identical — but an assertion on bytes would fail on whitespace while proving nothing about what prod runs. Task 1's findings called this; the wording above was wrong and is now corrected.)
 
-- [ ] **Step 3:** Preserve the confirmation prompt and `-y`. A promote is not reversible in one keystroke; do not quietly make it easier.
+- [x] **Step 3:** Preserve the confirmation prompt and `-y`. A promote is not reversible in one keystroke; do not quietly make it easier.
 
-- [ ] **Step 4:** Verify against the cluster **read-only** — `kubectl get application <app>-prod -n argocd -o json` before and after a dry run. Do not perform a real promotion as part of implementation.
+- [x] **Step 4:** Verify against the cluster **read-only** — `kubectl get application <app>-prod -n argocd -o json` before and after a dry run. Do not perform a real promotion as part of implementation.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
+
+**Findings (read before Task 5).**
+
+1. **The override key diverges from `ib.py`, deliberately.** `ib.py` builds it as `REGISTRY + "/" + app`; `cmd/bif` builds it with `promote.ReplaceTag` over `promote.ImageBase`, from the image the Deployment is actually running. For a service whose image repository is not named after it, `ib.py` writes an override keyed on an image no manifest references — kustomize ignores it silently, so the promote reports success and prod never moves. `footstrike-api` is that service (its image path is still `fitness-api`), and `cmd/bif/promote_test.go`'s `TestOverrideKeyComesFromTheImageNotTheAppName` pins it, reading `ib.py`'s value from `image_base.json` so the divergence fails loudly if the Python ever changes. **This is a behaviour change against `ib.py` and a fix.**
+2. **`bif status` now prints `To promote: bif promote <app>`.** The hint names the command that implements it. It is the only line of status output that departs from the oracle capture; the golden test applies that one substitution and guards against it becoming a no-op.
+3. **The staging/prod mismatch asymmetry lives in `cmd/bif`, not `internal/promote`.** `StatusOf` calls both `MidDeploy`; refusing on staging and warning on prod is a statement about what a promote may do, not about cluster state, so no verdict was widened or altered to accommodate it.
+4. **`promote.ReplaceTag` is new**, and `internal/web` now calls it instead of its own copy — one more decision the server and the CLI cannot drift apart on.
+5. **One small divergence in the prompt:** on EOF from stdin, `ib.py` raises `EOFError` and dies with a traceback (exit 1) where `bif` prints `Aborted.` and exits 0. Both refuse the write.
 
 ---
 

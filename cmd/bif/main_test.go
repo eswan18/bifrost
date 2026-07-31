@@ -13,7 +13,7 @@ import (
 
 // noCluster is the connection for dispatch tests: reaching it at all is the
 // failure.
-func noCluster() (podLister, error) { return nil, errors.New("dispatch must not connect") }
+func noCluster() (promoter, error) { return nil, errors.New("dispatch must not connect") }
 
 func TestDispatch(t *testing.T) {
 	tests := []struct {
@@ -26,7 +26,7 @@ func TestDispatch(t *testing.T) {
 			name:     "no arguments prints usage",
 			args:     nil,
 			wantCode: 1,
-			wantOut:  []string{"bif status <app> -q", "Deployment status and promotion helper"},
+			wantOut:  []string{"bif status <app> -q", "bif promote <app> -y", "Deployment status and promotion helper"},
 		},
 		{
 			name:     "unknown command",
@@ -35,10 +35,12 @@ func TestDispatch(t *testing.T) {
 			wantOut:  []string{"Unknown command: stauts", "Available commands: status, promote, preview"},
 		},
 		{
-			name:     "promote is reserved, not unknown",
-			args:     []string{"promote", "bifrost"},
+			name: "promote with no app prints its usage without connecting",
+			args: []string{"promote"},
+			// Rejected on argv alone, so the cluster is never dialled — the
+			// same shape ib.py has, and the reason noCluster can be used here.
 			wantCode: 1,
-			wantOut:  []string{"bif promote is not ported to Go yet"},
+			wantOut:  []string{"Usage: bif promote <app> [-y/--yes]"},
 		},
 		{
 			name:     "preview is reserved, not unknown",
@@ -50,7 +52,7 @@ func TestDispatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, &stdout, &stderr, noCluster)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
@@ -139,7 +141,7 @@ func TestNoBifrostServerDependency(t *testing.T) {
 	}
 	// Without this the test would pass against an empty directory, which is
 	// exactly the failure mode a guard like this dies of.
-	if files < 2 {
-		t.Fatalf("scanned %d non-test files in cmd/bif, expected at least main.go and status.go", files)
+	if files < 3 {
+		t.Fatalf("scanned %d non-test files in cmd/bif, expected at least main.go, status.go and promote.go", files)
 	}
 }
