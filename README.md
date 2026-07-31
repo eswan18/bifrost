@@ -102,6 +102,49 @@ the external one. If that's not your problem, set both to the same URL.
 
 For local dev, `kube.New` falls back to `~/.kube/config`.
 
+## The `ib` CLI
+
+`cmd/ib` is bifrost's command-line half — the same decision logic (`internal/promote`),
+the same fleet list (`internal/registry`), driven from a terminal instead of a browser.
+
+    make install      # go install ./cmd/ib  →  $(go env GOBIN), else $(go env GOPATH)/bin
+
+That directory has to be on your `PATH`; `make install` says so if it isn't.
+`make build-ib` drops a binary in the working directory instead.
+
+**Until `promote` and `preview` are ported, this binary is a strict subset of
+the Python `ib`** (uv installs that one to `~/.local/bin/ib`). Installing both
+means whichever comes first on `PATH` wins, silently — so `make install`
+prints which one that is, and warns when it has just shadowed the other. Find
+that out during an incident, with `ib promote bifrost` answering "not ported
+yet", and the shadowing is the outage.
+
+    ib status               # every service
+    ib status <app>         # one service's staging and prod images
+    ib status -q            # list out-of-sync services (* = mid-deploy)
+    ib status <app> -q      # minimal output; exit 0 in sync, 1 if not
+
+Exit codes are a contract: **1** only when a service is definitely out of sync,
+in every form, with or without `-q`. Mid-deploy, missing pods and an unreadable
+staging tag all exit **0** — a script asking "is there anything to promote?"
+gets "no", not an error, when the answer isn't knowable yet.
+
+`ib` reaches the cluster directly through client-go and never calls bifrost's
+API. That is deliberate and load-bearing: `ib promote bifrost` is how bifrost
+gets recovered when bifrost is down, so it cannot depend on bifrost being up.
+The service list is `go:embed`ed, so it needs no network either.
+
+`ib promote` and `ib preview` are still `infra/ib.py`; the Go `ib` says so
+rather than pretending they don't exist.
+
+### One deliberate difference from `ib.py`
+
+An **unparseable prod tag** (`latest`, `prod` — see "Unpinned prod" below) reads
+as *out of sync* here, where `ib.py`'s `status` called it indeterminate. Go is
+right: `ib.py`'s own `promote` promotes from that state, and calling it unknown
+is the bug behind bifrost#30. The visible cost is that `ib status -q` now prints
+the service and exits **1** where the Python printed nothing and exited **0**.
+
 ## Tests
 
     make test
