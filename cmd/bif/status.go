@@ -12,7 +12,7 @@ import (
 	"github.com/eswan18/bifrost/internal/registry"
 )
 
-// podLister is the slice of kube.Client that `ib status` needs: pods, and
+// podLister is the slice of kube.Client that `bif status` needs: pods, and
 // nothing else. Narrow on purpose — status is a read, and a wider seam here
 // would invite a later command to reach for a write through it.
 type podLister interface {
@@ -49,7 +49,7 @@ func exitCode(verdicts []verdict) int {
 	return 0
 }
 
-// statusCmd implements all four forms of `ib status`.
+// statusCmd implements all four forms of `bif status`.
 func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error)) int {
 	args, quiet := takeFlag(args, "-q", "--quiet")
 
@@ -118,8 +118,8 @@ func deployedImages(ctx context.Context, cluster podLister, stderr io.Writer, ns
 // The alternative was widening promote.Status, and it is the wrong shape: what
 // the mid-deploy display needs is every tag, so Status would have to carry
 // []string per environment — its own input handed back — and gain fields whose
-// meaning changed with State. cmd/ib already holds the image lists, having
-// just fetched them. So promote decides, and cmd/ib displays, and no verdict
+// meaning changed with State. cmd/bif already holds the image lists, having
+// just fetched them. So promote decides, and cmd/bif displays, and no verdict
 // moved to make the output match.
 func statusOne(w io.Writer, app string, stagingImages, prodImages []string, quiet bool) verdict {
 	staging := normalize(stagingImages)

@@ -10,7 +10,7 @@ ifeq ($(GOBIN_DIR),)
 GOBIN_DIR := $(shell go env GOPATH)/bin
 endif
 
-.PHONY: run build build-ib install test lint
+.PHONY: run build build-bif install test lint
 
 # static/style.css is hand-written and committed — there is no CSS build step.
 run:
@@ -19,32 +19,23 @@ run:
 build:
 	CGO_ENABLED=0 go build -o bifrost ./cmd/bifrost
 
-build-ib:
-	CGO_ENABLED=0 go build -o ib ./cmd/ib
+build-bif:
+	CGO_ENABLED=0 go build -o bif ./cmd/bif
 
-# Install the ib CLI. `go install` rather than a copy into a hand-picked
+# Install the bif CLI. `go install` rather than a copy into a hand-picked
 # directory: it already targets the one place Go tooling agrees is on PATH, so
 # there is nothing to configure and nothing to keep in sync.
 #
-# The PATH check afterwards is not decoration. Until promote and preview are
-# ported, this binary is a strict subset of the Python `ib` — and if the
-# Python one is also installed (uv puts it in ~/.local/bin), whichever comes
-# first on PATH wins silently. Finding that out during an incident, with
-# `ib promote bifrost` answering "not ported yet", is the failure this prints
-# to avoid.
+# Naming it `bif` rather than `ib` is what makes installing this safe while the
+# port is unfinished. The Python `ib` (uv puts it in ~/.local/bin) still owns
+# `promote` and `preview`; a Go binary called `ib` would shadow it on PATH and
+# silently take those away, which you would discover during an incident. Two
+# names, no collision, both work.
 install:
-	CGO_ENABLED=0 go install ./cmd/ib
-	@echo "installed ib to $(GOBIN_DIR)"
-	@found=$$(type -aP ib 2>/dev/null || true); \
-	first=$$(printf '%s' "$$found" | head -1); \
-	shadowed=$$(printf '%s' "$$found" | tail -n +2 | tr '\n' ' '); \
-	if [ -z "$$found" ]; then \
-		echo "warning: 'ib' is not on PATH — add $(GOBIN_DIR) to it"; \
-	elif [ "$$first" != "$(GOBIN_DIR)/ib" ]; then \
-		echo "note: $$first comes first on PATH, so 'ib' still runs that one, not this build"; \
-	elif [ -n "$$shadowed" ]; then \
-		echo "warning: this now shadows $$shadowed"; \
-		echo "         'ib promote' and 'ib preview' are NOT ported yet — run that one directly for those"; \
+	CGO_ENABLED=0 go install ./cmd/bif
+	@echo "installed bif to $(GOBIN_DIR)"
+	@if ! type -P bif >/dev/null 2>&1; then \
+		echo "warning: 'bif' is not on PATH — add $(GOBIN_DIR) to it"; \
 	fi
 
 test:
