@@ -784,15 +784,33 @@ func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]str
 //
 // sourceSHAs is what resolveMembers resolved each member's branch to for THIS
 // run; prior is what the last successful build recorded
-// (bifrost/built-images). A member is skipped iff the two agree — its
-// currently-resolved commit is exactly the commit whose image was last built —
-// and then its recorded short SHA is carried straight through to render, which
-// is what makes the skip a real reuse of the existing `preview-<sha>` image
-// rather than a rebuild in disguise. See builtImagesAnnotation for why prior
-// must come from that annotation and never from bifrost/source-shas.
+// (bifrost/built-images). There are two ways a member can end up reused, tried
+// in this order and never both:
+//
+//  1. prior has an entry for it. Then it is skipped iff the two agree — its
+//     currently-resolved commit is exactly the commit whose image was last
+//     built — and its recorded short SHA is carried straight through to
+//     render, which is what makes the skip a real reuse of the existing
+//     `preview-<sha>` image rather than a rebuild in disguise. An entry whose
+//     commit DISAGREES is a definitive "this member moved": it is built, with
+//     no lookup, because the annotation has already answered the question.
+//     See builtImagesAnnotation for why prior must come from that annotation
+//     and never from bifrost/source-shas.
+//  2. prior has NO entry for it, so the annotation cannot answer at all —
+//     which is exactly what a preview that has been torn down and recreated
+//     looks like, since Down deletes the namespace the annotation lived on.
+//     Only then does findPriorBuild ask Cloud Build whether the image is
+//     nonetheless already built.
+//
+// That ordering is what keeps the ordinary paths free. A live preview's
+// re-run — including every auto-update tick — has an entry for every member
+// either way, so it costs exactly the API calls it always did. Only a run
+// that would otherwise have built blind pays for a lookup.
 //
 // The returned map covers every member, skipped and built alike, so the
-// caller can both render and re-record all of them.
+// caller can both render and re-record all of them. A member reused via (2) is
+// recorded identically to one that was really built, so the NEXT run takes the
+// cheap annotation path rather than querying again.
 //
 // Two consequences of skipping are accepted rather than solved, and are
 // documented in docs/preview-environments.md:
@@ -815,7 +833,17 @@ func (o *Orchestrator) buildMembers(
 	built := make(map[string]builtImage, len(members))
 	var needed []string
 	for _, svc := range members {
-		if b, ok := prior[svc]; ok && b.Commit == sourceSHAs[svc] {
+		if b, ok := prior[svc]; ok {
+			if b.Commit == sourceSHAs[svc] {
+				built[svc] = b
+			} else {
+				needed = append(needed, svc)
+			}
+			continue
+		}
+		// No entry at all — the only case worth an API call. See
+		// findPriorBuild.
+		if b, ok := o.findPriorBuild(ctx, svc, sourceSHAs[svc]); ok {
 			built[svc] = b
 			continue
 		}
@@ -887,6 +915,61 @@ func (o *Orchestrator) buildMembers(
 	return built, nil
 }
 
+// findPriorBuild asks Cloud Build whether svc's preview trigger has ALREADY
+// built commit successfully, and if so what image tag that build produced.
+//
+// This is the reuse path that survives a teardown. bifrost/built-images lives
+// on the preview's namespace, and Down deletes the namespace, so the record of
+// what was built dies with it: an up -> down -> up at the same commit used to
+// rebuild everything from scratch even though the images were still sitting in
+// Artifact Registry under exactly the tags it was about to recreate. Cloud
+// Build's build history outlives the namespace and can be asked instead.
+//
+// Cloud Build rather than Artifact Registry deliberately, even though
+// Artifact Registry answers the more direct question. bifrost already holds a
+// Cloud Build client and the service account already has
+// cloudbuild.builds.viewer, so this needs no new dependency, no IAM change and
+// no `pulumi up`; the registry would need all three. What that trades away is
+// exactness: a successful build is a PROXY for a live image, and the two
+// diverge only if the image is deleted after being built. That is the same
+// exposure the annotation path above already carries and already documents —
+// there is no Artifact Registry cleanup policy today, and if one is ever added
+// the failure is a clean ImagePullBackOff caught by the readiness wait, from
+// either path.
+//
+// Every failure mode returns false, which means "build it" — the safe
+// direction, and the behavior this feature is an optimization over. A lookup
+// error is logged and swallowed rather than failing the preview: bifrost could
+// not tell, and could-not-tell is not a reason to refuse to build. A commit
+// that resolveMembers left empty, or a service with no configured preview
+// trigger, likewise just returns false; the missing trigger is reported
+// properly by buildMembers' own start loop, which is the one place that error
+// belongs — reporting it here would fail a run on a lookup, which is exactly
+// what this must never do.
+func (o *Orchestrator) findPriorBuild(ctx context.Context, svc, commit string) (builtImage, bool) {
+	triggerID := o.TriggerIDs[svc+"-preview-build"]
+	if triggerID == "" || commit == "" {
+		return builtImage{}, false
+	}
+	shortSHA, found, err := o.Builds.FindSuccessfulBuild(ctx, triggerID, commit)
+	if err != nil {
+		slog.Warn("preview: looking up an existing build failed; building instead",
+			"service", svc, "commit", commit, "err", err)
+		return builtImage{}, false
+	}
+	if !found {
+		return builtImage{}, false
+	}
+	// Logged because the step text deliberately doesn't distinguish this from
+	// an annotation-backed reuse (see buildStepText): "reusing" is what is
+	// happening either way, and the difference is bifrost's bookkeeping rather
+	// than a fact about the preview. An operator who tore a preview down and
+	// is surprised that the recreate built nothing gets their answer here.
+	slog.Info("preview: reusing an image from an earlier build of this commit",
+		"service", svc, "commit", commit, "shortSHA", shortSHA)
+	return builtImage{Commit: commit, ShortSHA: shortSHA}, true
+}
+
 // buildStepText narrates the build stage for an operator watching `ib preview
 // up` (or the Previews tab) sit still for minutes. The old wording numbered a
 // sequence — "building footstrike-api (1/2)", rewritten per member — which is
@@ -904,6 +987,19 @@ func (o *Orchestrator) buildMembers(
 // is most likely to be confused by ("why didn't my change show up?"), and it
 // is what a failure in a LATER stage will leave behind as its retained
 // diagnostic.
+//
+// A member reused because Cloud Build had already built its commit
+// (findPriorBuild) is narrated with the SAME "reusing" wording as one reused
+// off bifrost/built-images, deliberately. The step answers "what is happening
+// right now", and the answer is identical in both cases: no build is running,
+// and an existing `preview-<sha>` image is being deployed. Where they differ
+// is only in which record bifrost consulted — its own annotation, or Cloud
+// Build's history — which is bookkeeping, not a fact about the preview, and a
+// second vocabulary for the same outcome would make the same result read two
+// different ways depending on state the operator cannot see. The one place
+// that difference is genuinely interesting — a teardown-then-recreate that
+// surprisingly builds nothing — is served by findPriorBuild's log line, which
+// names the service and commit and does not have to fit in a table cell.
 func buildStepText(members, needed []string) string {
 	if len(needed) == 0 {
 		return "reusing images for " + strings.Join(members, ", ")

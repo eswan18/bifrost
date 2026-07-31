@@ -1147,6 +1147,10 @@ func (f *fakeBuilds) GetBuild(_ context.Context, _ string) (gcb.BuildStatus, err
 	return gcb.BuildStatus{}, nil
 }
 
+func (f *fakeBuilds) FindSuccessfulBuild(_ context.Context, _, _ string) (string, bool, error) {
+	return "", false, nil
+}
+
 func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var got map[string]any
