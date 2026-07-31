@@ -29,6 +29,21 @@ func ImageBase(image string) string {
 	return image
 }
 
+// ReplaceTag returns image with its tag replaced by tag — the step that turns
+// the tag a promote decided on into the image reference written to the ArgoCD
+// Application.
+//
+// It lives here, next to ImageBase, because the repository half of that
+// reference is a decision and not a formatting detail: it comes from the
+// artifact actually running, never from the app's name. ib.py builds the same
+// string as REGISTRY + "/" + app + ":" + tag and so cannot express an image
+// whose repository is named anything else — see ImageBase and
+// differential_test.go's TestImageBaseMatchesOracle. Both the server and
+// cmd/bif call this, so neither can drift back toward the app name.
+func ReplaceTag(image, tag string) string {
+	return ImageBase(image) + ":" + tag
+}
+
 func ExtractSHA(tag string) string {
 	if m := suffixedSHA.FindStringSubmatch(tag); m != nil {
 		return m[1]

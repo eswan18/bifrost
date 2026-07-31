@@ -22,8 +22,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // usage mirrors ib.py's module docstring, which is what it prints when run
@@ -35,9 +38,10 @@ Usage:
     bif status <app>         # Show current images for staging and prod
     bif status -q            # List out-of-sync services (* = mid-deploy)
     bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
+    bif promote <app>        # Compare staging vs prod, offer to promote
+    bif promote <app> -y     # Promote without confirmation
 
-Not ported yet — run these with the Python CLI:
-    ib promote <app> [-y/--yes]
+Not ported yet — run this with the Python CLI:
     ib preview <list|up|down> ...`
 
 // argoNamespace is where the ArgoCD Applications live. `bif status` never
@@ -45,13 +49,14 @@ Not ported yet — run these with the Python CLI:
 const argoNamespace = "argocd"
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr, dialCluster))
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster))
 }
 
-// run is main with the process edges passed in — argv, the output streams, the
-// exit status as a return value, and the cluster connection as a function — so
-// tests can drive whole commands end to end.
-func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error)) int {
+// run is main with the process edges passed in — argv, the input and output
+// streams, the exit status as a return value, and the cluster connection as a
+// function — so tests can drive whole commands end to end, including
+// promote's confirmation prompt.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error)) int {
 	if len(args) == 0 {
 		outln(stdout, usage)
 		return 1
@@ -59,8 +64,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect f
 
 	switch cmd := args[0]; cmd {
 	case "status":
-		return statusCmd(ctx, args[1:], stdout, stderr, connect)
-	case "promote", "preview":
+		// status gets the read-only view of the connection, not the one
+		// promote uses. See readOnly.
+		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect))
+	case "promote":
+		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
+	case "preview":
 		// Named rather than folded into the unknown-command case: the
 		// operator typed a real bif command, and "unknown command" would send
 		// them looking for a typo instead of at the other binary.
@@ -73,16 +82,50 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, connect f
 	}
 }
 
+// readOnly narrows a cluster connection down to the pod reads `bif status`
+// makes. The wider seam exists for exactly one caller — promote, which patches
+// an ArgoCD Application — and this keeps it out of reach of the other: nothing
+// on the status path can grow a write without changing this line first.
+func readOnly(connect func() (promoter, error)) func() (podLister, error) {
+	return func() (podLister, error) { return connect() }
+}
+
 // dialCluster opens a direct connection to the Kubernetes API — in-cluster
 // config when there is one, otherwise ~/.kube/config. Note what is absent: no
 // bifrost URL, no bearer token, no HTTP client for the service this tool
 // manages.
-func dialCluster() (podLister, error) {
+func dialCluster() (promoter, error) {
 	c, err := kube.New(argoNamespace)
 	if err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// loadApps returns the fleet from the embedded registry, reporting a load
+// failure on stderr. go:embed means this needs no network, which is what lets
+// it retire ib.py's hand-maintained SERVICES without costing the
+// works-when-bifrost-is-down property.
+func loadApps(stderr io.Writer) ([]string, bool) {
+	reg, err := registry.Load()
+	if err != nil {
+		outf(stderr, "Error: loading the service registry: %v\n", err)
+		return nil, false
+	}
+	return reg.Names(), true
+}
+
+// validateApp mirrors ib.py's validate_app, including printing to stdout. Both
+// status and promote call it before connecting, so a typo'd service name fails
+// the same way whether or not the cluster is reachable — and, for promote,
+// before anything could possibly be written.
+func validateApp(stdout io.Writer, apps []string, app string) bool {
+	if slices.Contains(apps, app) {
+		return true
+	}
+	outf(stdout, "Unknown service: %s\n", app)
+	outf(stdout, "Known services: %s\n", strings.Join(apps, ", "))
+	return false
 }
 
 // outf and outln write to a command's output stream and deliberately discard
