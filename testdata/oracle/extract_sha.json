@@ -1,0 +1,94 @@
+[
+  {
+    "tag": "abc1234",
+    "sha": "abc1234"
+  },
+  {
+    "tag": "1234567",
+    "sha": "1234567"
+  },
+  {
+    "tag": "0000000",
+    "sha": "0000000"
+  },
+  {
+    "tag": "deadbeefdeadbeefdeadbeef",
+    "sha": "deadbeefdeadbeefdeadbeef"
+  },
+  {
+    "tag": "abc1234-staging",
+    "sha": "abc1234"
+  },
+  {
+    "tag": "abc1234-prod",
+    "sha": "abc1234"
+  },
+  {
+    "tag": "abc-staging",
+    "sha": "abc"
+  },
+  {
+    "tag": "a-prod",
+    "sha": "a"
+  },
+  {
+    "tag": "abc123",
+    "sha": null
+  },
+  {
+    "tag": "latest",
+    "sha": null
+  },
+  {
+    "tag": "prod",
+    "sha": null
+  },
+  {
+    "tag": "staging",
+    "sha": null
+  },
+  {
+    "tag": "",
+    "sha": null
+  },
+  {
+    "tag": "-staging",
+    "sha": null
+  },
+  {
+    "tag": "-prod",
+    "sha": null
+  },
+  {
+    "tag": "abc1234-preview",
+    "sha": null
+  },
+  {
+    "tag": "abc1234-staging-prod",
+    "sha": null
+  },
+  {
+    "tag": "abc1234staging",
+    "sha": null
+  },
+  {
+    "tag": "ABC1234",
+    "sha": null
+  },
+  {
+    "tag": "g123456",
+    "sha": null
+  },
+  {
+    "tag": "abc1234-",
+    "sha": null
+  },
+  {
+    "tag": "abc1234\n",
+    "sha": "abc1234"
+  },
+  {
+    "tag": "abc1234-staging\n",
+    "sha": "abc1234"
+  }
+]

@@ -1,0 +1,154 @@
+[
+  {
+    "branch": "feat/foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "feat-foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "feat_foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "feat foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "FEAT/FOO",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "Feat/Foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "MAIN",
+    "tag": "main"
+  },
+  {
+    "branch": "-leading",
+    "tag": "leading"
+  },
+  {
+    "branch": "trailing-",
+    "tag": "trailing"
+  },
+  {
+    "branch": "--both--",
+    "tag": "both"
+  },
+  {
+    "branch": "/slash/",
+    "tag": "slash"
+  },
+  {
+    "branch": "___",
+    "tag": ""
+  },
+  {
+    "branch": "---",
+    "tag": ""
+  },
+  {
+    "branch": " ",
+    "tag": ""
+  },
+  {
+    "branch": "",
+    "tag": ""
+  },
+  {
+    "branch": "feat//foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "feat/-/foo",
+    "tag": "feat-foo"
+  },
+  {
+    "branch": "  spaces  ",
+    "tag": "spaces"
+  },
+  {
+    "branch": "feature/add-user-profile-avatars-v1",
+    "tag": "feature-add-user-profile-avata"
+  },
+  {
+    "branch": "feature/add-user-profile-avatars-v2",
+    "tag": "feature-add-user-profile-avata"
+  },
+  {
+    "branch": "abcdefghijklmnopqrstuvwxyzabcd",
+    "tag": "abcdefghijklmnopqrstuvwxyzabcd"
+  },
+  {
+    "branch": "abcdefghijklmnopqrstuvwxyzabcde",
+    "tag": "abcdefghijklmnopqrstuvwxyzabcd"
+  },
+  {
+    "branch": "abcdefghijklmnopqrstuvwxyzabc/d",
+    "tag": "abcdefghijklmnopqrstuvwxyzabc"
+  },
+  {
+    "branch": "abcdefghijklmnopqrstuvwxyzab-cd-ef",
+    "tag": "abcdefghijklmnopqrstuvwxyzab-c"
+  },
+  {
+    "branch": "release/v1.2.3",
+    "tag": "release-v123"
+  },
+  {
+    "branch": "feat/#123-fix",
+    "tag": "feat-123-fix"
+  },
+  {
+    "branch": "feat/foo@bar",
+    "tag": "feat-foobar"
+  },
+  {
+    "branch": "feat\tfoo",
+    "tag": "featfoo"
+  },
+  {
+    "branch": "feat.foo",
+    "tag": "featfoo"
+  },
+  {
+    "branch": "feat/café",
+    "tag": "feat-caf"
+  },
+  {
+    "branch": "fix/naïve-bug",
+    "tag": "fix-nave-bug"
+  },
+  {
+    "branch": "feat/日本語",
+    "tag": "feat"
+  },
+  {
+    "branch": "İstanbul",
+    "tag": "istanbul"
+  },
+  {
+    "branch": "STRASSE/ẞ",
+    "tag": "strasse"
+  },
+  {
+    "branch": "ﬁx/ligature",
+    "tag": "x-ligature"
+  },
+  {
+    "branch": "feat/🚀-rocket",
+    "tag": "feat-rocket"
+  },
+  {
+    "branch": "Ⅻ/roman",
+    "tag": "roman"
+  },
+  {
+    "branch": "ααααααααα/abcdefghijklmnopqrstuvwxyzabcdefg",
+    "tag": "abcdefghijklmnopqrstuvwxyzabcd"
+  }
+]

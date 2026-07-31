@@ -46,11 +46,19 @@ Build the safety net before porting anything. This is what makes the port TDD ra
 **Interfaces:**
 - Produces: golden files that later tasks assert against.
 
-- [ ] **Step 1: Capture the oracle.** Write a script that drives `infra/ib.py`'s pure functions over a matrix of inputs and writes the results as fixtures. Cover at minimum `new_prod_tag_for` across: staging and prod tags of the same shape, `{sha}` vs `{sha}-{env}` taggers (footstrike-dashboard uses the suffixed form, everything else doesn't), a prod tag with no parseable SHA, and equal staging/prod. Also capture `tag_for_branch` over the vectors that matter — character folding (`feat/foo`, `feat-foo`, `feat_foo`), truncation at 30 characters, leading and trailing dashes, uppercase, unicode, and empty.
+- [x] **Step 1: Capture the oracle.** Write a script that drives `infra/ib.py`'s pure functions over a matrix of inputs and writes the results as fixtures. Cover at minimum `new_prod_tag_for` across: staging and prod tags of the same shape, `{sha}` vs `{sha}-{env}` taggers (footstrike-dashboard uses the suffixed form, everything else doesn't), a prod tag with no parseable SHA, and equal staging/prod. Also capture `tag_for_branch` over the vectors that matter — character folding (`feat/foo`, `feat-foo`, `feat_foo`), truncation at 30 characters, leading and trailing dashes, uppercase, unicode, and empty.
 
-- [ ] **Step 2: Assert Go matches.** Table tests reading those fixtures and calling `promote.NewProdTag`, `promote.ExtractSHA`, `promote.StatusOf`, and `preview.TagForBranch`. **Expect failures here** — where Go and Python disagree, that is the port's first real finding. Do not "fix" either side without deciding which is correct and saying so.
+- [x] **Step 2: Assert Go matches.** Table tests reading those fixtures and calling `promote.NewProdTag`, `promote.ExtractSHA`, `promote.StatusOf`, and `preview.TagForBranch`. **Expect failures here** — where Go and Python disagree, that is the port's first real finding. Do not "fix" either side without deciding which is correct and saying so.
 
-- [ ] **Step 3: Commit** the harness and fixtures, with any disagreements recorded in the report rather than papered over.
+- [x] **Step 3: Commit** the harness and fixtures, with any disagreements recorded in the report rather than papered over.
+
+**Findings (read before Task 2 and Task 3).** `new_prod_tag_for` agrees with `promote.NewProdTag` on all 19 vectors, including both tagging schemes, missing/empty prod tags, and the June-2026 legacy-suffixed-prod case — the stop-the-project risk did not materialise. `tag_for_branch` agrees on all 38 vectors, so `ib.py`'s "mirror" claim is now true rather than assumed. Three disagreements, all pinned with analysis in `internal/promote/differential_test.go`:
+
+1. **`ib status` on an unpinned prod tag** (`bifrost#30`) — `ib.py` reports indeterminate, `promote.StatusOf` reports out-of-sync. Go is right (`ib.py`'s own `promote()` promotes from this state), but **Task 2 must state the change**: `ib status -q` will print the app and exit 1 where the Python exited 0.
+2. **`promote.Status` drops the tags `ib.py` still displays** when one side is mid-deploy or has no pods. Task 2 needs the tags from somewhere else, or `Status` has to widen.
+3. **The kustomize override key** — `ib.py` builds it from `REGISTRY + app name`, `promote.ImageBase` parses it from the running image. Identical for the fleet as named today; Go is right and Task 3 must not port `ib.py`'s version.
+
+Also for Task 3: the patch bodies are semantically identical but not byte-identical (`json.dumps` emits `": "` separators, `encoding/json` does not).
 
 ---
 

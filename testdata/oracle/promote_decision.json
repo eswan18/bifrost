@@ -1,0 +1,205 @@
+[
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "promoted": true,
+    "kubectlArgv": [
+      "kubectl",
+      "patch",
+      "application",
+      "bifrost-prod",
+      "-n",
+      "argocd",
+      "--type=merge",
+      "-p",
+      "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234\"]}}}}"
+    ],
+    "patch": "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234\"]}}}}",
+    "kustomizeImage": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+    "return": null,
+    "stdout": "\nbifrost promotion check:\n--------------------------------------------------\n  staging: abc1234\n  prod:    def5678\n\n→ Promote prod to: abc1234\n\nRunning: kubectl patch application bifrost-prod -n argocd\n\n✓ Promoted bifrost prod to abc1234\n  (ArgoCD will sync automatically)\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "promoted": false,
+    "kubectlArgv": null,
+    "patch": null,
+    "kustomizeImage": null,
+    "return": null,
+    "stdout": "\nbifrost promotion check:\n--------------------------------------------------\n  staging: abc1234\n  prod:    abc1234\n\n✓ Already in sync (both on abc1234)\n"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:def5678-prod"
+    ],
+    "promoted": true,
+    "kubectlArgv": [
+      "kubectl",
+      "patch",
+      "application",
+      "footstrike-dashboard-prod",
+      "-n",
+      "argocd",
+      "--type=merge",
+      "-p",
+      "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod\"]}}}}"
+    ],
+    "patch": "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod\"]}}}}",
+    "kustomizeImage": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod",
+    "return": null,
+    "stdout": "\nfootstrike-dashboard promotion check:\n--------------------------------------------------\n  staging: abc1234-staging\n  prod:    def5678-prod\n\n→ Promote prod to: abc1234-prod\n\nRunning: kubectl patch application footstrike-dashboard-prod -n argocd\n\n✓ Promoted footstrike-dashboard prod to abc1234-prod\n  (ArgoCD will sync automatically)\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "promoted": true,
+    "kubectlArgv": [
+      "kubectl",
+      "patch",
+      "application",
+      "bifrost-prod",
+      "-n",
+      "argocd",
+      "--type=merge",
+      "-p",
+      "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234\"]}}}}"
+    ],
+    "patch": "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234\"]}}}}",
+    "kustomizeImage": "us-central1-docker.pkg.dev/ethans-services/containers/bifrost=us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+    "return": null,
+    "stdout": "\nbifrost promotion check:\n--------------------------------------------------\n  staging: abc1234\n  prod:    latest\n\n→ Promote prod to: abc1234\n\nRunning: kubectl patch application bifrost-prod -n argocd\n\n✓ Promoted bifrost prod to abc1234\n  (ArgoCD will sync automatically)\n"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:prod"
+    ],
+    "promoted": true,
+    "kubectlArgv": [
+      "kubectl",
+      "patch",
+      "application",
+      "footstrike-dashboard-prod",
+      "-n",
+      "argocd",
+      "--type=merge",
+      "-p",
+      "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod\"]}}}}"
+    ],
+    "patch": "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod\"]}}}}",
+    "kustomizeImage": "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard=us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod",
+    "return": null,
+    "stdout": "\nfootstrike-dashboard promotion check:\n--------------------------------------------------\n  staging: abc1234-staging\n  prod:    prod\n\n→ Promote prod to: abc1234-prod\n\nRunning: kubectl patch application footstrike-dashboard-prod -n argocd\n\n✓ Promoted footstrike-dashboard prod to abc1234-prod\n  (ArgoCD will sync automatically)\n"
+  },
+  {
+    "app": "forecasting",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/forecasting:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/forecasting:def5678-prod"
+    ],
+    "promoted": true,
+    "kubectlArgv": [
+      "kubectl",
+      "patch",
+      "application",
+      "forecasting-prod",
+      "-n",
+      "argocd",
+      "--type=merge",
+      "-p",
+      "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/forecasting=us-central1-docker.pkg.dev/ethans-services/containers/forecasting:abc1234\"]}}}}"
+    ],
+    "patch": "{\"spec\": {\"source\": {\"kustomize\": {\"images\": [\"us-central1-docker.pkg.dev/ethans-services/containers/forecasting=us-central1-docker.pkg.dev/ethans-services/containers/forecasting:abc1234\"]}}}}",
+    "kustomizeImage": "us-central1-docker.pkg.dev/ethans-services/containers/forecasting=us-central1-docker.pkg.dev/ethans-services/containers/forecasting:abc1234",
+    "return": null,
+    "stdout": "\nforecasting promotion check:\n--------------------------------------------------\n  staging: abc1234\n  prod:    def5678-prod\n\n→ Promote prod to: abc1234\n\nRunning: kubectl patch application forecasting-prod -n argocd\n\n✓ Promoted forecasting prod to abc1234\n  (ArgoCD will sync automatically)\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "promoted": false,
+    "kubectlArgv": null,
+    "patch": null,
+    "kustomizeImage": null,
+    "return": null,
+    "stdout": "\nbifrost promotion check:\n--------------------------------------------------\n  staging: latest\n  prod:    abc1234\n\nWarning: Could not parse staging SHA from 'latest'\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "promoted": false,
+    "kubectlArgv": null,
+    "patch": null,
+    "kustomizeImage": null,
+    "return": {
+      "systemExit": 1
+    },
+    "stdout": "Error: Staging has an image mismatch (deployment in progress?)\n  Images found:\n    - abc1234\n    - def5678\n\nWait for the deployment to complete before promoting.\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "promoted": false,
+    "kubectlArgv": null,
+    "patch": null,
+    "kustomizeImage": null,
+    "return": {
+      "systemExit": 1
+    },
+    "stdout": "Error: Could not find staging deployment in bifrost-staging\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [],
+    "promoted": false,
+    "kubectlArgv": null,
+    "patch": null,
+    "kustomizeImage": null,
+    "return": {
+      "systemExit": 1
+    },
+    "stdout": "Error: Could not find prod deployment in bifrost-prod\n"
+  }
+]

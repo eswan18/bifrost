@@ -1,0 +1,19 @@
+{
+  "note": "Captured from the real infra/ib.py by scripts/capture-oracle.sh. ib.py is the oracle: where Go and Python disagree, Python is what production does today. Regenerate, do not hand-edit.",
+  "source": {
+    "path": "/Users/eswan18/Develop/ibormeith/infra/ib.py",
+    "repoHeadSha": "9db57a33b9ad6989b28a6f31e6c380302dab2160",
+    "fileLastCommitSha": "9db57a33b9ad6989b28a6f31e6c380302dab2160",
+    "fileUncommittedChanges": false
+  },
+  "python": "3.14.5",
+  "counts": {
+    "extract_tag.json": 10,
+    "extract_sha.json": 23,
+    "new_prod_tag_for.json": 19,
+    "tag_for_branch.json": 38,
+    "status.json": 15,
+    "promote_decision.json": 10,
+    "image_base.json": 4
+  }
+}

@@ -1,0 +1,253 @@
+[
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "state": "in_sync",
+    "stagingTag": "abc1234",
+    "prodTag": "abc1234",
+    "newProdTag": null,
+    "quietReturn": true,
+    "quietStdout": "",
+    "verboseReturn": true,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:    abc1234\n\n✓ In sync\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "state": "out_of_sync",
+    "stagingTag": "abc1234",
+    "prodTag": "def5678",
+    "newProdTag": "abc1234",
+    "quietReturn": false,
+    "quietStdout": "bifrost\n",
+    "verboseReturn": false,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:    def5678\n\n✗ Out of sync\n  To promote: ib promote bifrost\n  This will deploy abc1234 to prod\n"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-prod"
+    ],
+    "state": "in_sync",
+    "stagingTag": "abc1234-staging",
+    "prodTag": "abc1234-prod",
+    "newProdTag": null,
+    "quietReturn": true,
+    "quietStdout": "",
+    "verboseReturn": true,
+    "verboseStdout": "\nfootstrike-dashboard deployment status:\n--------------------------------------------------\n  staging: abc1234-staging\n  prod:    abc1234-prod\n\n✓ In sync\n"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:def5678-prod"
+    ],
+    "state": "out_of_sync",
+    "stagingTag": "abc1234-staging",
+    "prodTag": "def5678-prod",
+    "newProdTag": "abc1234-prod",
+    "quietReturn": false,
+    "quietStdout": "footstrike-dashboard\n",
+    "verboseReturn": false,
+    "verboseStdout": "\nfootstrike-dashboard deployment status:\n--------------------------------------------------\n  staging: abc1234-staging\n  prod:    def5678-prod\n\n✗ Out of sync\n  To promote: ib promote footstrike-dashboard\n  This will deploy abc1234-prod to prod\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "state": "unknown",
+    "stagingTag": "abc1234",
+    "prodTag": "latest",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:    latest\n\n"
+  },
+  {
+    "app": "footstrike-dashboard",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:prod"
+    ],
+    "state": "unknown",
+    "stagingTag": "abc1234-staging",
+    "prodTag": "prod",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nfootstrike-dashboard deployment status:\n--------------------------------------------------\n  staging: abc1234-staging\n  prod:    prod\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "state": "unknown",
+    "stagingTag": "latest",
+    "prodTag": "abc1234",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: latest\n  prod:    abc1234\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest"
+    ],
+    "state": "unknown",
+    "stagingTag": "latest",
+    "prodTag": "latest",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: latest\n  prod:    latest\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "state": "mid_deploy",
+    "stagingTag": null,
+    "prodTag": "abc1234",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "bifrost*\n",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging:\n    - abc1234\n    - def5678\n  prod:    abc1234\n\n⚠ Staging has an image mismatch (deployment in progress?)\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "state": "mid_deploy",
+    "stagingTag": "abc1234",
+    "prodTag": null,
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "bifrost*\n",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:\n    - abc1234\n    - def5678\n\n⚠ Prod has an image mismatch (deployment in progress?)\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:def5678"
+    ],
+    "state": "out_of_sync",
+    "stagingTag": "abc1234",
+    "prodTag": "def5678",
+    "newProdTag": "abc1234",
+    "quietReturn": false,
+    "quietStdout": "bifrost\n",
+    "verboseReturn": false,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:    def5678\n\n✗ Out of sync\n  To promote: ib promote bifrost\n  This will deploy abc1234 to prod\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "state": "unknown",
+    "stagingTag": null,
+    "prodTag": "abc1234",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: (no pods found)\n  prod:    abc1234\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "prodImages": [],
+    "state": "unknown",
+    "stagingTag": "abc1234",
+    "prodTag": null,
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: abc1234\n  prod:    (no pods found)\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [],
+    "prodImages": [],
+    "state": "unknown",
+    "stagingTag": null,
+    "prodTag": null,
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging: (no pods found)\n  prod:    (no pods found)\n\n"
+  },
+  {
+    "app": "bifrost",
+    "stagingImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234",
+      "docker.io/library/nginx:1.27"
+    ],
+    "prodImages": [
+      "us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234"
+    ],
+    "state": "mid_deploy",
+    "stagingTag": null,
+    "prodTag": "abc1234",
+    "newProdTag": null,
+    "quietReturn": null,
+    "quietStdout": "bifrost*\n",
+    "verboseReturn": null,
+    "verboseStdout": "\nbifrost deployment status:\n--------------------------------------------------\n  staging:\n    - 1.27\n    - abc1234\n  prod:    abc1234\n\n⚠ Staging has an image mismatch (deployment in progress?)\n"
+  }
+]
