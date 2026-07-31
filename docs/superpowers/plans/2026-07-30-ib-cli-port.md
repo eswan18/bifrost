@@ -4,7 +4,7 @@
 
 **Goal:** Move the `ib` CLI from `infra/ib.py` into the bifrost repo as a second Go binary, so the logic it shares with the server has exactly one implementation.
 
-**Architecture:** `cmd/ib` alongside `cmd/bifrost` in the same module. `ib status` and `ib promote` import `internal/promote`, `internal/registry`, and `internal/kube` **directly** and never contact the bifrost server. `ib preview` remains an HTTP client of bifrost's API, as today. The Python `ib.py` is the reference implementation and stays in place until the final cutover.
+**Architecture:** `cmd/bif` alongside `cmd/bifrost` in the same module. `bif status` and `bif promote` import `internal/promote`, `internal/registry`, and `internal/kube` **directly** and never contact the bifrost server. `bif preview` remains an HTTP client of bifrost's API, as today. The Python `ib.py` is the reference implementation and stays in place until the final cutover.
 
 **Tech Stack:** Go 1.26, existing bifrost internal packages, `client-go` (already a dependency), `gcloud` shelled out for the preview API token exactly as today.
 
@@ -18,13 +18,13 @@ Secondary wins: the `TagForBranch` mirror added to `ib.py` disappears, the hand-
 
 **`ib promote bifrost` has to work when bifrost is down.** It is the recovery path for the server itself, and that is not hypothetical — bifrost went down on a spot-node preemption during the preview-environments work and this is how it would have been recovered.
 
-So `status` and `promote` must reach the cluster directly and must never require the bifrost server, its API, or its bearer token. `cmd/ib` is a local binary that calls packages; it is not a client of the service it manages. Any task that blurs this is wrong even if its tests pass.
+So `status` and `promote` must reach the cluster directly and must never require the bifrost server, its API, or its bearer token. `cmd/bif` is a local binary that calls packages; it is not a client of the service it manages. Any task that blurs this is wrong even if its tests pass.
 
 Note the registry is `go:embed`ed, so reading service names from `internal/registry` **preserves** this property — the list is compiled in, not fetched.
 
 ## Global Constraints
 
-- `cmd/ib` must not import anything that opens an HTTP connection to bifrost for `status` or `promote`.
+- `cmd/bif` must not import anything that opens an HTTP connection to bifrost for `status` or `promote`.
 - **`ib.py` is the oracle.** Behavior is defined by what it does today, not by what seems reasonable. Where the port deliberately differs, that is a decision to state in the report and the docs, not a silent improvement.
 - **Exit codes and quiet-mode output are contracts.** `ib status -q` exits 0/1 and is scriptable. Preserve them exactly.
 - The preview API token comes from `gcloud secrets versions access latest --secret=…`. Keep shelling out — it avoids a new dependency and new IAM.
@@ -62,10 +62,10 @@ Also for Task 3: the patch bodies are semantically identical but not byte-identi
 
 ---
 
-### Task 2: `cmd/ib` skeleton, and `ib status`
+### Task 2: `cmd/bif` skeleton, and `bif status`
 
 **Files:**
-- Create: `cmd/ib/main.go`, `cmd/ib/status.go`, `cmd/ib/status_test.go`
+- Create: `cmd/bif/main.go`, `cmd/bif/status.go`, `cmd/bif/status_test.go`
 - Modify: `Makefile` (an install target)
 
 **Interfaces:**
@@ -89,10 +89,10 @@ Also for Task 3: the patch bodies are semantically identical but not byte-identi
 The task that justifies the project. **Read Task 1's findings before starting.**
 
 **Files:**
-- Create: `cmd/ib/promote.go`, `cmd/ib/promote_test.go`
+- Create: `cmd/bif/promote.go`, `cmd/bif/promote_test.go`
 - Modify: `internal/kube` if a patch helper is needed
 
-- [ ] **Step 1:** Port the decision path using `internal/promote` directly. No tag math may be reimplemented in `cmd/ib` — if something is missing, add it to `internal/promote` where the server shares it.
+- [ ] **Step 1:** Port the decision path using `internal/promote` directly. No tag math may be reimplemented in `cmd/bif` — if something is missing, add it to `internal/promote` where the server shares it.
 
 - [ ] **Step 2:** Port the write. `ib.py` shells out to `kubectl patch application <app>-prod -n argocd --type=merge -p '<json>'` with a kustomize images override. In Go this is a dynamic-client merge patch on the ArgoCD Application CR. **The resulting patch must be byte-equivalent to the Python's** — assert that against a captured fixture, because this is the step that changes what runs in production.
 
@@ -107,7 +107,7 @@ The task that justifies the project. **Read Task 1's findings before starting.**
 ### Task 4: `ib preview` — the HTTP client
 
 **Files:**
-- Create: `cmd/ib/preview.go`, `cmd/ib/preview_test.go`
+- Create: `cmd/bif/preview.go`, `cmd/bif/preview_test.go`
 - Reuse: the server's own record types rather than redeclaring them
 
 - [ ] **Step 1:** `preview list`, `up`, `down` with every flag the docstring documents: `--ttl`, `--auto-update`, `--no-wait`, `-y/--yes`. Argument parsing must reject unrecognized leftover tokens — `ib.py` learned this the hard way when `--ttl=8h` was silently accepted and ignored, producing a preview that never expired.
@@ -118,7 +118,7 @@ The task that justifies the project. **Read Task 1's findings before starting.**
 
 - [ ] **Step 4:** Port the progress rendering — 3-second polling, a redrawn spinner line on a TTY, plain one-line-per-step when piped. Test both, driving the TTY decision through an injected value; a Go test's stdout is not a terminal, so the branch cannot be exercised by accident.
 
-- [ ] **Step 5:** Delete the `TagForBranch` mirror. `cmd/ib` calls `preview.TagForBranch` directly. This is the moment that duplication dies.
+- [ ] **Step 5:** Delete the `TagForBranch` mirror. `cmd/bif` calls `preview.TagForBranch` directly. This is the moment that duplication dies.
 
 - [ ] **Step 6: Commit.**
 

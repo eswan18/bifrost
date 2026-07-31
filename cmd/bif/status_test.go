@@ -115,7 +115,7 @@ type divergence struct {
 }
 
 // verboseDivergences / quietDivergences: DIVERGENCE #1 from Task 1, the only
-// place `ib status` deliberately disagrees with ib.py.
+// place `bif status` deliberately disagrees with ib.py.
 //
 // ib.py's status() calls an unparseable PROD tag indeterminate, because it
 // requires both SHAs before it will compare them. promote.StatusOf requires
@@ -130,7 +130,7 @@ type divergence struct {
 // promote with no way out (bifrost#30).
 //
 // The visible cost, which is why it is spelled out here rather than left to
-// be discovered: `ib status -q` now prints the app and exits 1 where ib.py
+// be discovered: `bif status -q` now prints the app and exits 1 where ib.py
 // printed nothing and exited 0. That is a scriptable contract changing.
 var verboseDivergences = map[string]divergence{
 	"bifrost staging=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234] prod=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest]": {
@@ -169,7 +169,7 @@ var quietDivergences = map[string]divergence{
 }
 
 // TestStatusRenderingMatchesOracle is the golden comparison: for every cluster
-// state ib.py was captured against, `ib status` must print exactly what ib.py
+// state ib.py was captured against, `bif status` must print exactly what ib.py
 // printed and return the same verdict — byte for byte, including the table
 // alignment, the blank lines and the ⚠/✓/✗ glyphs.
 func TestStatusRenderingMatchesOracle(t *testing.T) {
@@ -240,7 +240,7 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 
 // TestMidDeployKeepsTheOtherEnvironmentsTag pins the resolution of Task 1's
 // DIVERGENCE #2. promote.Status zeroes StagingTag/ProdTag whenever either side
-// is mid-deploy or empty, so a `cmd/ib` that rendered from Status would print
+// is mid-deploy or empty, so a `cmd/bif` that rendered from Status would print
 // a table with a hole in it. It renders from the image lists instead, and this
 // is the assertion that says so: prod's tag survives a staging rollout, and
 // staging's survives a prod one.
@@ -295,7 +295,7 @@ func TestMidDeployKeepsTheOtherEnvironmentsTag(t *testing.T) {
 
 // TestUnparseableProdTagIsOutOfSync is DIVERGENCE #1 stated as a contract
 // rather than as a fixture exception: an unpinned prod is promotable, so
-// `ib status -q` names it and exits 1. ib.py exited 0 here. See
+// `bif status -q` names it and exits 1. ib.py exited 0 here. See
 // verboseDivergences for why Go is the correct side.
 func TestUnparseableProdTagIsOutOfSync(t *testing.T) {
 	for _, tc := range []struct {

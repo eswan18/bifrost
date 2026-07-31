@@ -26,7 +26,7 @@ func TestDispatch(t *testing.T) {
 			name:     "no arguments prints usage",
 			args:     nil,
 			wantCode: 1,
-			wantOut:  []string{"ib status <app> -q", "Deployment status and promotion helper"},
+			wantOut:  []string{"bif status <app> -q", "Deployment status and promotion helper"},
 		},
 		{
 			name:     "unknown command",
@@ -38,13 +38,13 @@ func TestDispatch(t *testing.T) {
 			name:     "promote is reserved, not unknown",
 			args:     []string{"promote", "bifrost"},
 			wantCode: 1,
-			wantOut:  []string{"ib promote is not ported to Go yet"},
+			wantOut:  []string{"bif promote is not ported to Go yet"},
 		},
 		{
 			name:     "preview is reserved, not unknown",
 			args:     []string{"preview", "list"},
 			wantCode: 1,
-			wantOut:  []string{"ib preview is not ported to Go yet"},
+			wantOut:  []string{"bif preview is not ported to Go yet"},
 		},
 	}
 	for _, tc := range tests {
@@ -95,12 +95,12 @@ func TestTakeFlag(t *testing.T) {
 }
 
 // TestNoBifrostServerDependency is the plan's non-negotiable property,
-// enforced rather than asserted in prose: `ib promote bifrost` is how bifrost
-// is recovered when bifrost is down, so cmd/ib must not import anything that
+// enforced rather than asserted in prose: `bif promote bifrost` is how bifrost
+// is recovered when bifrost is down, so cmd/bif must not import anything that
 // would make it a client of the service it manages.
 //
 // It checks imports rather than behaviour because that is where the property
-// would actually be lost — a future `ib preview` reaching for internal/web's
+// would actually be lost — a future `bif preview` reaching for internal/web's
 // record types, or someone "reusing" bifrost's API client for status. Note
 // internal/web is banned even though it holds no HTTP client of bifrost's own:
 // it is the server, and importing it here would be the first step toward
@@ -108,14 +108,14 @@ func TestTakeFlag(t *testing.T) {
 func TestNoBifrostServerDependency(t *testing.T) {
 	banned := map[string]string{
 		"net/http": "status and promote read the cluster directly; no HTTP client of bifrost may appear on this path",
-		"github.com/eswan18/bifrost/internal/web":    "internal/web is the bifrost server; cmd/ib calls packages, it is not a client of the service it manages",
-		"github.com/eswan18/bifrost/internal/auth":   "cmd/ib must never need bifrost's bearer token or session",
+		"github.com/eswan18/bifrost/internal/web":    "internal/web is the bifrost server; cmd/bif calls packages, it is not a client of the service it manages",
+		"github.com/eswan18/bifrost/internal/auth":   "cmd/bif must never need bifrost's bearer token or session",
 		"github.com/eswan18/bifrost/internal/oracle": "the oracle fixtures are for tests only",
 	}
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("read cmd/ib: %v", err)
+		t.Fatalf("read cmd/bif: %v", err)
 	}
 
 	fset := token.NewFileSet()
@@ -140,6 +140,6 @@ func TestNoBifrostServerDependency(t *testing.T) {
 	// Without this the test would pass against an empty directory, which is
 	// exactly the failure mode a guard like this dies of.
 	if files < 2 {
-		t.Fatalf("scanned %d non-test files in cmd/ib, expected at least main.go and status.go", files)
+		t.Fatalf("scanned %d non-test files in cmd/bif, expected at least main.go and status.go", files)
 	}
 }

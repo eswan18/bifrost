@@ -102,35 +102,34 @@ the external one. If that's not your problem, set both to the same URL.
 
 For local dev, `kube.New` falls back to `~/.kube/config`.
 
-## The `ib` CLI
+## The `bif` CLI
 
-`cmd/ib` is bifrost's command-line half — the same decision logic (`internal/promote`),
+`cmd/bif` is bifrost's command-line half — the same decision logic (`internal/promote`),
 the same fleet list (`internal/registry`), driven from a terminal instead of a browser.
 
-    make install      # go install ./cmd/ib  →  $(go env GOBIN), else $(go env GOPATH)/bin
+    make install      # go install ./cmd/bif  →  $(go env GOBIN), else $(go env GOPATH)/bin
 
 That directory has to be on your `PATH`; `make install` says so if it isn't.
-`make build-ib` drops a binary in the working directory instead.
+`make build-bif` drops a binary in the working directory instead.
 
 **Until `promote` and `preview` are ported, this binary is a strict subset of
-the Python `ib`** (uv installs that one to `~/.local/bin/ib`). Installing both
-means whichever comes first on `PATH` wins, silently — so `make install`
-prints which one that is, and warns when it has just shadowed the other. Find
-that out during an incident, with `ib promote bifrost` answering "not ported
-yet", and the shadowing is the outage.
+the Python `ib`** (uv installs that one to `~/.local/bin/ib`), which still owns
+those two commands. The names differ precisely so both can be installed: a Go
+binary called `ib` would shadow the Python one on `PATH` and silently take
+`promote` and `preview` away — the kind of thing you discover mid-incident.
 
-    ib status               # every service
-    ib status <app>         # one service's staging and prod images
-    ib status -q            # list out-of-sync services (* = mid-deploy)
-    ib status <app> -q      # minimal output; exit 0 in sync, 1 if not
+    bif status               # every service
+    bif status <app>         # one service's staging and prod images
+    bif status -q            # list out-of-sync services (* = mid-deploy)
+    bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
 
 Exit codes are a contract: **1** only when a service is definitely out of sync,
 in every form, with or without `-q`. Mid-deploy, missing pods and an unreadable
 staging tag all exit **0** — a script asking "is there anything to promote?"
 gets "no", not an error, when the answer isn't knowable yet.
 
-`ib` reaches the cluster directly through client-go and never calls bifrost's
-API. That is deliberate and load-bearing: `ib promote bifrost` is how bifrost
+`bif` reaches the cluster directly through client-go and never calls bifrost's
+API. That is deliberate and load-bearing: `bif promote bifrost` is how bifrost
 gets recovered when bifrost is down, so it cannot depend on bifrost being up.
 The service list is `go:embed`ed, so it needs no network either.
 
