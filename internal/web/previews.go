@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/previewapi"
 )
 
 // previewLabelSelector selects preview namespaces — the namespace itself is
@@ -21,80 +22,8 @@ const previewLabelSelector = "bifrost/preview=true"
 // previewNSPrefix is prepended to a preview's tag to form its namespace name.
 const previewNSPrefix = "preview-"
 
-type previewRecord struct {
-	Tag       string            `json:"tag"`
-	Branch    string            `json:"branch"`
-	Apps      []string          `json:"apps"`
-	Phase     string            `json:"phase"`
-	Health    string            `json:"health"`
-	CreatedAt time.Time         `json:"createdAt"`
-	URLs      map[string]string `json:"urls"`
-	// Step and StepSince narrate what the orchestrator's Up is doing right
-	// now (bifrost/step, bifrost/step-since — see internal/preview's
-	// Orchestrator.step). Step is "" once a preview reaches ready (cleared
-	// on success) but is deliberately left in place on a failed preview, so
-	// it reads as "failed while building footstrike-api" rather than going
-	// silent. StepSince is a timestamp, not a duration, so elapsed time is
-	// always computed fresh by whoever renders it (the CLI, the UI) instead
-	// of going stale between polls.
-	Step      string    `json:"step,omitempty"`
-	StepSince time.Time `json:"stepSince,omitzero"`
-	// Error surfaces bifrost/error (already written by Orchestrator.fail)
-	// so a failed preview's cause is visible to API consumers instead of
-	// only the cluster-side annotation.
-	Error string `json:"error,omitempty"`
-	// ExpiresAt is the optional reclaim time recorded at creation
-	// (bifrost/expires-at — see internal/preview's expiresAtAnnotation).
-	// Zero, and so omitted from the JSON, means the preview never expires:
-	// most previews carry no TTL, and that is the default by design.
-	ExpiresAt time.Time `json:"expiresAt,omitzero"`
-	// AutoUpdate reports whether the preview follows its branch
-	// (bifrost/auto-update = "true" — see internal/preview's
-	// autoUpdateAnnotation and PollAutoUpdates). Opt-in and false by
-	// default, so it is omitted from the JSON for almost every preview.
-	AutoUpdate bool `json:"autoUpdate,omitempty"`
-	// Busy reports that the orchestrator currently holds this tag for an
-	// in-flight Up or Down (internal/preview's Orchestrator.Busy). Alone
-	// among this struct's fields it is NOT derived from the namespace: it is
-	// bifrost's own in-process state, and that is exactly why it is worth
-	// reporting. A busy tag is the reason a concurrent up/down gets a 409,
-	// and until now nothing in the API said so, which left "That preview is
-	// busy" and "No preview environments" as the two simultaneous answers to
-	// the same question. False for a preview nobody is touching, so
-	// omitempty keeps it out of the JSON for almost every record; a consumer
-	// must read a missing key as false.
-	Busy bool `json:"busy,omitempty"`
-	// BuiltImages reports what each member's last SUCCESSFUL build produced
-	// (bifrost/built-images — see internal/preview's builtImagesAnnotation),
-	// keyed by service name. A member absent from the map has nothing
-	// recorded for it — an older preview predating this annotation, or one
-	// whose most recent build never succeeded — and that absence, like a
-	// wholly missing annotation, is this field's clean zero value (nil map,
-	// omitted from the JSON) rather than an error; see
-	// parseBuiltImagesAnnotation. It exists so a caller (the CLI, polling
-	// across a re-run of `up`) can diff this map before and after and tell
-	// whether anything was actually rebuilt: an unchanged preview reports the
-	// identical commit for every member, which Step cannot show once the run
-	// reaches ready (Step is cleared to "" on success, and a re-run that
-	// reuses every image can finish inside a single poll interval).
-	BuiltImages map[string]builtImageRecord `json:"builtImages,omitempty"`
-}
-
-// builtImageRecord is the JSON shape of one previewRecord.BuiltImages entry:
-// the full commit a member's image was built from, and the short SHA that
-// build produced (render.go's `preview-<short sha>` image tag). Mirrors
-// internal/preview's builtImage field-for-field — same two fields, same
-// reason neither is derived from the other (see that type's doc) — but is
-// its own type rather than a reuse of it: builtImage is unexported, and nothing
-// forces this package's wire shape to move in lockstep with that package's
-// internal representation.
-type builtImageRecord struct {
-	Commit   string `json:"commit"`
-	ShortSHA string `json:"shortSha"`
-}
-
 // parseBuiltImagesAnnotation reads bifrost/built-images into
-// previewRecord.BuiltImages. It is a local reimplementation of
+// previewapi.Record.BuiltImages. It is a local reimplementation of
 // internal/preview's parseBuiltImages/builtImage, not a call into them: both
 // are unexported, and — more to the point — every other bifrost/* annotation
 // this file reads back that is written only by internal/preview (branch,
@@ -113,8 +42,8 @@ type builtImageRecord struct {
 // value, whenever nothing valid was found — including for raw == "" — so a
 // caller (and reflect.DeepEqual in a test) sees exactly the same thing for
 // "no such annotation" and "an annotation with nothing readable in it".
-func parseBuiltImagesAnnotation(raw string) map[string]builtImageRecord {
-	var built map[string]builtImageRecord
+func parseBuiltImagesAnnotation(raw string) map[string]previewapi.BuiltImage {
+	var built map[string]previewapi.BuiltImage
 	for _, pair := range strings.Split(raw, ",") {
 		svc, rest, ok := strings.Cut(pair, "=")
 		if !ok {
@@ -129,50 +58,18 @@ func parseBuiltImagesAnnotation(raw string) map[string]builtImageRecord {
 			continue
 		}
 		if built == nil {
-			built = map[string]builtImageRecord{}
+			built = map[string]previewapi.BuiltImage{}
 		}
-		built[svc] = builtImageRecord{Commit: commit, ShortSHA: shortSHA}
+		built[svc] = previewapi.BuiltImage{Commit: commit, ShortSHA: shortSHA}
 	}
 	return built
 }
 
-// phaseBusy is the phase carried by a synthesized record — a tag the
-// orchestrator holds that has no namespace to describe it (see busyRecord).
-//
-// It is deliberately its own phase rather than a reuse of an existing one.
-// "creating" and "terminating" would both be guesses: the busy set is a bare
-// claim on a tag and does not record which of Up or Down took it, and the two
-// windows that produce this state are one of each (Up before EnsureNamespace,
-// Down after DeleteNamespace). "terminating" would be an outright lie besides
-// — recordFromNamespace reserves it for a namespace whose Kubernetes phase
-// really is Terminating, and here there is no namespace at all. "unknown",
-// which recordFromNamespace uses for a namespace missing its phase
-// annotation, would throw away the one thing that IS known. So: busy, which
-// claims exactly what bifrost can see.
-const phaseBusy = "busy"
-
-// Teardownable reports whether DELETE /api/previews/{tag} has anything to act
-// on for this record — i.e. whether a namespace is behind it. It exists for
-// the Previews tab, which offers a teardown control per row and must not
-// offer one that cannot work.
-//
-// A synthesized busy record (phaseBusy — see busyRecord) is the only record
-// this excludes: it describes a tag the orchestrator holds with no namespace
-// to describe it, which is precisely the case DeletePreviewJSON answers 404
-// for, since previewByTag deliberately does not synthesize. Every other
-// phase, terminating included, has a namespace and so a real DELETE to make
-// (a redundant one against an already-terminating preview is answered
-// honestly by the handler rather than guessed at here).
-//
-// It is a method, not a field, so it stays out of the JSON: the API's shape
-// is fixed and consumers derive this themselves from phase.
-func (r previewRecord) Teardownable() bool { return r.Phase != phaseBusy }
-
 // recordFromNamespace derives everything derivable without extra cluster
 // calls; Health is filled separately by the assemblers.
-func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
+func recordFromNamespace(ns kube.NamespaceInfo) previewapi.Record {
 	tag := strings.TrimPrefix(ns.Name, previewNSPrefix)
-	rec := previewRecord{
+	rec := previewapi.Record{
 		Tag:       tag,
 		Branch:    ns.Annotations["bifrost/branch"],
 		Apps:      []string{},
@@ -233,7 +130,7 @@ func recordFromNamespace(ns kube.NamespaceInfo) previewRecord {
 // and writing new steps. previewsPage ORs this into the page's AnyActive so
 // the Previews tab polls on the fast cadence while that's true; see the
 // comment there for why the fleet-derived signal alone isn't enough.
-func anyPreviewCreating(records []previewRecord) bool {
+func anyPreviewCreating(records []previewapi.Record) bool {
 	for _, rec := range records {
 		if rec.Phase == "creating" {
 			return true
@@ -254,18 +151,18 @@ func anyPreviewCreating(records []previewRecord) bool {
 // list pods in, and asking would be a wasted call with a foregone answer.
 // Apps and URLs are non-nil so they marshal as [] and {} like every other
 // record's.
-func busyRecord(tag string) previewRecord {
-	return previewRecord{
+func busyRecord(tag string) previewapi.Record {
+	return previewapi.Record{
 		Tag:    tag,
 		Apps:   []string{},
-		Phase:  phaseBusy,
+		Phase:  previewapi.PhaseBusy,
 		Health: "unknown",
 		URLs:   map[string]string{},
 		Busy:   true,
 	}
 }
 
-func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error) {
+func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewapi.Record, error) {
 	namespaces, err := h.Kube.ListNamespaces(ctx, previewLabelSelector)
 	if err != nil {
 		return nil, err
@@ -276,7 +173,7 @@ func (h *Handlers) assemblePreviews(ctx context.Context) ([]previewRecord, error
 	// contradict itself — flagging a tag busy in one record while omitting
 	// the synthesized one for another because the claim moved in between.
 	busy := h.busyTags()
-	records := make([]previewRecord, 0, len(namespaces)+len(busy))
+	records := make([]previewapi.Record, 0, len(namespaces)+len(busy))
 	hasNamespace := make(map[string]bool, len(namespaces))
 	for _, ns := range namespaces {
 		rec := recordFromNamespace(ns)
@@ -320,10 +217,10 @@ func (h *Handlers) busyTags() map[string]bool {
 // teardown into a 200 and let a DELETE proceed against a preview that is
 // already gone. The busy flag is still reported, so a caller polling a
 // specific tag sees the claim as soon as there is a namespace to hang it on.
-func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewRecord, bool, error) {
+func (h *Handlers) previewByTag(ctx context.Context, tag string) (previewapi.Record, bool, error) {
 	ns, found, err := h.Kube.GetNamespace(ctx, previewNSPrefix+tag)
 	if err != nil || !found {
-		return previewRecord{}, false, err
+		return previewapi.Record{}, false, err
 	}
 	rec := recordFromNamespace(ns)
 	rec.Health = h.previewHealth(ctx, ns.Name)
@@ -365,7 +262,7 @@ const (
 type previewDetail struct {
 	Tag     string
 	State   previewDetailState
-	Rec     previewRecord
+	Rec     previewapi.Record
 	StepFor string // how long .Rec.Step has been running; "" when unknown
 }
 
@@ -484,18 +381,16 @@ func (h *Handlers) previewHealth(ctx context.Context, namespace string) string {
 }
 
 // PreviewsListJSON serves GET /api/previews for both the UI's consumers and
-// the ib CLI (bearer-authed — may carry no session; no SessionFromContext).
+// the bif CLI (bearer-authed — may carry no session; no SessionFromContext).
 func (h *Handlers) PreviewsListJSON(w http.ResponseWriter, r *http.Request) {
 	records, err := h.assemblePreviews(r.Context())
 	if err != nil {
 		slog.Error("list previews failed", "err", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "list previews failed"})
+		writeJSONError(w, http.StatusInternalServerError, "list previews failed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"previews": records})
+	_ = json.NewEncoder(w).Encode(previewapi.ListResponse{Previews: records})
 }
 
 // PreviewJSON serves GET /api/previews/{tag}.
@@ -503,15 +398,11 @@ func (h *Handlers) PreviewJSON(w http.ResponseWriter, r *http.Request) {
 	rec, found, err := h.previewByTag(r.Context(), r.PathValue("tag"))
 	if err != nil {
 		slog.Error("get preview failed", "err", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "get preview failed"})
+		writeJSONError(w, http.StatusInternalServerError, "get preview failed")
 		return
 	}
 	if !found {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": "unknown preview"})
+		writeJSONError(w, http.StatusNotFound, "unknown preview")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

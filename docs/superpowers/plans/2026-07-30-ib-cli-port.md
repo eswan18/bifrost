@@ -130,6 +130,14 @@ The task that justifies the project. **Read Task 1's findings before starting.**
 
 - [ ] **Step 6: Commit.**
 
+**Findings (read before porting `preview up`).** `list` and `down` are ported; `up` is untouched and still prints the not-ported message.
+
+1. **The record type moved rather than being exported or mirrored.** `previewRecord`/`builtImageRecord` are now `previewapi.Record`/`previewapi.BuiltImage` in `internal/previewapi`, imported by both `internal/web` and `cmd/bif`, along with `ListResponse` and `ErrorResponse` so even the `previews` and `error` envelope keys are declared once. Exporting from `internal/web` was rejected because `cmd/bif` must not import the server at all; a hand-copied mirror is the exact duplication the port exists to remove. `up` gets `Step`, `StepSince`, `Error` and `BuiltImages` for free and must not redeclare them.
+2. **`TestNoBifrostServerDependency` was narrowed, not deleted.** Every non-test file in `cmd/bif` except `preview.go` is still banned from `net/http`, `internal/web`, `internal/auth`, `internal/oracle` and now `internal/previewclient` — a whitelist by exception rather than by enumeration, so a new file is checked automatically. A companion test walks the bifrost-internal dependency closure of what `main.go`/`status.go`/`promote.go` import and fails if `internal/web` or `internal/previewclient` appears below `cmd/bif`. Keep `up` inside `preview.go`, or the exemption has to widen.
+3. **A synthesized busy record renders `busy*`, not a bare `busy`.** `ib.py`'s docstring says otherwise, but `previewRecord.Phase` has never had `omitempty` and `busyRecord` has always filled it with `"busy"`, so `preview_phase_display`'s `phase is None` branch is dead against any bifrost that ever shipped. The port keeps the branch (it answers an older or non-bifrost server) and pins both cases. The docstring's claim, not the code, is what was wrong.
+4. **Two deliberate divergences from `ib.py`, both stated in code comments.** `list` and `down` reject leftover arguments where `ib.py` silently drops them — the same discipline Step 1 demands for `--ttl`; and the hints in the 409 and not-found messages say `bif preview list`, matching the substitution `bif status`'s promote hint already makes. The `User-Agent` deliberately still reads `ib-preview-cli`: it is a token an external, dashboard-managed WAF sees, and nothing in this repo can prove no rule keys on it.
+5. **The token is memoized** on `previewclient.Client` after the first successful fetch. `ib.py` re-runs `gcloud` per request, which is a subprocess every 3 seconds once `up`'s poll loop exists.
+
 ---
 
 ### Task 5: Cutover

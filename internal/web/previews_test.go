@@ -13,6 +13,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/auth"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/previewapi"
 )
 
 func nsInfo(name, branch, apps, phase string) kube.NamespaceInfo {
@@ -104,7 +105,7 @@ func TestRecordFromNamespaceTerminatingSuppressesStepAndError(t *testing.T) {
 
 // TestRecordFromNamespaceStep pins the step-reporting contract added for
 // preview progress: bifrost/step, bifrost/step-since, and bifrost/error all
-// surface onto previewRecord verbatim (the timestamp parsed, not just
+// surface onto previewapi.Record verbatim (the timestamp parsed, not just
 // copied).
 func TestRecordFromNamespaceStep(t *testing.T) {
 	ns := nsInfo("preview-hae-cadence", "hae-cadence", "footstrike-api", "creating")
@@ -249,7 +250,7 @@ func TestRecordFromNamespaceBuiltImages(t *testing.T) {
 		ns.Annotations["bifrost/built-images"] = "footstrike-api=deadbeef0123456789:deadbee,footstrike-dashboard=c0ffee1122334455:c0ffee1"
 
 		got := recordFromNamespace(ns).BuiltImages
-		want := map[string]builtImageRecord{
+		want := map[string]previewapi.BuiltImage{
 			"footstrike-api":       {Commit: "deadbeef0123456789", ShortSHA: "deadbee"},
 			"footstrike-dashboard": {Commit: "c0ffee1122334455", ShortSHA: "c0ffee1"},
 		}
@@ -272,7 +273,7 @@ func TestRecordFromNamespaceBuiltImages(t *testing.T) {
 		ns.Annotations["bifrost/built-images"] = "footstrike-api=deadbeef0123456789:deadbee,footstrike-dashboard=c0ffee1122334455:"
 
 		got := recordFromNamespace(ns).BuiltImages
-		want := map[string]builtImageRecord{"footstrike-api": {Commit: "deadbeef0123456789", ShortSHA: "deadbee"}}
+		want := map[string]previewapi.BuiltImage{"footstrike-api": {Commit: "deadbeef0123456789", ShortSHA: "deadbee"}}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("BuiltImages = %+v, want %+v", got, want)
 		}
@@ -527,7 +528,7 @@ func TestPreviewsListJSON(t *testing.T) {
 		t.Errorf("Content-Type = %q", ct)
 	}
 	var body struct {
-		Previews []previewRecord `json:"previews"`
+		Previews []previewapi.Record `json:"previews"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -1257,7 +1258,7 @@ func TestPreviewDetailPageShowsEverythingWithURLsProminent(t *testing.T) {
 		}
 	}
 
-	// Every remaining field of previewRecord, plus the page chrome that makes
+	// Every remaining field of previewapi.Record, plus the page chrome that makes
 	// this a real dashboard page rather than a bare fragment.
 	for _, want := range []string{
 		`<div class="modal-title mono">hae-cadence</div>`,

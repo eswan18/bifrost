@@ -1,15 +1,21 @@
 // Command bif is the deploy CLI for the fleet: see what's running in staging
 // versus prod, and promote staging to prod.
 //
-// It is deliberately NOT a client of bifrost. `bif promote bifrost` is how
-// bifrost gets recovered when bifrost is down — it went down on a spot-node
-// preemption during the preview-environments work, and this is the path back.
-// So `status` and `promote` read the cluster directly through client-go, and
+// `status` and `promote` are deliberately NOT clients of bifrost. `bif promote
+// bifrost` is how bifrost gets recovered when bifrost is down — it went down on
+// a spot-node preemption during the preview-environments work, and this is the
+// path back. So they read the cluster directly through client-go, and
 // internal/registry compiles the service list into the binary, so even the
 // fleet list needs no network. Nothing on those paths may grow a dependency on
-// bifrost's HTTP API, its bearer token, or its availability. (`bif preview`,
-// when it lands, is a different case: the server owns preview orchestration,
-// so that one is an HTTP client by design.)
+// bifrost's HTTP API, its bearer token, or its availability.
+//
+// `bif preview` is the one exception, and is an HTTP client by design: the
+// server owns preview orchestration — the busy set, the cluster write
+// credentials, the Neon and Cloud Build tokens — so there is nothing there for
+// the CLI to do locally. It is confined to preview.go and
+// internal/previewclient so the exception stays an exception; see
+// main_test.go's TestNoBifrostServerDependency, which enforces the boundary
+// file by file.
 //
 // Ported from infra/ib.py, which stays the reference implementation until the
 // cutover. Argument handling is hand-rolled to match it: this is a
@@ -40,23 +46,31 @@ Usage:
     bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
     bif promote <app>        # Compare staging vs prod, offer to promote
     bif promote <app> -y     # Promote without confirmation
+    bif preview list         # Table of preview environments, TTL remaining
+    bif preview down <tag>   # Tear down (confirm unless -y/--yes)
 
 Not ported yet — run this with the Python CLI:
-    ib preview <list|up|down> ...`
+    ib preview up <branch> [--ttl 8h] [--auto-update] [--no-wait]`
 
 // argoNamespace is where the ArgoCD Applications live. `bif status` never
 // touches them — it reads pods — but kube.New wants it, and `bif promote` will.
 const argoNamespace = "argocd"
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster))
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialPreview))
 }
 
 // run is main with the process edges passed in — argv, the input and output
-// streams, the exit status as a return value, and the cluster connection as a
-// function — so tests can drive whole commands end to end, including
+// streams, the exit status as a return value, and the two connections as
+// functions — so tests can drive whole commands end to end, including
 // promote's confirmation prompt.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error)) int {
+//
+// The cluster and the preview API are separate parameters rather than one
+// bundle because they are separate privileges: everything reachable through
+// `connect` works with bifrost down, and nothing reachable through
+// `connectPreview` does. Only the preview branch below is handed the second
+// one.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectPreview func() previewAPI) int {
 	if len(args) == 0 {
 		outln(stdout, usage)
 		return 1
@@ -70,11 +84,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "promote":
 		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
 	case "preview":
-		// Named rather than folded into the unknown-command case: the
-		// operator typed a real bif command, and "unknown command" would send
-		// them looking for a typo instead of at the other binary.
-		outf(stdout, "bif %s is not ported to Go yet — use `ib %s` (infra/ib.py) for it.\n", cmd, cmd)
-		return 1
+		return previewCmd(ctx, args[1:], stdin, stdout, stderr, connectPreview)
 	default:
 		outf(stdout, "Unknown command: %s\n", cmd)
 		outln(stdout, "Available commands: status, promote, preview")
