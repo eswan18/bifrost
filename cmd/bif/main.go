@@ -17,10 +17,11 @@
 // main_test.go's TestNoBifrostServerDependency, which enforces the boundary
 // file by file.
 //
-// Ported from infra/ib.py, which stays the reference implementation until the
-// cutover. Argument handling is hand-rolled to match it: this is a
-// three-command tool, and a CLI framework would be more machinery than the
-// thing it drives.
+// Ported from the Python `ib`, which was the reference implementation for the
+// port and has since been deleted from the infra repo — the comments below that
+// cite it are describing behaviour this file now owns, not a second CLI to go
+// read. Argument handling is hand-rolled to match it: this is a three-command
+// tool, and a CLI framework would be more machinery than the thing it drives.
 package main
 
 import (

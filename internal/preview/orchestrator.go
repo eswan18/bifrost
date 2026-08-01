@@ -152,7 +152,7 @@ func (o *Orchestrator) Busy(tag string) bool {
 // invisible to anything that reads the cluster. Down holds the tag after
 // DeleteNamespace has returned while it works through the Neon branches, and
 // Up holds it during membership resolution before the namespace exists at
-// all. In both windows `ib preview list` and the Previews tab, which see
+// all. In both windows `bif preview list` and the Previews tab, which see
 // namespaces and nothing else, report the preview as simply absent while a
 // concurrent up/down is told the tag is busy. The read path uses this to
 // surface those tags instead (see internal/web's assemblePreviews).
@@ -208,7 +208,7 @@ type UpOptions struct {
 // fail leaves the "migrate" initContainer in Init:CrashLoopBackOff and the
 // app container never runs at all, which the old apply-then-declare-ready
 // flow reported as a perfectly healthy preview. Consumers of the API
-// (`ib preview up`, the Previews tab) rely on this: ready means usable.
+// (`bif preview up`, the Previews tab) rely on this: ready means usable.
 //
 // Every stage past EnsureNamespace that fails — the readiness wait
 // included — marks the namespace bifrost/phase=failed with a sanitized
@@ -319,7 +319,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 			// documented recovery path. Without these three, that retry
 			// would display the PREVIOUS run's error and last step for its
 			// entire duration ("creating · building X — build ended with
-			// status FAILURE") in both the UI and `ib preview up`. This
+			// status FAILURE") in both the UI and `bif preview up`. This
 			// write is Up's entry point, so it clears exactly what the ready
 			// write below clears on exit; fail() rewrites bifrost/error (and
 			// leaves this run's own step in place) if the retry fails too,
@@ -390,7 +390,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 //     tag (ErrTagCollision).
 //
 // An existing namespace for the SAME branch is the ordinary case and is
-// untouched by either: re-running `ib preview up` on a branch is the
+// untouched by either: re-running `bif preview up` on a branch is the
 // documented recovery path, and the auto-update watcher re-runs Up on the
 // recorded branch every time a member's SHA moves.
 //
@@ -417,7 +417,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // Because it is a look-then-act, it is NOT airtight, and nothing here can
 // make it so. The namespace can enter Terminating in the instant between this
 // read and EnsureNamespace, or at any point during the minutes that follow —
-// an `ib preview down`, or a bare kubectl delete, landing mid-create does
+// a `bif preview down`, or a bare kubectl delete, landing mid-create does
 // exactly that. Kubernetes offers no "create unless terminating" primitive to
 // close it with, and the busy set only serializes bifrost's own Up and Down,
 // not anyone else's delete. What this buys is the COMMON case: the
@@ -429,7 +429,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // Namespace teardown is unbounded in principle (finalizers, stuck pods) and
 // routinely takes tens of seconds; blocking here would hold the tag's busy
 // claim for the whole time, so a caller who would rather give up couldn't,
-// and `ib preview list` would show nothing at all meanwhile. The caller gets
+// and `bif preview list` would show nothing at all meanwhile. The caller gets
 // a named error and decides.
 //
 // The different-branch check exists because TagForBranch is many-to-one: by
@@ -440,7 +440,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // of them warned. EnsureNamespace merges, overwriting bifrost/branch with the
 // newcomer's name; ensureNeonBranch finds the existing preview-<tag> branch by
 // name and REUSES it, inheriting whatever migrations the first branch's
-// migrate initContainer applied; and a later `ib preview down` on that tag
+// migrate initContainer applied; and a later `bif preview down` on that tag
 // destroys both previews at once. The second developer gets the first
 // developer's database and schema, and neither is told.
 //
@@ -455,7 +455,7 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 // refused. Absence is not evidence of a collision — a preview created before
 // bifrost recorded the branch, or a namespace left behind by a partial or
 // out-of-band run, looks exactly like this — and refusing would strand it:
-// nothing but a manual `ib preview down` could ever get past the guard again,
+// nothing but a manual `bif preview down` could ever get past the guard again,
 // including the very re-run that would repair it. Proceeding also fixes it,
 // because the EnsureNamespace immediately below writes the annotation this
 // read went looking for.
@@ -970,7 +970,7 @@ func (o *Orchestrator) findPriorBuild(ctx context.Context, svc, commit string) (
 	return builtImage{Commit: commit, ShortSHA: shortSHA}, true
 }
 
-// buildStepText narrates the build stage for an operator watching `ib preview
+// buildStepText narrates the build stage for an operator watching `bif preview
 // up` (or the Previews tab) sit still for minutes. The old wording numbered a
 // sequence — "building footstrike-api (1/2)", rewritten per member — which is
 // no longer true in either direction: the builds run concurrently, so there is
@@ -1074,7 +1074,7 @@ func (o *Orchestrator) awaitBuild(ctx context.Context, buildID string) (string, 
 }
 
 // buildFailure turns a non-SUCCESS terminal build into the error that
-// eventually lands in bifrost/error — the string `ib preview up`, `ib preview
+// eventually lands in bifrost/error — the string `bif preview up`, `bif preview
 // list`, the Previews tab and the detail page all display verbatim.
 //
 // It carries the build's console LOG URL, because "build ended with status

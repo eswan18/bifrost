@@ -153,15 +153,35 @@ The task that justifies the project. **Read Task 1's findings before starting.**
 
 Only after Tasks 1–4 are merged and the Go CLI has been used for real work.
 
-- [ ] **Step 1:** Run both CLIs side by side against the same cluster over a real preview lifecycle — create, re-run unchanged, push and re-run, tear down — and diff the output. Record the differences and confirm each is intended.
+- [x] **Step 1:** Run both CLIs side by side against the same cluster over a real preview lifecycle — create, re-run unchanged, push and re-run, tear down — and diff the output. Record the differences and confirm each is intended.
 
-- [ ] **Step 2:** Remove `ib.py` and `verify_preview_progress.py` from the infra repo. Leave a pointer at bifrost.
+- [x] **Step 2:** Remove `ib.py` and `verify_preview_progress.py` from the infra repo. Leave a pointer at bifrost.
 
-- [ ] **Step 3:** Update `~/Develop/ibormeith/.claude/CLAUDE.md`, bifrost's README, `docs/preview-environments.md`, and `docs/adding-a-service.md` — every one of them documents `ib` commands. Verify each claim against the new code.
+- [x] **Step 3:** Update `~/Develop/ibormeith/.claude/CLAUDE.md`, bifrost's README, `docs/preview-environments.md`, and `docs/adding-a-service.md` — every one of them documents `ib` commands. Verify each claim against the new code.
 
-- [ ] **Step 4:** Note in the infra repo that `SERVICES` no longer needs maintaining there, since it was a deliberate duplicate of the registry.
+- [x] **Step 4:** Note in the infra repo that `SERVICES` no longer needs maintaining there, since it was a deliberate duplicate of the registry.
 
-- [ ] **Step 5: Commit** and open the paired PRs.
+- [x] **Step 5: Commit.** (PRs deliberately not opened; both branches are committed and unpushed.)
+
+**Findings.**
+
+1. **Step 1 was performed on the read-only paths only, and that is the one claim in this cutover not to overstate.** `status` in all four forms, `status -q`, per-app `status`, and `preview list` were run side by side against the live cluster and are **byte-identical including exit codes**, with exactly one intended difference: the out-of-sync hint reads `bif promote <app>` where `ib.py` said `ib promote <app>` (`cmd/bif/status_test.go`'s `retargetPromoteHint` applies that substitution to the oracle capture, and `TestOutOfSyncHintNamesBif` fails if it becomes a no-op).
+
+   **`promote`, `preview up` and `preview down` were NOT compared live.** They mutate — a real side-by-side would mean promoting to prod twice and standing up and tearing down a preview twice, which is a production write and a Cloud Build spend to prove something the fixtures already pin. Their equivalence rests on the oracle fixtures captured in Task 1 and the mutation-checked tests from Tasks 3 and 4: the patch body decoded against `promote_decision.json`, the override key read from `image_base.json` (`TestOverrideKeyComesFromTheImageNotTheAppName`), and `up`/`down`'s 404 asymmetry, tag-mismatch, TTL/auto-update warning and `builtImages` diffing tests. That is the actual evidence, and the docs written in Step 3 say nothing that implies more.
+
+2. **The Python's packaging entry point mattered more than the file.** `infra/pyproject.toml` carried `[project.scripts] ib = "ib:main"`. Deleting `ib.py` without it leaves `uv sync` **succeeding** and still installing a `ib` console script that dies with `ModuleNotFoundError: No module named 'ib'` — verified by building the old `pyproject.toml` against a stub. Infra CI (`.github/workflows/pull_request.yaml`: `uv sync`, `uv run ruff check`, `uv run ty check`) would not have caught it, because nothing there runs `ib`. The entry point is removed.
+
+3. **Infra's `ty check` step is now vacuous.** `[tool.ty.src] exclude = ["__main__.py"]` was the only exclusion, and `ib.py`/`verify_preview_progress.py` were the only other Python files. `ty` now reports `WARN No python files found under the given path(s)` and exits 0, so CI stays green while type-checking nothing. Left as-is — it costs nothing and starts working again the moment a non-Pulumi module lands — but it is not a signal any more.
+
+4. **Three classes of `ib` reference, treated differently.** Commands a reader should now type became `bif` (all of `docs/preview-environments.md`, the command blocks in the README and `docs/adding-a-service.md`, and the empty-state hint in `templates/previews.html`, which is user-facing UI text). Historical and explanatory references to the Python stayed `ib`/`ib.py` and now say it is retired — the README's "Two deliberate differences from the retired `ib.py`", `internal/promote/differential_test.go` (whose whole subject is the oracle comparison), and the oracle constant `oraclePromoteHint`, which is a captured fixture value and must not move. The dead `infra/ib.py` path is named in exactly one place, the README sentence that says it was deleted.
+
+5. **One doc claim was false and is fixed.** The README said "`bif` reaches the cluster directly through client-go and never calls bifrost's API" — true when it was written, and untrue from the moment Task 4 landed `preview`. It is now scoped to `status` and `promote`, with the `preview` exception stated and pointed at `TestNoBifrostServerDependency`, which is what actually enforces it.
+
+6. **`adding-a-service.md`'s "Gotcha: `ib.py`'s own service list" is resolved but replaced, not deleted.** The cross-repo duplicate is gone. What survives is weaker and worth keeping written down: `bif` carries the registry that was `go:embed`ed when its binary was built, so a newly added service is refused by `validateApp` until you `make install` again. `bif preview up` is exempt — it never checks the name against the registry, and membership is resolved by prod bifrost.
+
+7. **Deleting `ib.py` broke the oracle *regeneration* path, not the oracle.** `scripts/capture-oracle.sh` defaulted to `~/Develop/ibormeith/infra/ib.py`, which no longer exists. The committed `testdata/oracle/` fixtures are what the tests read, so nothing fails — but the scripts are the reason those fixtures are reproducible rather than merely asserted, so they are kept and now say `IB_PY` is required and where to recover the Python from (`git -C ~/Develop/ibormeith/infra show 9db57a3:ib.py`, verified to resolve). `testdata/oracle/meta.json` still records the old absolute path; it is generated and marked do-not-hand-edit, so it was left alone.
+
+8. **Task 2's step checkboxes are still unticked** despite its work being merged (it is the only task with no findings section). Not touched here; flagging it so the omission is deliberate rather than lost.
 
 ---
 

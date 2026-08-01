@@ -68,7 +68,7 @@ const autoUpdatePollBudget = 30 * time.Minute
 //
 // Membership CHANGES are out of scope: a repo that newly gained the branch is
 // not picked up, because this only ever asks about the members already
-// recorded on the namespace. That needs a manual `ib preview up` re-run, and
+// recorded on the namespace. That needs a manual `bif preview up` re-run, and
 // is documented as a limitation in docs/preview-environments.md.
 //
 // A re-run preserves the preview's existing state rather than resetting it:
@@ -157,7 +157,7 @@ func autoUpdatable(ns kube.NamespaceInfo) (string, bool) {
 // branch no longer exists in a member's repo (github.ErrNoBranch), which
 // happens the moment a merged branch is deleted. PollAutoUpdates skips and
 // logs it rather than reporting it, so a tidy merge doesn't produce an error
-// every two minutes until someone runs `ib preview down`.
+// every two minutes until someone runs `bif preview down`.
 var errBranchGone = errors.New("branch no longer exists in this repo")
 
 // movedMembers returns one human-readable entry per member of ns whose branch
@@ -264,7 +264,7 @@ func splitAnnotationList(raw string) []string {
 // DETACHED from it, bounded by autoUpdatePollBudget. That matches how every
 // other Up already runs — the API layer hands Up a WithoutCancel context on
 // its own 30-minute budget — so an in-flight auto-update behaves on shutdown
-// exactly as a manual `ib preview up` does: it is not cancelled, but nothing
+// exactly as a manual `bif preview up` does: it is not cancelled, but nothing
 // waits on it either, so a process that exits fast can still leave the
 // preview at bifrost/phase=creating (the documented stuck-creating case,
 // recovered by re-running up).

@@ -26,7 +26,7 @@ const maxTagLen = 30
 // closes only the truncation path while leaving folding — which needs no long
 // branch name at all — wide open, and it would change the tag of every
 // existing long-branch preview, orphaning that preview's namespace and its
-// Neon branch from the `ib preview down` that should have reclaimed them. The
+// Neon branch from the `bif preview down` that should have reclaimed them. The
 // general fix is at the point of use instead: Up refuses to run against a
 // namespace another branch already owns (refuseUnusableNamespace and
 // ErrTagCollision in orchestrator.go), which catches both paths and every

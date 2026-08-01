@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Capture the behaviour of ib.py's promote/tag logic as JSON fixtures.
 
-`infra/ib.py` is the oracle: it is what promotes to production today. This
-script imports the REAL ib.py (never a reimplementation of it), drives its
-pure decision functions over a matrix of inputs, and writes the results to
-testdata/oracle/. The Go differential tests in internal/promote and
+`infra/ib.py` was the oracle: it is what promoted to production before the
+cutover. This script imports the REAL ib.py (never a reimplementation of it),
+drives its pure decision functions over a matrix of inputs, and writes the
+results to testdata/oracle/. The Go differential tests in internal/promote and
 internal/preview then assert that the Go port produces identical answers.
 
+ib.py has since been deleted from the infra repo, so --ib-py must now point at
+a copy recovered from git history (infra commit 9db57a3); see
+scripts/capture-oracle.sh. The committed fixtures are unaffected -- they are
+the frozen record, and the tests read them, not this script.
+
 Usage:
-    scripts/capture-oracle.sh                    # defaults below
+    IB_PY=/path/to/ib.py scripts/capture-oracle.sh
     python3 scripts/capture_oracle.py --ib-py /path/to/ib.py --out testdata/oracle
 
 Everything written here must be deterministic: re-running against the same
