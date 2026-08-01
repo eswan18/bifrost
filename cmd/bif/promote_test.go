@@ -461,7 +461,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		&stdout, &stderr, func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, noPreview)
+		}, unreachableBuilds, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -480,7 +480,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 func TestPromoteConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"promote", "bifrost", "-y"}, strings.NewReader(""),
-		&stdout, &stderr, func() (promoter, error) { return nil, errors.New("no kubeconfig") }, noPreview)
+		&stdout, &stderr, func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)

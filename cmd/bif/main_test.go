@@ -22,6 +22,17 @@ func noCluster() (promoter, error) { return nil, errors.New("dispatch must not c
 // an error to check: there is no code path that should recover from this.
 func noPreview() previewAPI { panic("status and promote must not touch the preview API") }
 
+// unreachableBuilds is the Cloud Build connection every test that isn't about
+// the build column runs with, and it fails — which is the point. No unit test
+// may reach Google, and making the default the unreachable case means every
+// other status assertion in this package doubles as evidence that a dead Cloud
+// Build changes nothing but the build cell: the tables, the verdicts and the
+// exit codes below are all recorded against it. The build column's own tests
+// supply a working one (see fakeBuilds).
+func unreachableBuilds(context.Context) (buildLister, error) {
+	return nil, errors.New("no credentials")
+}
+
 func TestDispatch(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -80,7 +91,7 @@ func TestDispatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, noPreview)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
@@ -124,15 +135,34 @@ func TestTakeFlag(t *testing.T) {
 	}
 }
 
-// networkExempt is the one file in cmd/bif allowed to reach bifrost:
-// preview.go, which implements `bif preview`. See TestNoBifrostServerDependency
-// for why the exemption is a single named file rather than a relaxed rule.
-const networkExempt = "preview.go"
+// bifrostClientExempt is the one file in cmd/bif allowed to be a client of
+// bifrost: preview.go, which implements `bif preview`. See
+// TestNoBifrostServerDependency for why the exemption is a single named file
+// rather than a relaxed rule.
+const bifrostClientExempt = "preview.go"
 
 // bannedFromStatusAndPromote is what may not appear on the path that has to
-// work with bifrost down.
+// keep working with bifrost down.
+//
+// The property is about ONE server. `bif status` has always spoken HTTPS to
+// the Kubernetes API through client-go, and as of the build column it also
+// reads Cloud Build through internal/gcb; neither is the service being
+// managed, and neither can make `bif promote bifrost` depend on bifrost being
+// up. What may not appear here is a reach for BIFROST — its API, its bearer
+// token, its session — under any spelling.
+//
+// net/http stays on the list, and its entry is the one worth reading twice,
+// because it is the only one that is not literally a bifrost package. In THESE
+// files a raw net/http import can only mean a hand-rolled client, and the one
+// server cmd/bif has ever hand-rolled a client for is bifrost — that is what
+// preview.go is. Every legitimate remote read status makes goes through a
+// package that owns the protocol: client-go for Kubernetes, internal/gcb for
+// Cloud Build. So the ban costs the third-party reads nothing while still
+// stopping the thing it was written to stop, and a new third-party client
+// arrives the same way internal/gcb did: as a package, visible in the walk
+// below, and not by opening a socket in status.go.
 var bannedFromStatusAndPromote = map[string]string{
-	"net/http": "status and promote read the cluster directly; no HTTP client of bifrost may appear on this path",
+	"net/http": "a raw HTTP client in status/promote can only be a hand-rolled client of bifrost; third-party reads (Kubernetes, Cloud Build) go through their own packages",
 	"github.com/eswan18/bifrost/internal/web":           "internal/web is the bifrost server; cmd/bif calls packages, it is not a client of the service it manages",
 	"github.com/eswan18/bifrost/internal/auth":          "cmd/bif must never need bifrost's bearer token or session",
 	"github.com/eswan18/bifrost/internal/oracle":        "the oracle fixtures are for tests only",
@@ -158,15 +188,15 @@ var bannedFromStatusAndPromote = map[string]string{
 //     may now do HTTP".
 //   - preview.go must actually use the exemption, so it cannot linger as dead
 //     permission if `bif preview` is ever restructured.
-//   - TestStatusAndPromoteDependenciesStayOffTheNetwork covers what a
-//     file-level import check cannot: a package status or promote depends on
-//     growing its own path to the server, below cmd/bif entirely.
+//   - TestStatusAndPromoteDependenciesStayOffBifrost covers what a file-level
+//     import check cannot: a package status or promote depends on growing its
+//     own path to the server, below cmd/bif entirely.
 //
 // What is genuinely given up: the binary now links net/http (it always did
 // transitively, through client-go), and Go's file-scoped imports cannot stop
 // promote.go from calling a function preview.go declares. The package-level
 // boundary is what makes that visible — such a call would have to name a
-// preview identifier, in a file this test proves owns the only network reach.
+// preview identifier, in a file this test proves owns the only bifrost reach.
 func TestNoBifrostServerDependency(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -188,7 +218,7 @@ func TestNoBifrostServerDependency(t *testing.T) {
 		}
 		for _, imp := range file.Imports {
 			path := strings.Trim(imp.Path.Value, `"`)
-			if name == networkExempt {
+			if name == bifrostClientExempt {
 				if path == "github.com/eswan18/bifrost/internal/previewclient" {
 					exemptUsesIt = true
 				}
@@ -203,29 +233,42 @@ func TestNoBifrostServerDependency(t *testing.T) {
 	// Without these the test would pass against an empty directory, or against
 	// a status.go renamed out of the scan, which is exactly the failure mode a
 	// guard like this dies of.
-	for _, required := range []string{"main.go", "status.go", "promote.go", networkExempt} {
+	for _, required := range []string{"main.go", "status.go", "promote.go", bifrostClientExempt} {
 		if !scanned[required] {
 			t.Fatalf("%s was not scanned; cmd/bif's files are %v", required, sortedKeys(scanned))
 		}
 	}
 	if !exemptUsesIt {
-		t.Errorf("%s no longer imports internal/previewclient, so its exemption from the ban is dead permission — delete it", networkExempt)
+		t.Errorf("%s no longer imports internal/previewclient, so its exemption from the ban is dead permission — delete it", bifrostClientExempt)
 	}
 }
 
-// TestStatusAndPromoteDependenciesStayOffTheNetwork closes the hole a
-// file-level import check leaves open: status and promote could keep clean
-// imports while a package they depend on grew its own client of bifrost.
+// TestStatusAndPromoteDependenciesStayOffBifrost closes the hole a file-level
+// import check leaves open: status and promote could keep clean imports while
+// a package they depend on grew its own client of bifrost.
 //
 // The roots are read from the code rather than listed here, so the test
 // follows what status and promote actually import instead of a stale copy of
-// it, and the walk is over bifrost's own packages only — client-go speaks HTTP
-// to Kubernetes and always has, which is the point, not a violation.
-func TestStatusAndPromoteDependenciesStayOffTheNetwork(t *testing.T) {
+// it, and the walk is over bifrost's own packages only. That last part is the
+// scope, not a gap: client-go speaks HTTPS to Kubernetes and always has, and
+// internal/gcb speaks HTTPS to Cloud Build for the build column — talking to a
+// third party is what this tool DOES, and what it must not do is depend on the
+// server it exists to recover. internal/gcb sits in this closure and passes
+// for the reason that matters: it imports nothing of bifrost's, so it cannot
+// smuggle the server in, and statusCmd treats its failure as a blank column
+// (TestBuildColumnFailuresLeaveStatusIntact) rather than as an error, so it
+// cannot make bifrost's availability a precondition either.
+//
+// internal/auth is banned here as well as file by file: bifrost's session and
+// bearer machinery has no business on this path at any depth, and a package
+// that pulled it in would be reaching for the server's credentials by
+// definition.
+func TestStatusAndPromoteDependenciesStayOffBifrost(t *testing.T) {
 	const modulePrefix = "github.com/eswan18/bifrost/"
 	banned := []string{
 		modulePrefix + "internal/web",
 		modulePrefix + "internal/previewclient",
+		modulePrefix + "internal/auth",
 	}
 
 	roots := bifrostImports(t, "main.go", "status.go", "promote.go")
