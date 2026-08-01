@@ -76,7 +76,7 @@ func TestRecordFromNamespaceTerminating(t *testing.T) {
 
 // TestRecordFromNamespaceTerminatingSuppressesStepAndError covers tearing
 // down a FAILED preview — the common case, since a failed preview is usually
-// the next thing an operator runs `ib preview down` on. Its annotations still
+// the next thing an operator runs `bif preview down` on. Its annotations still
 // carry the retained last step and error (deliberately, for as long as it
 // exists), but once the namespace is Terminating that run is over: rendering
 // them would read as "terminating · building footstrike-api (1/1) — build
@@ -377,8 +377,8 @@ func TestPreviewRecordCarriesBusyFlag(t *testing.T) {
 }
 
 // TestPreviewsListSynthesizesABusyTagWithNoNamespace is the state that made
-// the production incident baffling: `ib preview list` said "No preview
-// environments" while `ib preview up` said "That preview is busy", and
+// the production incident baffling: `bif preview list` said "No preview
+// environments" while `bif preview up` said "That preview is busy", and
 // neither was the whole truth. A tag can be claimed with no namespace behind
 // it — Down holds it after deleting the namespace while it works through the
 // Neon branches, Up holds it during membership resolution before the
@@ -749,7 +749,7 @@ func countGridCells(row string) int {
 }
 
 // TestPreviewsPageShowsCreateForm covers the create half of the tab's new
-// controls. Until this existed the Previews tab was read-only and `ib preview
+// controls. Until this existed the Previews tab was read-only and `bif preview
 // up` was the only way to make a preview — which is a poor answer on a phone,
 // the reason bifrost exists at all.
 //
@@ -1284,7 +1284,7 @@ func TestPreviewDetailPageShowsEverythingWithURLsProminent(t *testing.T) {
 // half of the feature. base.html's poller drops from 30s to 4s purely because
 // a [data-active] sits inside #tab-body, and re-fetches whatever <body>'s
 // data-refresh points at — so a per-tag fragment URL plus that attribute is
-// the entire mechanism by which this page narrates `ib preview up` live.
+// the entire mechanism by which this page narrates `bif preview up` live.
 //
 // The settled subtest is what makes the active one mean anything: on an idle
 // fleet nothing else may carry the attribute. The leading space matters —

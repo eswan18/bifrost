@@ -965,7 +965,7 @@ func TestUpFirstCreateBuildsEveryMemberAndRecordsWhatItBuilt(t *testing.T) {
 }
 
 // TestUpRerunWithNoNewCommitsBuildsNothing is the headline case: re-running
-// `ib preview up` on a branch nobody has pushed to — the documented recovery
+// `bif preview up` on a branch nobody has pushed to — the documented recovery
 // path, and what the auto-update watcher walks — must not rebuild anything,
 // and must still render and apply a working preview off the images the
 // previous run produced.
@@ -2035,7 +2035,7 @@ func TestUpRefusesATerminatingNamespace(t *testing.T) {
 // same flow, and the one the refusal must not break: recreate-after-teardown
 // is the ordinary path, and once Kubernetes has actually finished the delete
 // there is nothing left to refuse. A pre-check that treated "absent" as
-// anything other than "go ahead" would make every second `ib preview up`
+// anything other than "go ahead" would make every second `bif preview up`
 // fail forever.
 func TestUpCreatesAFreshNamespaceOnceTheOldOneIsGone(t *testing.T) {
 	d := newTwoMemberDeps(t)
@@ -2095,7 +2095,7 @@ const (
 // preview with no warning at any layer: EnsureNamespace merges (overwriting
 // bifrost/branch with the newcomer), ensureNeonBranch finds the existing
 // preview-<tag> Neon branch by name and reuses it — inheriting whatever
-// migrations the first branch applied — and one `ib preview down` on that tag
+// migrations the first branch applied — and one `bif preview down` on that tag
 // then destroys both.
 //
 // The refusal has to land BEFORE any of that, which is what
@@ -2143,7 +2143,7 @@ func TestUpRefusesACollidingTagFromADifferentBranch(t *testing.T) {
 }
 
 // TestUpProceedsOverItsOwnNamespace is the case the guard must NOT catch, and
-// the one with the most to lose: re-running `ib preview up` on the same branch
+// the one with the most to lose: re-running `bif preview up` on the same branch
 // is the documented recovery path for a stuck or failed preview, and the
 // auto-update watcher calls Up on the recorded branch every time a member's
 // SHA moves. A guard that refused on the mere presence of a namespace would
@@ -2179,7 +2179,7 @@ func TestUpProceedsOverItsOwnNamespace(t *testing.T) {
 // predating the annotation, or one left by a partial or out-of-band run.
 //
 // It proceeds, deliberately. Absence is not evidence of a collision, and
-// refusing on it would strand the namespace forever: no `ib preview up` could
+// refusing on it would strand the namespace forever: no `bif preview up` could
 // ever get past the guard again, including the re-run that would repair it.
 // The EnsureNamespace that follows writes the annotation, so the state is
 // self-healing rather than permanent.
@@ -2969,7 +2969,7 @@ func TestUpFailedPreviewRetainsLastStep(t *testing.T) {
 }
 
 // TestUpRetryDoesNotInheritPreviousRunsStepOrError covers the recovery path
-// the docs point operators at: fail a preview, then re-run `ib preview up`.
+// the docs point operators at: fail a preview, then re-run `bif preview up`.
 // EnsureNamespace MERGES annotations, so unless Up's entry write clears them
 // explicitly, the previous run's bifrost/error and bifrost/step survive into
 // the retry — and since the retry's own builds take minutes, the UI and the

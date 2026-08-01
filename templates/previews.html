@@ -65,7 +65,7 @@
       <span class="c-mut"{{if not .CreatedAt.IsZero}} title="{{abstime .CreatedAt}}"{{end}}>{{reltime .CreatedAt}}{{template "preview-expiry" .}}</span>
     </div>
     {{else}}
-    <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
+    <div class="jobs-empty c-faint">No preview environments. Create one with <code>bif preview up &lt;branch&gt;</code>.</div>
     {{end}}
   </div>
 
@@ -95,7 +95,7 @@
       {{end}}
     </div>
     {{else}}
-    <div class="jobs-empty c-faint">No preview environments. Create one with <code>ib preview up &lt;branch&gt;</code>.</div>
+    <div class="jobs-empty c-faint">No preview environments. Create one with <code>bif preview up &lt;branch&gt;</code>.</div>
     {{end}}
   </div>
 
@@ -270,7 +270,7 @@
      URL from data-refresh on <body> (here /partial/previews/{tag}, set by
      previewPage), swaps the response into #tab-body, and drops to the 4s
      cadence whenever a [data-active] is anywhere inside it — so a creating
-     preview narrates its steps here exactly as `ib preview up` does in a
+     preview narrates its steps here exactly as `bif preview up` does in a
      terminal, purely from the attribute below. Everything the tab already
      established, pointed at one tag.
 

@@ -4,7 +4,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := build
 
 # Where `go install` puts binaries: GOBIN if set, else GOPATH/bin. This is the
-# directory `make install` lands ib in, and the one that has to be on PATH.
+# directory `make install` lands bif in, and the one that has to be on PATH.
 GOBIN_DIR := $(shell go env GOBIN)
 ifeq ($(GOBIN_DIR),)
 GOBIN_DIR := $(shell go env GOPATH)/bin
@@ -26,11 +26,12 @@ build-bif:
 # directory: it already targets the one place Go tooling agrees is on PATH, so
 # there is nothing to configure and nothing to keep in sync.
 #
-# Naming it `bif` rather than `ib` is what makes installing this safe while the
-# port is unfinished. The Python `ib` (uv puts it in ~/.local/bin) still owns
-# `promote` and `preview`; a Go binary called `ib` would shadow it on PATH and
-# silently take those away, which you would discover during an incident. Two
-# names, no collision, both work.
+# The name `bif` rather than `ib` is a leftover from the port: while it was in
+# progress the Python `ib` still owned the commands not yet ported, and a Go
+# binary called `ib` would have shadowed it on PATH and silently taken those
+# away — the kind of thing you discover during an incident. The Python is
+# retired now, but the name stays: renaming it would break every script and
+# habit that has learned it, to save one character.
 install:
 	CGO_ENABLED=0 go install ./cmd/bif
 	@echo "installed bif to $(GOBIN_DIR)"

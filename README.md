@@ -31,16 +31,16 @@ there is **no CSS build step** and no Node toolchain.
 
 ## Preview environments
 
-Ephemeral, per-branch environments layered onto staging. `ib preview up
+Ephemeral, per-branch environments layered onto staging. `bif preview up
 <branch>` stands up namespace `preview-<tag>` (`<tag>` = a slug of the
 branch), containing only the services whose `internal/registry/registry.yaml`
 entry has a `preview:` block and whose repo has that branch pushed —
 everything else a preview app talks to resolves cross-namespace to shared
 staging.
 
-    ib preview list                     # table of preview environments
-    ib preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
-    ib preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
+    bif preview list                     # table of preview environments
+    bif preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
+    bif preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
 
 Lifecycle: membership by branch name -> each member's `{registry key}-preview-build`
 Cloud Build trigger runs (manual-only, no push trigger; named after the
@@ -112,11 +112,14 @@ the same fleet list (`internal/registry`), driven from a terminal instead of a b
 That directory has to be on your `PATH`; `make install` says so if it isn't.
 `make build-bif` drops a binary in the working directory instead.
 
-**Until `preview` is ported, this binary is a strict subset of the Python `ib`**
-(uv installs that one to `~/.local/bin/ib`), which still owns that command. The
-names differ precisely so both can be installed: a Go binary called `ib` would
-shadow the Python one on `PATH` and silently take `preview` away — the kind of
-thing you discover mid-incident.
+**`bif` is the only deploy CLI.** It replaces the Python `ib` (`infra/ib.py`),
+which is retired and no longer in the infra repo. The two names differ because
+they had to coexist during the port: a Go binary called `ib` would have shadowed
+the Python one on `PATH` and silently taken whatever wasn't ported yet away —
+the kind of thing you discover mid-incident. The name outlived the reason, and
+renaming it now would cost every muscle-memory and script that has since learned
+it. An `ib` still on your `PATH` is a leftover install of a script that no
+longer exists in any repo — remove it.
 
     bif status               # every service
     bif status <app>         # one service's staging and prod images
@@ -124,6 +127,12 @@ thing you discover mid-incident.
     bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
     bif promote <app>        # compare staging vs prod, then ask before promoting
     bif promote <app> -y     # promote without the prompt
+    bif preview list         # table of preview environments
+    bif preview up <branch>  # create/update, show progress, print URLs
+    bif preview down <tag>   # tear down (confirms unless -y/--yes)
+
+`preview` takes `--ttl <duration>`, `--auto-update` and `--no-wait`; see
+`docs/preview-environments.md`.
 
 Exit codes are a contract: `status` exits **1** only when a service is
 definitely out of sync, in every form, with or without `-q`. Mid-deploy, missing
@@ -134,30 +143,38 @@ staging rollout in flight) or when the patch fails; declining the prompt exits
 **0**, because nothing went wrong.
 
 `promote` writes one thing: a kustomize images override on the `<app>-prod`
-ArgoCD Application, which is what `ib promote` has always done. A staging image
-mismatch refuses — the artifact isn't settled, so promoting might ship the wrong
-one — while a prod mismatch only warns, since re-pinning prod is how a bad
+ArgoCD Application, which is what the retired `ib promote` always did. A staging
+image mismatch refuses — the artifact isn't settled, so promoting might ship the
+wrong one — while a prod mismatch only warns, since re-pinning prod is how a bad
 rollout gets corrected.
 
-`bif` reaches the cluster directly through client-go and never calls bifrost's
-API. That is deliberate and load-bearing: `bif promote bifrost` is how bifrost
-gets recovered when bifrost is down, so it cannot depend on bifrost being up.
-The service list is `go:embed`ed, so it needs no network either.
+`status` and `promote` reach the cluster directly through client-go and never
+call bifrost's API. That is deliberate and load-bearing: `bif promote bifrost` is
+how bifrost gets recovered when bifrost is down, so it cannot depend on bifrost
+being up. The service list is `go:embed`ed, so it needs no network either.
 
-`ib preview` is still `infra/ib.py`; `bif` says so rather than pretending it
-doesn't exist.
+`preview` is the one exception, and is an HTTP client of bifrost's API by
+design — the server owns preview orchestration, the cluster write credentials
+and the Neon/Cloud Build tokens, so there is nothing for the CLI to do locally.
+The split is enforced by `cmd/bif/main_test.go`'s `TestNoBifrostServerDependency`
+file by file, so no future `status` or `promote` change can quietly acquire the
+dependency.
 
-### Two deliberate differences from `ib.py`
+### Two deliberate differences from the retired `ib.py`
+
+`ib.py` is gone from the infra repo; both of these are behaviour changes the port
+made on purpose, recorded here because the old behaviour is what a long-time user
+expects.
 
 An **unparseable prod tag** (`latest`, `prod` — see "Unpinned prod" below) reads
 as *out of sync* here, where `ib.py`'s `status` called it indeterminate. Go is
-right: `ib.py`'s own `promote` promotes from that state, and calling it unknown
-is the bug behind bifrost#30. The visible cost is that `bif status -q` now prints
+right: `ib.py`'s own `promote` promoted from that state, and calling it unknown
+is the bug behind bifrost#30. The visible cost is that `bif status -q` prints
 the service and exits **1** where the Python printed nothing and exited **0**.
 
 The **kustomize override key** comes from the image that's running, not from the
-service's name. `ib.py` builds it as `<registry>/<app>`, so for a service whose
-image repository is named something else it writes an override matching nothing
+service's name. `ib.py` built it as `<registry>/<app>`, so for a service whose
+image repository is named something else it wrote an override matching nothing
 — kustomize ignores it, the promote reports success, and prod doesn't move.
 `footstrike-api` is exactly that service: its image path is still `fitness-api`.
 

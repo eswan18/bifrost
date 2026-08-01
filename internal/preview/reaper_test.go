@@ -324,7 +324,7 @@ func TestPurgeExpiredRechecksTheNamespaceBeforeTearingItDown(t *testing.T) {
 }
 
 // TestPurgeExpiredSkipsAPreviewThatVanishedMidSweep is the other outcome of
-// that re-read: the namespace is simply gone (an operator's `ib preview down`
+// that re-read: the namespace is simply gone (an operator's `bif preview down`
 // landed while the sweep was working). Nothing to reclaim and nothing to
 // report — silence, not an error, and above all no Down, whose Neon half would
 // still have run against a preview bifrost no longer owns.
@@ -464,7 +464,7 @@ func assertPurged(t *testing.T, got []string, want ...string) {
 // TestPurgeOrphanedBranchesDeletesABranchWithNoNamespace is the base case: the
 // exact residue of a teardown that died between its namespace delete and its
 // Neon delete. Nothing else in bifrost can see this branch — it is absent from
-// ListNamespaces, so no expiry sweep and no `ib preview down` can name it.
+// ListNamespaces, so no expiry sweep and no `bif preview down` can name it.
 func TestPurgeOrphanedBranchesDeletesABranchWithNoNamespace(t *testing.T) {
 	d := newOrphanDeps()
 	d.addOrphan("gone")

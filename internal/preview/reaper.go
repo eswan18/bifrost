@@ -100,7 +100,7 @@ func (o *Orchestrator) PurgeExpired(ctx context.Context, now time.Time) ([]strin
 		// one is the fast path and the documented rule; Down's own acquire is
 		// what actually makes it race-free, and the ErrBusy arm below is how
 		// its verdict comes back when a tag goes busy in the window between
-		// here and there (an operator's own `ib preview down` landing in
+		// here and there (an operator's own `bif preview down` landing in
 		// between). Neither is dead code, and no test can tell them apart —
 		// their observable behavior is identical by construction.
 		if o.Busy(tag) {
@@ -177,7 +177,7 @@ func (o *Orchestrator) PurgeExpired(ctx context.Context, now time.Time) ([]strin
 // more waiting for pods, under a 30-minute API-layer ceiling. A bound short
 // enough to be useful is a bound that eventually deletes a live create, which
 // is the one outcome this whole design refuses. A wedged creating preview is
-// visible as such in the UI and `ib preview list`, and `ib preview down`
+// visible as such in the UI and `bif preview list`, and `bif preview down`
 // tears it down on demand (teardown does not consult the phase at all), so
 // the manual path is short. Recorded as a known limitation, not an oversight.
 func reclaimable(ns kube.NamespaceInfo, now time.Time) (time.Time, bool) {
@@ -236,7 +236,7 @@ const minOrphanAge = time.Hour
 // interruption in between — the process exiting on a spot-node preemption,
 // sweepBudget expiring mid-teardown — leaves a branch that nothing can ever
 // find again: the preview is gone from ListNamespaces, so no later expiry
-// sweep and no repeat `ib preview down` can name it, and what's left is a paid,
+// sweep and no repeat `bif preview down` can name it, and what's left is a paid,
 // invisible database. Reclaiming from the Neon side (rather than reversing
 // Down's order) avoids ever having a window where a preview's pods run against
 // a database that has already been deleted.
@@ -254,7 +254,7 @@ const minOrphanAge = time.Hour
 //     branch bifrost didn't name is not bifrost's to delete.
 //   - a tag that still has a namespace, Terminating included. A Terminating
 //     namespace still exists, so the preview is still visible to the expiry
-//     sweep and to `ib preview down`; its branch isn't orphaned.
+//     sweep and to `bif preview down`; its branch isn't orphaned.
 //   - a Busy tag: an Up or Down holds it, so a missing namespace means a
 //     teardown in flight — Down sitting between its two halves — rather than
 //     one that died.

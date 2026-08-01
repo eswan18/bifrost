@@ -8,7 +8,7 @@ registry.yaml` in `internal/registry/registry.go`), not read from disk at
 runtime, so a merged entry only takes effect through bifrost's normal
 deploy lifecycle: bifrost's own CI builds a new image from the merged
 commit, staging picks it up automatically via ArgoCD Image Updater, and
-prod picks it up once someone runs `ib promote bifrost`. Restarting a
+prod picks it up once someone runs `bif promote bifrost`. Restarting a
 *live* pod on an unchanged image does nothing — it comes back up with the
 same embedded (old) registry. Everything else — the app's own CI, its
 Kubernetes manifests, its GCP identity/secrets, and its ArgoCD
@@ -50,14 +50,14 @@ types:
   `urls:` block) empty for a service with no ingress on that environment —
   `comms`, a background worker, has neither.
 - **`preview`** (optional, entirely separate concern) — present only if the
-  service should be part of `ib preview up`. See
+  service should be part of `bif preview up`. See
   [`docs/preview-environments.md`](preview-environments.md) for its
   `neon`/`env`/`required`/`migrate` fields and the env-template resolution
   cascade; a service with no `preview:` block simply isn't a preview
   candidate, and everything above still works without it.
 
 That's it on bifrost's side. Once a new image carrying this entry is
-running — staging automatically, prod after `ib promote bifrost` — the
+running — staging automatically, prod after `bif promote bifrost` — the
 service appears in the Apps tab (`Registry.Names()` drives that list
 directly) and in the Jobs tab, reading `<name>-staging`/`<name>-prod` — even
 before any of the infrastructure below exists, just with pods/images showing
@@ -140,10 +140,23 @@ migrations at startup doesn't need the key. An app that neither runs nor
 verifies them will start happily against the wrong schema, which is worse than
 crash-looping — set `migrate:` for that case too.
 
-## Gotcha: `ib.py`'s own service list
+## Gotcha: the CLI has its own copy of this file
 
-`ib.py`, the CLI wrapping bifrost's preview API, keeps its own hard-coded
-service list independent of this registry — deliberately, since it has to
-keep working when bifrost itself is down. Adding a service here does **not**
-update `ib.py`; if the new service needs `ib preview`/`ib promote` support,
-that list needs a separate, manual edit in `ib.py`'s own repo.
+The deploy CLI used to be `infra/ib.py`, which kept a hard-coded `SERVICES`
+list independent of this registry — deliberately, since it has to keep working
+when bifrost itself is down, but it meant onboarding a service took a second,
+manual edit in another repo. That list is gone: `ib.py` is retired and the CLI
+is now `cmd/bif` in this repo, reading the same `//go:embed`ed
+`registry.yaml`, which needs no network and so keeps the bifrost-is-down
+property without the duplicate.
+
+What survives is weaker but real: **`bif` carries the registry that was
+embedded when its binary was built.** So a newly added service isn't known to
+`bif status`/`bif promote` — `validateApp` refuses it as an unknown service —
+until you rebuild from a commit containing the entry (`make install`). That is
+the same embedding caveat as the deployed bifrost above, applied to whatever
+binary is on your `PATH` rather than to the one in the cluster.
+
+`bif preview up` is unaffected: it never checks the name against the registry,
+and preview membership is resolved by prod bifrost, so it depends on the
+*deployed* bifrost carrying the entry, not on your local binary.

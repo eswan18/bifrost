@@ -1,6 +1,6 @@
 # Preview environments
 
-Ephemeral, per-branch environments overlaid on staging: `ib preview up <branch>`
+Ephemeral, per-branch environments overlaid on staging: `bif preview up <branch>`
 stands up namespace `preview-<tag>` (`<tag>` = a slug of the branch name — see
 "Branch → tag" below, including what happens when two branches slug to the
 same one),
@@ -16,21 +16,22 @@ previewable app" below) is the whole path to making an already-onboarded app
 previewable; nothing else in bifrost's Go code changes.
 
 ```
-ib preview list                     # table of preview environments
-ib preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
-ib preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
+bif preview list                     # table of preview environments
+bif preview up <branch> [--no-wait]  # create/update, poll to ready, print URLs
+bif preview down <tag> [-y/--yes]    # tear down (confirms unless -y)
 ```
 
 ## Where it runs
 
 Prod bifrost is the single orchestrator (`internal/preview/orchestrator.go`'s
-`Orchestrator.Up`/`Down`) — `ib.py` is a thin HTTP client of bifrost's API, no
-preview logic lives in `ib.py` itself. It authenticates with a static bearer
-token (Secret Manager secret `bifrost_prod_preview_api_token`) against:
+`Orchestrator.Up`/`Down`) — `bif preview` (`cmd/bif/preview.go`) is a thin HTTP
+client of bifrost's API, and no preview logic lives in the CLI itself. It
+authenticates with a static bearer token (Secret Manager secret
+`bifrost_prod_preview_api_token`) against:
 
 ```
 GET    /api/previews          # list
-GET    /api/previews/{tag}    # one preview's record — ib.py polls this from `up`
+GET    /api/previews/{tag}    # one preview's record — `bif` polls this from `up`
 POST   /api/previews          # {"branch": "...", "ttl": "8h", "autoUpdate": true}
                               #   -> create/update, returns {tag, phase}
 DELETE /api/previews/{tag}    # tear down
@@ -78,7 +79,7 @@ entirely for every preview that didn't opt in — a consumer must read a
 missing key as `false`.
 
 A tag mid-`Up`/`Down` is claimed by an in-memory busy set; a concurrent call
-for the same tag gets `409` (`ib.py`: "That preview is busy").
+for the same tag gets `409` (`bif`: "That preview is busy").
 
 `busy` (bool) reports that claim on the record itself. It's `omitempty`, so
 like `autoUpdate` it appears only as `"busy": true` and a missing key reads as
@@ -111,8 +112,8 @@ A tag can be claimed while **no namespace exists for it**, in both directions:
   the required-key pre-flight, before it creates the namespace at all.
 
 Because `list` and the Previews tab read namespaces, that state used to be
-completely invisible: `ib preview list` said "No preview environments" while
-`ib preview up` said "That preview is busy", and neither was the whole truth.
+completely invisible: `bif preview list` said "No preview environments" while
+`bif preview up` said "That preview is busy", and neither was the whole truth.
 So `GET /api/previews` **synthesizes** a record for every claimed tag that has
 no namespace behind it. It carries `"phase": "busy"` and `"busy": true`;
 `branch`, `apps` and `urls` are empty and `createdAt` is the zero time,
@@ -149,7 +150,7 @@ not produce a usable preview tag`).
 
 The tag names everything downstream: the namespace `preview-<tag>`, the Neon
 branch `preview-<tag>`, the hostnames `{app}-<tag>.preview.footstrike.run`,
-and the argument to `ib preview down <tag>`.
+and the argument to `bif preview down <tag>`.
 
 ### Two branches can derive the same tag
 
@@ -170,7 +171,7 @@ Before that refusal existed, the second `up` silently *adopted* the first
 preview: `EnsureNamespace` merges, so `bifrost/branch` was overwritten with
 the newcomer; the Neon branch is found by name, so the second branch inherited
 the first's database **and whatever migrations it had applied**; and one
-`ib preview down <tag>` destroyed both. No layer warned.
+`bif preview down <tag>` destroyed both. No layer warned.
 
 Two ways out, and which one is right is yours to decide — bifrost can't:
 
@@ -178,7 +179,7 @@ Two ways out, and which one is right is yours to decide — bifrost can't:
   For a truncation collision the change has to land inside the first 30
   characters; appending to the end of an already-too-long name changes
   nothing. For a folding collision, change more than the separator.
-- **tear the other preview down** — `ib preview down <tag>` — if it's finished
+- **tear the other preview down** — `bif preview down <tag>` — if it's finished
   with, then re-run `up`.
 
 The tag is deliberately **not** disambiguated with a hash of the branch name.
@@ -192,7 +193,7 @@ the note on `TagForBranch` in `internal/preview/tag.go`.
 **202**: `Up` runs in a background goroutine and the response has already
 been sent by the time the check runs, exactly as for `ErrTerminating`. The
 refusal is a `preview create failed` line in bifrost's logs, and the tag's own
-record is untouched — so `GET /api/previews/<tag>`, `ib preview list` and the
+record is untouched — so `GET /api/previews/<tag>`, `bif preview list` and the
 Previews tab all go on describing **the other branch's** preview, at whatever
 phase it was already in. A tag showing a `BRANCH` that isn't the one you just
 ran `up` for is the symptom.
@@ -236,7 +237,7 @@ ran `up` for is the symptom.
    A namespace carrying **no** `bifrost/branch` annotation at all also passes:
    absence isn't evidence of a collision (a preview predating the annotation,
    or one left by a partial or out-of-band run, looks exactly like this), and
-   refusing would strand it — nothing but a manual `ib preview down` could get
+   refusing would strand it — nothing but a manual `bif preview down` could get
    past the check again, including the re-run that would repair it. The
    `EnsureNamespace` immediately below writes the annotation, so the state
    heals itself.
@@ -252,7 +253,7 @@ ran `up` for is the symptom.
 
    It is a look-then-act and therefore **not** airtight: the namespace can
    enter `Terminating` in the instant after the read, or at any point during
-   the minutes that follow (an `ib preview down`, or a bare `kubectl delete`,
+   the minutes that follow (a `bif preview down`, or a bare `kubectl delete`,
    landing mid-create). Kubernetes offers no "create unless terminating"
    primitive to close that with, and the busy set only serializes bifrost's
    own `Up`/`Down`. What the check buys is the common case — recreate
@@ -459,7 +460,7 @@ ran `up` for is the symptom.
    preview never goes on displaying the last step it ran.
 
 `ready` therefore means "every member has running, ready pods", not merely
-"the manifests were accepted" — API consumers (`ib preview up`, the Previews
+"the manifests were accepted" — API consumers (`bif preview up`, the Previews
 tab) can treat it as "usable". This matters most for the `migrate`
 initContainer (see the registry's `migrate:` key below): a failed migration
 leaves a pod in `Init:CrashLoopBackOff` with the app container never
@@ -562,7 +563,7 @@ inside prod bifrost (`Orchestrator.RunReaper`, started in `cmd/bifrost/main.go`
 next to the signal-handling setup, gated on preview config being present)
 wakes every `previewReapInterval` (one hour) and calls `PurgeExpired`
 (`internal/preview/reaper.go`), which reclaims each past-due preview through
-the same `Orchestrator.Down` a manual `ib preview down` would use — namespace
+the same `Orchestrator.Down` a manual `bif preview down` would use — namespace
 and any Neon branch both go, and Down's own idempotency means a preview
 double-swept (e.g. by two `bifrost` replicas) is harmless.
 
@@ -622,7 +623,7 @@ For each preview namespace annotated `bifrost/auto-update: "true"`, one poll:
    from out of `bifrost/source-shas`;
 2. calls `BranchSHA` once per member;
 3. if **any** member's branch SHA differs from the recorded one, re-runs the
-   ordinary `Orchestrator.Up` — the same one `ib preview up` runs, so every
+   ordinary `Orchestrator.Up` — the same one `bif preview up` runs, so every
    member is re-applied and the Neon branch (with its data) is found rather
    than re-created. There is no partial update at the *deploy* level: `Up` is
    all-or-nothing.
@@ -668,7 +669,7 @@ One further skip **is** logged, at info: a member whose branch has been
 **deleted** from its repo (`ErrNoBranch`). Deleting the branch after a merge
 is the normal end of a preview's life rather than a failure, so it isn't
 reported as an error — but the preview then sits at whatever it last deployed
-until someone runs `ib preview down`, and the log line is the only notice of
+until someone runs `bif preview down`, and the log line is the only notice of
 that.
 
 **Every refresh is logged**, at info, with the tag, the branch, and which
@@ -698,18 +699,18 @@ renders exactly as it did before.
 - **A failed auto-update marks a previously-working preview `failed`.** The
   re-run is an ordinary `Up`, so any failure in it sets `bifrost/phase:
   failed` and a `bifrost/error` on a preview that was `ready` a moment ago —
-  nobody asked for that redeploy, and nobody is watching `ib preview up`
+  nobody asked for that redeploy, and nobody is watching `bif preview up`
   output when it happens. Nothing is torn down (no namespace delete, no Neon
   branch delete), and if the run failed before the apply stage the previous
   generation's pods are still running and still serving. Re-running
-  `ib preview up <branch>` is the recovery path, exactly as for any other
+  `bif preview up <branch>` is the recovery path, exactly as for any other
   failed preview.
 - **It does not notice membership *changes*.** The comparison only asks about
   the members already recorded on the namespace, so a repo that *newly* gained
   the branch won't be added to a running preview (nor will one that lost it be
   dropped — that member is instead reported as "branch is gone" and the whole
   preview stops updating). Changing a preview's membership needs a manual
-  `ib preview up <branch>` re-run, which re-resolves it from scratch.
+  `bif preview up <branch>` re-run, which re-resolves it from scratch.
 - **It doesn't extend an expiry**, so an auto-updating preview created with
   `--ttl 8h` is still reclaimed 8 hours after it was *created*, however many
   commits it has absorbed since.
@@ -726,7 +727,7 @@ the namespace first and the Neon branches second, so an interruption in between
 (the process exiting on a spot-node preemption; `sweepBudget` firing
 mid-teardown; a Neon API error) leaves a branch **nothing can ever find again**
 — the preview is gone from `ListNamespaces`, so no later expiry sweep and no
-repeat `ib preview down` can name it. What's left is billed and invisible. The
+repeat `bif preview down` can name it. What's left is billed and invisible. The
 fix reclaims from the Neon side rather than reversing `Down`'s order, which
 would trade this for a window where a preview's pods run against a database
 that has already been deleted.
@@ -944,7 +945,7 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   sitting there against somebody else's branch. Rename your branch or tear
   their preview down; see "Two branches can derive the same tag" above.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
-  by re-running `ib preview up <branch>` — safe, since every stage is
+  by re-running `bif preview up <branch>` — safe, since every stage is
   idempotent, and cheap, since a member whose commit already has an image
   isn't rebuilt (see step 4). A run that died *before* its builds finished
   recorded nothing, but it doesn't necessarily pay for them either: nothing
@@ -955,18 +956,18 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   flight" and skips it unconditionally — not merely defers it — so a preview
   whose `Up` died with the process (a spot-node preemption is the routine
   cause) sits at `creating` forever, however far past its `expiresAt`, until
-  a human intervenes. It's visible as such in the UI and `ib preview list`;
-  `ib preview down` (which doesn't consult phase at all) clears it either
+  a human intervenes. It's visible as such in the UI and `bif preview list`;
+  `bif preview down` (which doesn't consult phase at all) clears it either
   way.
 - **An auto-updating preview can go from `ready` to `failed` on its own.**
   Nobody ran a command; a teammate pushed a commit that doesn't build, and two
   minutes later the preview is `failed` with that build's error. See "What
   auto-update does not do" above for what survives (everything — nothing is
-  torn down) and how to recover (re-run `ib preview up`).
+  torn down) and how to recover (re-run `bif preview up`).
 - **Expiry is strictly opt-in.** A preview created without a `ttl` never
   expires — there's no implicit default — so most previews, including every
   one that predates this feature, simply carry no `bifrost/expires-at` and
-  sit until someone runs `ib preview down`.
+  sit until someone runs `bif preview down`.
 - **A preview can outlive its recorded expiry by up to an hour.** The sweep
   (`PurgeExpired`) runs once per `previewReapInterval` (an hour), and the
   first sweep after any bifrost start or restart is delayed a full interval
@@ -977,15 +978,15 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   and only the hourly orphan sweep will find it.** `Down` deletes the namespace
   first and the `preview-<tag>` Neon branches second. Once the namespace is gone
   the preview is no longer in `ListNamespaces`, so no expiry sweep can see it
-  and no `ib preview down` can name it — whatever the second half didn't finish
+  and no `bif preview down` can name it — whatever the second half didn't finish
   stays unfinished as far as *that* path is concerned. A Neon list/delete API
   error does it; so does the process exiting mid-teardown (`RunReaper` runs each
   sweep on a context detached from shutdown to narrow that window, but nothing
   waits on the goroutine, so a fast exit can still cut one short). What's left
-  behind is a live Neon branch: billed, and invisible to the UI, `ib preview
+  behind is a live Neon branch: billed, and invisible to the UI, `bif preview
   list` and bifrost generally, since all three list *namespaces*. Nor is there
   much of a signal — teardown runs in a background goroutine and `DELETE
-  /api/previews/{tag}` answers `202` before it starts, so `ib preview down`
+  /api/previews/{tag}` answers `202` before it starts, so `bif preview down`
   reports success either way. What closes the loop is `PurgeOrphanedBranches`
   (see "Orphaned Neon branches" above): it reclaims the branch from the Neon
   side on the next hourly tick, up to an hour later, and logs it. It is not
@@ -1044,7 +1045,7 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   ... -c migrate`) is where the actual cause lives. bifrost deliberately
   never fetches pod logs itself: unlike a pod *reason*, a log line can carry
   anything, including secrets, and `bifrost/error` is served over the API.
-  Fix the branch and re-run `ib preview up`; teardown (`ib preview down`) is
+  Fix the branch and re-run `bif preview up`; teardown (`bif preview down`) is
   unaffected either way.
 - **A `migrate:` key doesn't retroactively cover images built before the
   service's binary could run it.** Preview images are built from the

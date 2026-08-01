@@ -196,10 +196,10 @@ var quietDivergences = map[string]divergence{
 }
 
 // The out-of-sync hint is the one line where `bif status` deliberately does
-// not reproduce the oracle's bytes: ib.py names itself, and this names the
-// binary the reader is already running, because as of `bif promote` that hint
-// is true and `ib promote` is the one that is going away. Nothing else about
-// the line moves — same indent, same position, same following line.
+// not reproduce the oracle's bytes: ib.py named itself, and this names the
+// binary the reader is already running. `bif promote` is the implementation
+// and `ib promote` no longer exists. Nothing else about the line moves — same
+// indent, same position, same following line.
 const (
 	oraclePromoteHint = "  To promote: ib promote "
 	bifPromoteHint    = "  To promote: bif promote "
@@ -393,8 +393,8 @@ func TestUnparseableProdTagIsOutOfSync(t *testing.T) {
 
 // TestOutOfSyncHintNamesBif: the hint has to name a command that exists and
 // does the thing. It said `ib promote` while promote lived only in the Python;
-// now that `bif promote` is the implementation, pointing at `ib` would send an
-// operator to the CLI this one is replacing.
+// now that `bif promote` is the implementation and the Python is deleted,
+// pointing at `ib` would send an operator to a command that isn't there.
 func TestOutOfSyncHintNamesBif(t *testing.T) {
 	c := fleet(t)
 	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
@@ -430,7 +430,7 @@ func fleet(t *testing.T) *fakeCluster {
 }
 
 // TestExitCodesAllForms is the exit-status contract for every form of
-// `ib status`. The mapping is ib.py's and does not vary with -q: only a
+// `bif status`. The mapping is ib.py's and does not vary with -q: only a
 // definite out-of-sync exits 1.
 func TestExitCodesAllForms(t *testing.T) {
 	// state applies one service's cluster state onto an otherwise in-sync
@@ -465,41 +465,41 @@ func TestExitCodesAllForms(t *testing.T) {
 		t.Run(tc.state, func(t *testing.T) {
 			st := states[tc.state]
 
-			// Form 2: ib status <app>
+			// Form 2: bif status <app>
 			c := fleet(t)
 			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
 			if _, code := exec(t, c, "status", "bifrost"); code != tc.wantCode {
-				t.Errorf("`ib status bifrost` exit = %d, want %d", code, tc.wantCode)
+				t.Errorf("`bif status bifrost` exit = %d, want %d", code, tc.wantCode)
 			}
 
-			// Form 4: ib status <app> -q
+			// Form 4: bif status <app> -q
 			c = fleet(t)
 			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
 			out, code := exec(t, c, "status", "bifrost", "-q")
 			if code != tc.wantCode {
-				t.Errorf("`ib status bifrost -q` exit = %d, want %d", code, tc.wantCode)
+				t.Errorf("`bif status bifrost -q` exit = %d, want %d", code, tc.wantCode)
 			}
 			if out != tc.wantQuiet {
-				t.Errorf("`ib status bifrost -q` stdout = %q, want %q", out, tc.wantQuiet)
+				t.Errorf("`bif status bifrost -q` stdout = %q, want %q", out, tc.wantQuiet)
 			}
 
-			// Form 1: ib status (whole fleet; every other service in sync)
+			// Form 1: bif status (whole fleet; every other service in sync)
 			c = fleet(t)
 			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
 			if _, code := exec(t, c, "status"); code != tc.wantCode {
-				t.Errorf("`ib status` exit = %d, want %d", code, tc.wantCode)
+				t.Errorf("`bif status` exit = %d, want %d", code, tc.wantCode)
 			}
 
-			// Form 3: ib status -q. Only the interesting service prints, so
+			// Form 3: bif status -q. Only the interesting service prints, so
 			// the whole-fleet quiet output is exactly the one-service output.
 			c = fleet(t)
 			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
 			out, code = exec(t, c, "status", "-q")
 			if code != tc.wantCode {
-				t.Errorf("`ib status -q` exit = %d, want %d", code, tc.wantCode)
+				t.Errorf("`bif status -q` exit = %d, want %d", code, tc.wantCode)
 			}
 			if out != tc.wantQuiet {
-				t.Errorf("`ib status -q` stdout = %q, want %q", out, tc.wantQuiet)
+				t.Errorf("`bif status -q` stdout = %q, want %q", out, tc.wantQuiet)
 			}
 		})
 	}
@@ -646,7 +646,7 @@ func TestConnectFailureExitsNonZero(t *testing.T) {
 
 // TestJobPodsExcluded: a completed job pod keeps the image it ran with, which
 // would read as a permanent mid-deploy. kube.Images drops them and this
-// asserts `ib status` gets the benefit.
+// asserts `bif status` gets the benefit.
 func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
