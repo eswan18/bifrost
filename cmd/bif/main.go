@@ -9,6 +9,14 @@
 // fleet list needs no network. Nothing on those paths may grow a dependency on
 // bifrost's HTTP API, its bearer token, or its availability.
 //
+// The property is about that one server, not about the network. `bif status`
+// has always spoken HTTPS to the Kubernetes API, and it now also reads Cloud
+// Build through internal/gcb for the build column. Both are third parties
+// rather than the service being managed, and the build read is best-effort on
+// top of that: a bounded timeout, a column that degrades to "unavailable", and
+// no effect on the exit code. See main_test.go's
+// TestNoBifrostServerDependency.
+//
 // `bif preview` is the one exception, and is an HTTP client by design: the
 // server owns preview orchestration — the busy set, the cluster write
 // credentials, the Neon and Cloud Build tokens — so there is nothing there for
@@ -32,6 +40,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/registry"
 )
@@ -59,20 +68,21 @@ Usage:
 const argoNamespace = "argocd"
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialPreview))
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialBuilds, dialPreview))
 }
 
 // run is main with the process edges passed in — argv, the input and output
-// streams, the exit status as a return value, and the two connections as
+// streams, the exit status as a return value, and the three connections as
 // functions — so tests can drive whole commands end to end, including
-// promote's confirmation prompt.
+// promote's confirmation prompt, without any of them reaching a real service.
 //
-// The cluster and the preview API are separate parameters rather than one
-// bundle because they are separate privileges: everything reachable through
-// `connect` works with bifrost down, and nothing reachable through
-// `connectPreview` does. Only the preview branch below is handed the second
-// one.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectPreview func() previewAPI) int {
+// The three are separate parameters rather than one bundle because they are
+// three different relationships. `connect` is the cluster, and everything
+// reachable through it works with bifrost down. `connectBuilds` is Cloud
+// Build: a third party `bif status` reads for information, whose failure
+// degrades one column and nothing else (see fetchBuilds). `connectPreview` is
+// bifrost itself, which nothing but the preview branch below is handed.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectBuilds func(context.Context) (buildLister, error), connectPreview func() previewAPI) int {
 	if len(args) == 0 {
 		outln(stdout, usage)
 		return 1
@@ -81,8 +91,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	switch cmd := args[0]; cmd {
 	case "status":
 		// status gets the read-only view of the connection, not the one
-		// promote uses. See readOnly.
-		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect))
+		// promote uses. See readOnly. It is also the only command handed the
+		// Cloud Build connection: promote must not so much as be able to
+		// stall on a third party.
+		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect), connectBuilds)
 	case "promote":
 		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
 	case "preview":
@@ -114,14 +126,47 @@ func dialCluster() (promoter, error) {
 	return c, nil
 }
 
-// loadApps returns the fleet from the embedded registry, reporting a load
-// failure on stderr. go:embed means this needs no network, which is what lets
-// it retire ib.py's hand-maintained SERVICES without costing the
+// defaultGCPProject is the project whose Cloud Build history `bif status`
+// reads, overridable through GCP_PROJECT — the same variable bifrost's own
+// config reads, so an operator pointing the two at one project sets one name.
+// A constant default, like previewclient.DefaultBaseURL: one fleet, one
+// project, and requiring the variable would mean the build column silently
+// never appeared for anyone who hadn't heard of it.
+const defaultGCPProject = "ethans-services"
+
+// dialBuilds opens the Cloud Build client, using Application Default
+// Credentials (gcloud ADC locally). Its failure is not the command's failure:
+// statusCmd renders the column as unavailable and carries on, so an operator
+// with no gcloud login still gets the deployment status they came for.
+func dialBuilds(ctx context.Context) (buildLister, error) {
+	project := os.Getenv("GCP_PROJECT")
+	if project == "" {
+		project = defaultGCPProject
+	}
+	c, err := gcb.New(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// loadRegistry returns the embedded fleet registry, reporting a load failure
+// on stderr. go:embed means this needs no network, which is what lets it
+// retire ib.py's hand-maintained SERVICES without costing the
 // works-when-bifrost-is-down property.
-func loadApps(stderr io.Writer) ([]string, bool) {
+func loadRegistry(stderr io.Writer) (registry.Registry, bool) {
 	reg, err := registry.Load()
 	if err != nil {
 		outf(stderr, "Error: loading the service registry: %v\n", err)
+		return nil, false
+	}
+	return reg, true
+}
+
+// loadApps is loadRegistry for the callers that want only the names.
+func loadApps(stderr io.Writer) ([]string, bool) {
+	reg, ok := loadRegistry(stderr)
+	if !ok {
 		return nil, false
 	}
 	return reg.Names(), true

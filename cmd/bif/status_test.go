@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/oracle"
 	"github.com/eswan18/bifrost/internal/registry"
@@ -83,8 +86,66 @@ func exec(t *testing.T, cluster *fakeCluster, args ...string) (string, int) {
 func execStdin(t *testing.T, cluster *fakeCluster, stdin string, args ...string) (string, int) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, noPreview)
+	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, unreachableBuilds, noPreview)
 	return stdout.String(), code
+}
+
+// ---- fake Cloud Build ---------------------------------------------------
+
+// fakeBuilds serves LatestBuilds from a repo -> build map. It counts both the
+// dials and the calls, because "one API call for the whole fleet" is a
+// property no output assertion can see.
+//
+// The counters are mutex-guarded: the lookup runs on its own goroutine (see
+// fetchBuilds), and a test that reads them is a second one.
+type fakeBuilds struct {
+	byRepo  map[string]gcb.BuildStatus
+	dialErr error // no credentials, no project, ...
+	listErr error // the API answered with an error
+	hang    bool  // never answer; wait for the context instead
+
+	mu    sync.Mutex
+	dials int
+	calls int
+}
+
+func (f *fakeBuilds) dial(context.Context) (buildLister, error) {
+	f.mu.Lock()
+	f.dials++
+	f.mu.Unlock()
+	if f.dialErr != nil {
+		return nil, f.dialErr
+	}
+	return f, nil
+}
+
+func (f *fakeBuilds) LatestBuilds(ctx context.Context) (map[string]gcb.BuildStatus, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.byRepo, nil
+}
+
+func (f *fakeBuilds) counts() (dials, calls int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dials, f.calls
+}
+
+// execBuilds is exec with a Cloud Build to talk to, and it returns stderr too
+// — where the build lookup's failures are reported, and where they must stay.
+func execBuilds(t *testing.T, cluster *fakeCluster, builds *fakeBuilds, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, noPreview)
+	return out.String(), errb.String(), code
 }
 
 // ---- the oracle fixtures ------------------------------------------------
@@ -212,11 +273,48 @@ func retargetPromoteHint(oracleStdout string) string {
 	return strings.ReplaceAll(oracleStdout, oraclePromoteHint, bifPromoteHint)
 }
 
+// unknownBuild is the build cell for tests that are not about the build
+// column: Cloud Build was not reachable, which is the state every one of them
+// runs its cluster assertions in.
+var unknownBuild = buildCell{}
+
+// buildLinePrefix is the build cell's label as writeCell renders it — the
+// padding included, since lining up under "prod:" is the point of it.
+const buildLinePrefix = "  build:   "
+
+// stripBuildLine removes the build line from `bif status` output and fails if
+// there is not exactly one.
+//
+// The oracle predates the build column by an entire tool, so its captured
+// output cannot contain one, and the golden comparison below would otherwise
+// have to be weakened to a "contains". Requiring exactly one before removing
+// it turns the strip into an assertion of its own: every oracle row — every
+// cluster state ib.py was ever captured against, in sync, mid-deploy, no pods
+// — now also proves the build line is rendered there, exactly once.
+func stripBuildLine(t *testing.T, out string) string {
+	t.Helper()
+	lines := strings.Split(out, "\n")
+	kept := make([]string, 0, len(lines))
+	found := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, buildLinePrefix) {
+			found++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if found != 1 {
+		t.Fatalf("output has %d lines starting %q, want exactly 1:\n%s", found, buildLinePrefix, out)
+	}
+	return strings.Join(kept, "\n")
+}
+
 // TestStatusRenderingMatchesOracle is the golden comparison: for every cluster
 // state ib.py was captured against, `bif status` must print exactly what ib.py
 // printed and return the same verdict — byte for byte, including the table
-// alignment, the blank lines and the ⚠/✓/✗ glyphs. The single exception is the
-// promote hint; see retargetPromoteHint.
+// alignment, the blank lines and the ⚠/✓/✗ glyphs. The exceptions are the
+// promote hint (see retargetPromoteHint) and the build line, which ib.py had
+// no notion of (see stripBuildLine).
 func TestStatusRenderingMatchesOracle(t *testing.T) {
 	rows, err := oracle.Load[statusRow]("status.json")
 	if err != nil {
@@ -243,6 +341,10 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 		stdout      func(statusRow) string
 		ret         func(statusRow) *bool
 		divergences map[string]divergence
+		// got normalizes what bif printed before it is compared to ib.py's
+		// bytes. Verbose strips the build line, which ib.py could not have
+		// printed; quiet has no build line to strip. See stripBuildLine.
+		got func(*testing.T, string) string
 	}{
 		{
 			name:        "verbose",
@@ -250,6 +352,7 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 			stdout:      func(r statusRow) string { return retargetPromoteHint(r.VerboseStdout) },
 			ret:         func(r statusRow) *bool { return r.VerboseReturn },
 			divergences: verboseDivergences,
+			got:         stripBuildLine,
 		},
 		{
 			name:        "quiet",
@@ -257,13 +360,15 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 			stdout:      func(r statusRow) string { return r.QuietStdout },
 			ret:         func(r statusRow) *bool { return r.QuietReturn },
 			divergences: quietDivergences,
+			got:         func(_ *testing.T, out string) string { return out },
 		},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			for _, r := range rows {
 				t.Run(r.key(), func(t *testing.T) {
-					var buf bytes.Buffer
-					got := statusOne(&buf, r.App, r.StagingImages, r.ProdImages, mode.quiet)
+					var raw bytes.Buffer
+					got := statusOne(&raw, r.App, r.StagingImages, r.ProdImages, mode.quiet, unknownBuild)
+					buf := mode.got(t, raw.String())
 
 					wantStdout := mode.stdout(r)
 					wantVerdict := verdictFromOracle(mode.ret(r))
@@ -276,8 +381,8 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 							t.Fatalf("oracle changed: ib.py now prints %q / returns %v; divergence table records %q / %v",
 								wantStdout, wantVerdict, d.pythonStdout, d.pythonVerdict)
 						}
-						if buf.String() != d.goStdout {
-							t.Fatalf("known divergence changed:\n got %q\nwant %q\n(%s)", buf.String(), d.goStdout, d.why)
+						if buf != d.goStdout {
+							t.Fatalf("known divergence changed:\n got %q\nwant %q\n(%s)", buf, d.goStdout, d.why)
 						}
 						if got != d.goVerdict {
 							t.Fatalf("known divergence changed: verdict %v, was %v (%s)", got, d.goVerdict, d.why)
@@ -285,8 +390,8 @@ func TestStatusRenderingMatchesOracle(t *testing.T) {
 						return
 					}
 
-					if buf.String() != wantStdout {
-						t.Errorf("stdout mismatch\n got %q\nib.py %q", buf.String(), wantStdout)
+					if buf != wantStdout {
+						t.Errorf("stdout mismatch\n got %q\nib.py %q", buf, wantStdout)
 					}
 					if got != wantVerdict {
 						t.Errorf("verdict = %v, ib.py returned %v", got, wantVerdict)
@@ -342,7 +447,7 @@ func TestMidDeployKeepsTheOtherEnvironmentsTag(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			if v := statusOne(&buf, "bifrost", tc.staging, tc.prod, false); v != indeterminate {
+			if v := statusOne(&buf, "bifrost", tc.staging, tc.prod, false, unknownBuild); v != indeterminate {
 				t.Fatalf("verdict = %v, want indeterminate", v)
 			}
 			if !slices.Contains(strings.Split(buf.String(), "\n"), tc.wantLine) {
@@ -595,7 +700,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, noPreview)
+		}, unreachableBuilds, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -618,7 +723,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, noPreview)
+	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, noPreview)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
@@ -635,7 +740,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 func TestConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"status"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, noPreview)
+		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, noPreview)
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
@@ -651,7 +756,7 @@ func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
 	code := run(context.Background(), []string{"status", "bifrost", "-q"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return cluster, nil }, noPreview)
+		func() (promoter, error) { return cluster, nil }, unreachableBuilds, noPreview)
 	if stdout.String() != "" || code != 0 {
 		t.Errorf("stdout = %q, exit = %d; want in-sync (no output, 0) with the job pod ignored", stdout.String(), code)
 	}
@@ -679,4 +784,314 @@ func (jobCluster) ListPods(_ context.Context, ns string) ([]kube.PodInfo, error)
 		})
 	}
 	return pods, nil
+}
+
+// ---- the build column ---------------------------------------------------
+
+// TestBuildLabel is the wording, one state at a time. The shape is fixed —
+// glyph, SHA, state, time — so a whole-fleet run has a column of SHAs to scan
+// and one glyph per line to scan them by.
+func TestBuildLabel(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+
+	tests := []struct {
+		name string
+		cell buildCell
+		want string
+	}{
+		{
+			name: "in flight",
+			cell: known(gcb.BuildStatus{Status: "WORKING", SHA: "0ab11f2", StartTime: ago(2 * time.Minute)}),
+			want: "◌ 0ab11f2 building (2m)",
+		},
+		{
+			// Queued builds have no start time yet, so there is no elapsed
+			// time to print and inventing one ("0s") would read as stuck.
+			name: "queued, not yet started",
+			cell: known(gcb.BuildStatus{Status: "QUEUED", SHA: "0ab11f2"}),
+			want: "◌ 0ab11f2 queued",
+		},
+		{
+			name: "succeeded",
+			cell: known(gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: ago(3 * time.Hour)}),
+			want: "✓ 0ab11f2 succeeded 3h ago",
+		},
+		{
+			name: "failed",
+			cell: known(gcb.BuildStatus{Status: "FAILURE", SHA: "0ab11f2", FinishTime: ago(12 * time.Minute)}),
+			want: "✗ 0ab11f2 failed 12m ago",
+		},
+		{
+			name: "timed out is a failure too",
+			cell: known(gcb.BuildStatus{Status: "TIMEOUT", SHA: "0ab11f2", FinishTime: ago(30 * time.Hour)}),
+			want: "✗ 0ab11f2 failed 1d ago",
+		},
+		{
+			// CANCELLED is deliberate, so it is neither ✓ nor ✗ — see
+			// gcb.BuildStatus.Failed, which excludes it for the same reason.
+			name: "cancelled keeps its own name",
+			cell: known(gcb.BuildStatus{Status: "CANCELLED", SHA: "0ab11f2", FinishTime: ago(2 * 24 * time.Hour)}),
+			want: "· 0ab11f2 cancelled 2d ago",
+		},
+		{
+			name: "just finished",
+			cell: known(gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: ago(5 * time.Second)}),
+			want: "✓ 0ab11f2 succeeded just now",
+		},
+		{
+			// Cloud Build's clock and this machine's are not the same clock;
+			// a few seconds of skew must not print "-1s ago".
+			name: "future finish time from clock skew",
+			cell: known(gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(3 * time.Second)}),
+			want: "✓ 0ab11f2 succeeded just now",
+		},
+		{
+			name: "no recent build for this repo",
+			cell: known(gcb.BuildStatus{}),
+			want: "(no recent build)",
+		},
+		{
+			// The distinction the whole buildCell type exists for: Cloud Build
+			// saying "nothing" is not the same as not having asked it.
+			name: "Cloud Build could not be read",
+			cell: unknownBuild,
+			want: "(build status unavailable)",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildLabel(tc.cell, now); got != tc.want {
+				t.Errorf("buildLabel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// known wraps a build Cloud Build actually answered with.
+func known(b gcb.BuildStatus) buildCell { return buildCell{status: b, known: true} }
+
+// TestBuildColumnUsesTheRegistryRepoName is the trap this codebase has now
+// walked into three times: LatestBuilds keys on Cloud Build's REPO_NAME
+// substitution, which is the GitHub repo, NOT the registry key. asset-manager
+// lives in asset_manager, so a lookup by service name finds nothing for it —
+// and finds the right thing for the other six services, which is why it
+// survives review.
+//
+// Both directions are asserted. Keying the fake by the repo name must produce
+// the build; keying it by the service name must produce none, which is what
+// fails if RepoFor is dropped from the lookup.
+func TestBuildColumnUsesTheRegistryRepoName(t *testing.T) {
+	reg, err := registry.Load()
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	const svc = "asset-manager"
+	repo := reg.RepoFor(svc)
+	if repo == svc {
+		t.Fatalf("%s's repo no longer differs from its registry key; this test covers nothing until it is pointed at a service where they differ", svc)
+	}
+
+	build := gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)}
+
+	t.Run("keyed by repo name", func(t *testing.T) {
+		out, _, code := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{repo: build}}, "status", svc)
+		if want := buildLinePrefix + "✓ 0ab11f2 succeeded 3h ago\n"; !strings.Contains(out, want) {
+			t.Errorf("output is missing %q:\n%s", want, out)
+		}
+		if code != 0 {
+			t.Errorf("exit = %d, want 0", code)
+		}
+	})
+
+	t.Run("keyed by service name finds nothing", func(t *testing.T) {
+		out, _, _ := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{svc: build}}, "status", svc)
+		if want := buildLinePrefix + "(no recent build)\n"; !strings.Contains(out, want) {
+			t.Errorf("a build keyed by the service name must not be found (Cloud Build keys on %q):\n%s", repo, out)
+		}
+	})
+}
+
+// TestBuildColumnRendersInFlightAndCompleted drives the whole command for the
+// two states an operator actually looks for, and pins the build line's place
+// in the table: under prod, above the verdict.
+func TestBuildColumnRendersInFlightAndCompleted(t *testing.T) {
+	now := time.Now()
+	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{
+		"bifrost":  {Status: "WORKING", SHA: "0ab11f2", StartTime: now.Add(-2 * time.Minute)},
+		"identity": {Status: "FAILURE", SHA: "def5678", FinishTime: now.Add(-12 * time.Minute)},
+	}}
+
+	out, _, code := execBuilds(t, fleet(t), builds, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0: a build is not a verdict", code)
+	}
+
+	wantBlocks := []string{
+		"  staging: abc1234\n  prod:    abc1234\n  build:   ◌ 0ab11f2 building (2m)\n\n✓ In sync\n",
+		"  staging: abc1234\n  prod:    abc1234\n  build:   ✗ def5678 failed 12m ago\n\n✓ In sync\n",
+		// A service Cloud Build returned nothing for still gets a cell.
+		"  staging: abc1234\n  prod:    abc1234\n  build:   (no recent build)\n\n✓ In sync\n",
+	}
+	for _, want := range wantBlocks {
+		if !strings.Contains(out, want) {
+			t.Errorf("output is missing:\n%s\ngot:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildLookupIsOneCallForTheWholeFleet: LatestBuilds answers for every
+// repo at once, so the whole-fleet form must not turn into seven round trips
+// to Google — the shape that makes a status page slow enough to stop using.
+func TestBuildLookupIsOneCallForTheWholeFleet(t *testing.T) {
+	reg, err := registry.Load()
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Names()) < 2 {
+		t.Fatal("a one-service registry cannot tell one call from one per service")
+	}
+
+	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{}}
+	if _, _, code := execBuilds(t, fleet(t), builds, "status"); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if dials, calls := builds.counts(); dials != 1 || calls != 1 {
+		t.Errorf("dialled %d times and called LatestBuilds %d times for %d services; want 1 and 1", dials, calls, len(reg.Names()))
+	}
+}
+
+// TestQuietModeMakesNoBuildLookup: `bif status -q` is a scriptable contract —
+// bare app names, "*" for mid-deploy — so it gains no build text, and since
+// there is nothing to render there is nothing to ask for either. That is not
+// only tidiness: -q is what a script runs in a loop, and it stays exactly as
+// cheap and as offline as it was before the build column existed.
+func TestQuietModeMakesNoBuildLookup(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "-q"},
+		{"status", "bifrost", "-q"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			c := fleet(t)
+			c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+			builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{
+				"bifrost": {Status: "WORKING", SHA: "0ab11f2", StartTime: time.Now()},
+			}}
+
+			out, errOut, code := execBuilds(t, c, builds, args...)
+			if out != "bifrost\n" || code != 1 {
+				t.Errorf("stdout = %q, exit = %d; want %q and 1", out, code, "bifrost\n")
+			}
+			if errOut != "" {
+				t.Errorf("stderr = %q, want nothing: -q reports no build state, so it has none to fail at", errOut)
+			}
+			if dials, calls := builds.counts(); dials != 0 || calls != 0 {
+				t.Errorf("-q dialled Cloud Build %d times and called it %d times; want 0 and 0", dials, calls)
+			}
+		})
+	}
+}
+
+// TestBuildColumnFailuresLeaveStatusIntact is the best-effort property, which
+// is the whole reason this is safe to put on the incident path. `bif status`
+// is what you run when something is already wrong; Cloud Build being slow,
+// unreachable or unauthenticated must cost the build cell and nothing else —
+// not the table, not the verdict, not the exit code, and not the wait.
+func TestBuildColumnFailuresLeaveStatusIntact(t *testing.T) {
+	tests := []struct {
+		name    string
+		builds  *fakeBuilds
+		wantErr string // what stderr must name, so the degradation is diagnosable
+	}{
+		{
+			name:    "no credentials",
+			builds:  &fakeBuilds{dialErr: errors.New("could not find default credentials")},
+			wantErr: "could not find default credentials",
+		},
+		{
+			name:    "the API returns an error",
+			builds:  &fakeBuilds{listErr: errors.New("403 caller lacks cloudbuild.builds.list")},
+			wantErr: "cloudbuild.builds.list",
+		},
+		{
+			// Unreachable rather than refused: the failure mode a timeout
+			// exists for, and the one that would otherwise hang the command.
+			name:    "Cloud Build never answers",
+			builds:  &fakeBuilds{hang: true},
+			wantErr: "context deadline exceeded",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Shortened so the hang case proves the bound without waiting for
+			// it. The bound itself is what is under test; its value is a
+			// judgement call about incident latency, not a contract.
+			restore := buildLookupTimeout
+			buildLookupTimeout = 20 * time.Millisecond
+			t.Cleanup(func() { buildLookupTimeout = restore })
+
+			c := fleet(t)
+			c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+			done := make(chan struct{})
+			var out, errOut string
+			var code int
+			go func() {
+				defer close(done)
+				out, errOut, code = execBuilds(t, c, tc.builds, "status", "bifrost")
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("`bif status` did not return: a build lookup must never be able to hang the command")
+			}
+
+			// The deployment status is untouched, down to the promote hint.
+			for _, want := range []string{
+				"  staging: abc1234\n",
+				"  prod:    def5678\n",
+				"\n✗ Out of sync\n",
+				bifPromoteHint + "bifrost\n",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("output is missing %q:\n%s", want, out)
+				}
+			}
+			// The column says it does not know, rather than saying nothing or
+			// claiming there is no build.
+			if want := buildLinePrefix + "(build status unavailable)\n"; !strings.Contains(out, want) {
+				t.Errorf("output is missing %q:\n%s", want, out)
+			}
+			// Out of sync, because prod is behind staging — not because a
+			// build failed, and not because Cloud Build did.
+			if code != 1 {
+				t.Errorf("exit = %d, want 1 (the cluster's verdict, unchanged)", code)
+			}
+			if !strings.Contains(errOut, tc.wantErr) {
+				t.Errorf("stderr = %q, want it to name %q", errOut, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestFailedBuildIsNotAVerdict: the build column is information. A service
+// whose last build failed is still in sync if the images match — what is
+// deployed is what "in sync" means, and a red build is a statement about the
+// next deploy, not this one. Exiting 1 here would break every script that
+// treats `bif status` as "is there anything to promote?".
+func TestFailedBuildIsNotAVerdict(t *testing.T) {
+	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{
+		"bifrost": {Status: "FAILURE", SHA: "0ab11f2", FinishTime: time.Now().Add(-12 * time.Minute)},
+	}}
+
+	out, _, code := execBuilds(t, fleet(t), builds, "status", "bifrost")
+	if code != 0 {
+		t.Errorf("exit = %d, want 0: a failed build must not make an in-sync service out of sync", code)
+	}
+	if !strings.Contains(out, "\n✓ In sync\n") {
+		t.Errorf("verdict changed with the build state:\n%s", out)
+	}
+	if !strings.Contains(out, buildLinePrefix+"✗ 0ab11f2 failed 12m ago\n") {
+		t.Errorf("the failed build is not reported at all:\n%s", out)
+	}
 }

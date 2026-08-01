@@ -1352,7 +1352,7 @@ func TestPreviewUpEndToEndThroughRun(t *testing.T) {
 	f := newUp(t, &upScript{polls: []canned{ok(`{"tag":"feat-x","branch":"feat/x","phase":"creating","urls":{}}`)}})
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"preview", "up", "feat/x", "--no-wait"},
-		strings.NewReader(""), &stdout, &stderr, noCluster, f.dial())
+		strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, f.dial())
 
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 (stderr %q)", code, stderr.String())

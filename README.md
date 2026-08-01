@@ -142,6 +142,24 @@ yet. `promote` exits **1** when it refuses (no deployment on either side, a
 staging rollout in flight) or when the patch fails; declining the prompt exits
 **0**, because nothing went wrong.
 
+`bif status` and `bif status <app>` also show each service's most recent Cloud
+Build, under its prod tag:
+
+      staging: 0ab11f2
+      prod:    abc1234
+      build:   ◌ 0ab11f2 building (2m)
+
+`✓ <sha> succeeded 3h ago` / `✗ <sha> failed 12m ago` once it finishes. The
+column is **information, never a verdict**: a failed build does not make a
+service out of sync and never changes the exit code — what's deployed is what
+that word means. It is also best-effort. One API call covers the whole fleet,
+it is bounded by its own short timeout, and if Cloud Build is slow, unreachable
+or unauthenticated the cell reads `(build status unavailable)`, a note goes to
+stderr, and the rest of the output is exactly what it would have been. `bif
+status -q` is untouched: its output is a scriptable contract, so it renders no
+build text and makes no Cloud Build call at all. The project is `GCP_PROJECT`,
+defaulting to `ethans-services`.
+
 `promote` writes one thing: a kustomize images override on the `<app>-prod`
 ArgoCD Application, which is what the retired `ib promote` always did. A staging
 image mismatch refuses — the artifact isn't settled, so promoting might ship the
@@ -151,7 +169,10 @@ rollout gets corrected.
 `status` and `promote` reach the cluster directly through client-go and never
 call bifrost's API. That is deliberate and load-bearing: `bif promote bifrost` is
 how bifrost gets recovered when bifrost is down, so it cannot depend on bifrost
-being up. The service list is `go:embed`ed, so it needs no network either.
+being up. The service list is `go:embed`ed, so it needs no network either. The
+property is about that one server, not about the network — the Kubernetes API
+and Cloud Build are third parties, not the service being managed, and the Cloud
+Build read degrades to an unknown column rather than a failure.
 
 `preview` is the one exception, and is an HTTP client of bifrost's API by
 design — the server owns preview orchestration, the cluster write credentials
