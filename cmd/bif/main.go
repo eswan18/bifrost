@@ -54,6 +54,8 @@ Usage:
     bif status <app>         # Show current images for staging and prod
     bif status -q            # List out-of-sync services (* = mid-deploy)
     bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
+    bif status -a            # List everything noteworthy, and why (--attention)
+    bif status <app> -a      # Same, for one service
     bif promote <app>        # Compare staging vs prod, offer to promote
     bif promote <app> -y     # Promote without confirmation
     bif preview list                      # Table of preview environments, TTL remaining

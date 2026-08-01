@@ -125,6 +125,8 @@ longer exists in any repo — remove it.
     bif status <app>         # one service's staging and prod images
     bif status -q            # list out-of-sync services (* = mid-deploy)
     bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
+    bif status -a            # what needs attention, and why (--attention)
+    bif status <app> -a      # the same four checks, for one service
     bif promote <app>        # compare staging vs prod, then ask before promoting
     bif promote <app> -y     # promote without the prompt
     bif preview list         # table of preview environments
@@ -135,10 +137,11 @@ longer exists in any repo — remove it.
 `docs/preview-environments.md`.
 
 Exit codes are a contract: `status` exits **1** only when a service is
-definitely out of sync, in every form, with or without `-q`. Mid-deploy, missing
+definitely out of sync, in the default and `-q` forms alike. Mid-deploy, missing
 pods and an unreadable staging tag all exit **0** — a script asking "is there
 anything to promote?" gets "no", not an error, when the answer isn't knowable
-yet. `promote` exits **1** when it refuses (no deployment on either side, a
+yet. (`--attention` asks a broader question and has its own rules; see below.)
+`promote` exits **1** when it refuses (no deployment on either side, a
 staging rollout in flight) or when the patch fails; declining the prompt exits
 **0**, because nothing went wrong.
 
@@ -159,6 +162,63 @@ stderr, and the rest of the output is exactly what it would have been. `bif
 status -q` is untouched: its output is a scriptable contract, so it renders no
 build text and makes no Cloud Build call at all. The project is `GCP_PROJECT`,
 defaulting to `ethans-services`.
+
+### `bif status --attention`
+
+`-a` / `--attention` answers "what needs my attention?" — every service with
+something noteworthy, and what. One line per reason, each line naming its own
+service so it stands alone under `grep`:
+
+    bifrost   build 0ab11f2 succeeded 3d ago, staging still on abc1234
+    bifrost   staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)
+    comms     build 4f2a1b0 is building (3m)
+    identity  deploy in progress: staging is running 2 images (abc1234, def5678)
+
+Four conditions qualify: **staging and prod differ** (something to promote);
+**two or more distinct images inside one environment** (a deploy in progress —
+what `-q` marks with `*`); **a build running right now** (`QUEUED`/`PENDING`/
+`WORKING`); and **the newest successful build's SHA is not what staging is
+running**.
+
+That last one is the point of the mode. The other three are already visible
+somewhere — in the table, in `-q`, on the Apps tab — but a green build that
+never reached staging is visible nowhere, and it is the signature of a failure
+this fleet has actually hit: when ArgoCD's `github-eswan18-repocreds` PAT
+expires, the Applications go to `ComparisonError` and **syncs silently stop**.
+Builds keep going green, staging quietly stays behind, and `promote` appears to
+do nothing. It is *not* a duplicate of "staging and prod differ": that compares
+two environments to each other, this compares CI to staging, and they fail
+independently. When both fire, the stalled sync is listed first — it explains
+why the promote suggested under it would appear to do nothing.
+
+There is **no grace period** on it. Right after a push there is a brief window
+where the build is green and staging has not moved yet, and that state is
+worth being able to see rather than something to suppress — so it is reported,
+and the elapsed time in the line is what tells the two apart at a glance
+(`succeeded just now` versus `succeeded 3d ago`). The reader draws the
+conclusion. It does not fire when it cannot tell: no recent build, a build that
+failed or is still running, staging with no pods, staging on an unpinned
+mutable tag, or any staging image already on the build's commit (a half-finished
+rollout is a rollout, and reports itself as one).
+
+Exit **0** only when all four checks ran and nothing qualified — and it says so,
+`Nothing needs attention.`, rather than printing nothing. Exit **1** when
+something qualified, which makes it usable from cron (`bif status -a || notify`).
+
+**If the Cloud Build read fails, it does not claim an all-clear.** Two of the
+four checks are unknowable without build data, so the run says on *stdout* that
+they were skipped, prints whatever the two cluster-only checks found, and exits
+**1**. `0` is reserved for "I checked all four and the fleet is clean", because
+that is the only state in which this command's silence means anything. This is a
+deliberate departure from the build column's best-effort degradation below,
+which is right for `status` — whose answer comes from the cluster — and wrong
+here.
+
+`-a` and `-q` together are refused rather than resolved: they are two different
+answers to what stdout should be, and either winner silently takes something
+away — `-q`'s offline guarantee, or the mode that was asked for. `bif status
+<app> -a` is accepted and scoped to that one service; it costs the same single
+Cloud Build call, which answers for the whole fleet either way.
 
 `promote` writes one thing: a kustomize images override on the `<app>-prod`
 ArgoCD Application, which is what the retired `ib promote` always did. A staging
