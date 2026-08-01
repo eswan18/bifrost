@@ -12,6 +12,7 @@ import (
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/promote"
+	"github.com/eswan18/bifrost/internal/registry"
 )
 
 // podLister is the slice of kube.Client that `bif status` needs: pods, and
@@ -137,9 +138,21 @@ func exitCode(verdicts []verdict) int {
 	return 0
 }
 
-// statusCmd implements all four forms of `bif status`.
+// statusCmd implements every form of `bif status`.
 func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error)) int {
 	args, quiet := takeFlag(args, "-q", "--quiet")
+	args, attention := takeFlag(args, "-a", "--attention")
+
+	// -q and --attention are two different answers to "what should stdout be",
+	// and there is no sensible winner. Letting -q win would silently drop the
+	// mode the operator asked for; letting --attention win would break -q's
+	// scriptable contract AND its offline guarantee, since --attention cannot
+	// work without a Cloud Build read and -q deliberately makes none. So the
+	// combination is refused rather than resolved.
+	if quiet && attention {
+		outf(stderr, "Error: -q and --attention are different output modes; pass one or the other.\n")
+		return 1
+	}
 
 	// The service list comes from the embedded registry, not a constant. That
 	// is what retires ib.py's hand-maintained SERVICES, and it costs nothing
@@ -186,6 +199,10 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 			// on stderr so stdout stays what it was.
 			outf(stderr, "Warning: could not read Cloud Build status: %v\n", set.err)
 		}
+	}
+
+	if attention {
+		return attentionReport(ctx, stdout, stderr, cluster, reg, apps, set, time.Now())
 	}
 
 	verdicts := make([]verdict, 0, len(apps))
@@ -405,6 +422,256 @@ func elapsed(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
 	}
+}
+
+// ---- `bif status --attention` -------------------------------------------
+
+// attentionSkippedNote is what stdout says when the Cloud Build read failed.
+//
+// `bif status`'s build lookup is best-effort by design: the column degrades to
+// "(build status unavailable)" and everything else about the command is
+// unchanged. That is right for `status`, whose answer comes from the cluster,
+// and WRONG here. Two of --attention's four checks — a build running right
+// now, and a successful build staging never picked up — are unknowable without
+// build data, so a run that printed nothing and exited 0 would be claiming an
+// all-clear on a half-finished inspection. The entire value of this mode is
+// that silence can be trusted; one false all-clear during the one incident it
+// was built for costs more than every true one it will ever produce.
+//
+// So the skip is stated on STDOUT, not just stderr. The underlying error goes
+// to stderr where statusCmd already reports it, but an operator who ran
+// `bif status -a 2>/dev/null` must still not be able to read this output as
+// "nothing to do".
+const attentionSkippedNote = "! Cloud Build could not be read, so two of the four checks did not run:\n" +
+	"    whether a build is running now, and whether a successful build never reached staging.\n" +
+	"  This is NOT an all-clear."
+
+// attentionAllClear is the positive answer, printed only when all four checks
+// ran and none fired. It is a line rather than silence on purpose: this mode
+// exists to be trusted, so it always says which of its three outcomes it
+// reached — findings, all-clear, or checks skipped.
+const attentionAllClear = "Nothing needs attention."
+
+// attentionReport implements `bif status --attention` (and `-a`): every service
+// with something noteworthy, and what.
+//
+// Exit codes. 0 when every check ran and nothing qualified; 1 when something
+// did — the same two-valued contract as -q, which is what makes this usable as
+// a cron guard (`bif status -a || notify`). A failed build lookup also exits 1,
+// deliberately: 0 is reserved for "I checked all four conditions and the fleet
+// is clean", which is the only state in which silence means anything. A third
+// code for "could not check" was considered and rejected — every caller that
+// did not special-case it would fall back to treating it as attention-worthy,
+// which is the behaviour we want anyway, so the extra code would buy nothing
+// but a third thing to document and get wrong.
+//
+// An explicit app argument is ACCEPTED rather than rejected. `bif status
+// footstrike-api -a` asks the same four questions about one service, which is a
+// real thing to want — a per-service CI or cron guard, or a first look at the
+// service you already suspect. It composes exactly the way `bif status <app>
+// -q` does, it costs the same single LatestBuilds call (that call answers for
+// the whole fleet regardless), and refusing it would make one flag combination
+// an error for no reason a user could predict.
+func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podLister, reg registry.Registry, apps []string, set buildSet, now time.Time) int {
+	type line struct{ app, reason string }
+	var lines []line
+	width := 0
+	for _, app := range apps {
+		staging := normalize(deployedImages(ctx, cluster, stderr, app+"-staging"))
+		prod := normalize(deployedImages(ctx, cluster, stderr, app+"-prod"))
+		for _, reason := range attentionFor(app, staging, prod, set.cellFor(reg.RepoFor(app)), now) {
+			lines = append(lines, line{app: app, reason: reason})
+			width = max(width, len(app))
+		}
+	}
+
+	// One line per reason, each naming its own service, so every line stands
+	// alone: `bif status -a | grep bifrost` gets everything about bifrost, and
+	// `... | grep 'never reached staging'` gets the stalled syncs across the
+	// fleet. Continuation lines under a single service name would read more
+	// tidily and grep worse, and this output's job is to be acted on.
+	for _, l := range lines {
+		outf(stdout, "%-*s  %s\n", width, l.app, l.reason)
+	}
+
+	if !set.known {
+		outln(stdout, attentionSkippedNote)
+		return 1
+	}
+	if len(lines) == 0 {
+		outln(stdout, attentionAllClear)
+		return 0
+	}
+	return 1
+}
+
+// attentionFor returns every reason app is worth a human's attention right
+// now, or nil when there is none.
+//
+// Four conditions qualify. They are emitted in decreasing order of "this is
+// broken" rather than in any numbered order, because that is how the reader
+// wants them — a stalled sync explains why the promote listed under it will
+// appear to do nothing:
+//
+//   - STALLED SYNC — the newest build succeeded, and staging is not running it.
+//     This is the reason this mode exists; see stalledSyncReason.
+//   - Staging and prod differ: there is something to promote.
+//   - Two or more distinct images inside one environment: a deploy in progress.
+//     `bif status -q` already marks this with "*".
+//   - A build is running right now (QUEUED/PENDING/WORKING).
+//
+// The last three are each already visible somewhere — in `bif status`'s own
+// table, in -q's output, on the Apps tab. The stalled sync is visible NOWHERE,
+// and it is not a duplicate of "staging and prod differ" however much it may
+// look like one: that compares two environments to each other, this compares CI
+// to staging. They answer different questions and they fail independently.
+func attentionFor(app string, staging, prod []string, build buildCell, now time.Time) []string {
+	var reasons []string
+
+	if reason, ok := stalledSyncReason(staging, build, now); ok {
+		reasons = append(reasons, reason)
+	}
+
+	// promote.StatusOf is the same decision `bif status` and the server make,
+	// reused rather than re-derived: "staging and prod differ" has to mean here
+	// exactly what it means everywhere else, including the unpinned-prod case
+	// (bifrost#30) that reads as out of sync.
+	if status := promote.StatusOf(staging, prod); status.State == promote.OutOfSync {
+		reasons = append(reasons, fmt.Sprintf("staging and prod differ: staging %s, prod %s (bif promote %s)",
+			status.StagingTag, status.ProdTag, app))
+	}
+
+	// Both environments are checked, not just the one promote.StatusOf would
+	// have named: a prod rollout and a staging rollout are equally worth
+	// knowing about, and unlike -q's single "*" there is room to say which.
+	for _, env := range []struct {
+		name   string
+		images []string
+	}{{"staging", staging}, {"prod", prod}} {
+		if len(env.images) > 1 {
+			reasons = append(reasons, fmt.Sprintf("deploy in progress: %s is running %d images (%s)",
+				env.name, len(env.images), strings.Join(tagsOf(env.images), ", ")))
+		}
+	}
+
+	if build.known && build.status.InProgress() {
+		reasons = append(reasons, inFlightBuildReason(build.status, now))
+	}
+	return reasons
+}
+
+// stalledSyncReason implements the condition this whole mode was built for: the
+// most recent build SUCCEEDED, and staging is not running its SHA.
+//
+// DO NOT "simplify" this away as redundant with "staging and prod differ". It
+// is not. It detects a failure mode this fleet has actually hit and that
+// nothing else surfaces: when ArgoCD's github-eswan18-repocreds PAT expires,
+// the Applications go to ComparisonError and syncs SILENTLY STOP. Builds keep
+// going green, staging quietly stays on last week's image, and `bif promote`
+// reports success while prod never moves — because the write lands in the
+// Application and nothing ever reconciles it. A successful build whose SHA
+// never reached staging is the signature of that state, and it is the only
+// signal in this tool that points at it.
+//
+// There is deliberately NO grace period and no threshold. The window between a
+// build going green and image-updater moving staging is short and it is a state
+// worth being able to SEE — running this seconds after a push and being told
+// "nothing to see" would defeat the point. So the transient case is reported,
+// not suppressed, and made legible instead: the reason carries how long ago the
+// build finished, rendered by the same `ago` the build column uses, so
+//
+//	build abc1234 succeeded just now, staging still on def5678
+//
+// and
+//
+//	build abc1234 succeeded 3d ago, staging still on def5678
+//
+// look nothing alike at a glance. The reader draws the conclusion; the command
+// does not decide for them by hiding one of the two.
+//
+// What this does NOT fire on, because these are "cannot tell", not "fine":
+// Cloud Build unreadable (attentionSkippedNote says so out loud instead), no
+// recent build, a build that is running or failed rather than succeeded, a
+// staging with no pods, and a staging whose tags carry no parseable SHA (an
+// unpinned `latest`, whose content genuinely cannot be compared to a commit).
+func stalledSyncReason(staging []string, build buildCell, now time.Time) (string, bool) {
+	if !build.known {
+		return "", false
+	}
+	b := build.status
+	if b.Status != "SUCCESS" || b.SHA == "" {
+		return "", false
+	}
+
+	// comparable is the single "could we even tell?" guard, and it covers both
+	// absences at once: a staging with no pods contributes no tags, and a
+	// staging pinned to a mutable `latest` contributes tags with no commit in
+	// them. An explicit len(staging) == 0 above would be a second spelling of
+	// the first case and dead by the time it was read.
+	tags := tagsOf(staging)
+	comparable := false
+	for _, tag := range tags {
+		sha := promote.ExtractSHA(tag)
+		if sha == "" {
+			continue
+		}
+		comparable = true
+		// Any staging image on the build's commit means staging picked it up.
+		// Checking every image rather than requiring a single one is what keeps
+		// a rollout that is halfway to the new SHA from reading as stalled — it
+		// is mid-deploy, which is its own condition and says so itself.
+		if shaMatches(sha, b.SHA) {
+			return "", false
+		}
+	}
+	if !comparable {
+		return "", false
+	}
+
+	when := ago(b.FinishTime, now)
+	if when == "" {
+		// SUCCESS with no finish time is not a state Cloud Build produces, but
+		// the field is parsed from a string and a zero here must not render as
+		// "succeeded , staging still on ...".
+		when = "at an unknown time"
+	}
+	return fmt.Sprintf("build %s succeeded %s, staging still on %s", b.SHA, when, strings.Join(tags, ", ")), true
+}
+
+// inFlightBuildReason renders a build that is running right now. A queued build
+// has no start time yet, so it gets no elapsed time — the same distinction
+// buildLabel draws, for the same reason: an invented "0s" reads as stuck.
+func inFlightBuildReason(b gcb.BuildStatus, now time.Time) string {
+	what := "build " + b.SHA
+	if b.SHA == "" {
+		what = "a build"
+	}
+	if b.StartTime.IsZero() {
+		return what + " is queued"
+	}
+	return fmt.Sprintf("%s is building (%s)", what, elapsed(now.Sub(b.StartTime)))
+}
+
+// shaMatches reports whether a deployed tag's SHA and a build's SHORT_SHA name
+// the same commit. Both are abbreviations of one hash and are not guaranteed to
+// be abbreviated to the same length — Cloud Build's $SHORT_SHA is seven
+// characters, while promote.ExtractSHA accepts seven or more — so the shorter
+// being a PREFIX of the longer is the match. Anchored at the front, which is
+// what makes this a hash abbreviation rather than a substring search.
+func shaMatches(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
+}
+
+// tagsOf extracts the tag from each image ref, preserving order.
+func tagsOf(images []string) []string {
+	tags := make([]string, 0, len(images))
+	for _, img := range images {
+		tags = append(tags, promote.ExtractTag(img))
+	}
+	return tags
 }
 
 // normalize dedupes and sorts image refs. ib.py keeps them in a set and prints

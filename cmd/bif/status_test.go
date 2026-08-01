@@ -1095,3 +1095,485 @@ func TestFailedBuildIsNotAVerdict(t *testing.T) {
 		t.Errorf("the failed build is not reported at all:\n%s", out)
 	}
 }
+
+// ---- `bif status --attention` -------------------------------------------
+
+// attentionFleet is `fleet` with a Cloud Build to talk to: every service in
+// sync on abc1234, and only the repos named in builds have any build at all —
+// so a test can make exactly one service noteworthy and assert on the whole of
+// stdout rather than on a substring of it.
+func attentionFleet(t *testing.T, builds map[string]gcb.BuildStatus) (*fakeCluster, *fakeBuilds) {
+	t.Helper()
+	if builds == nil {
+		builds = map[string]gcb.BuildStatus{}
+	}
+	return fleet(t), &fakeBuilds{byRepo: builds}
+}
+
+// TestAttentionNamesEveryConditionAndItsReason drives the whole command once
+// per qualifying condition, with the rest of the fleet quiet, and pins both the
+// exit code and the exact line. A bare list of service names would not be
+// actionable, so the reason text is the contract, not decoration.
+func TestAttentionNamesEveryConditionAndItsReason(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name    string
+		images  map[string][]string // overrides onto an otherwise in-sync fleet
+		builds  map[string]gcb.BuildStatus
+		want    string
+		wantOne string // the condition this row exists for, named for the failure message
+	}{
+		{
+			name:    "staging and prod differ",
+			images:  map[string][]string{"bifrost-prod": {image("bifrost", "def5678")}},
+			want:    "bifrost  staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n",
+			wantOne: "condition 1: there is something to promote",
+		},
+		{
+			name: "two images in one environment",
+			images: map[string][]string{
+				"bifrost-staging": {image("bifrost", "abc1234"), image("bifrost", "def5678")},
+			},
+			want:    "bifrost  deploy in progress: staging is running 2 images (abc1234, def5678)\n",
+			wantOne: "condition 2: a deploy in progress, which -q marks with *",
+		},
+		{
+			name: "a deploy in progress in prod, not staging",
+			images: map[string][]string{
+				"bifrost-prod": {image("bifrost", "abc1234"), image("bifrost", "def5678")},
+			},
+			want:    "bifrost  deploy in progress: prod is running 2 images (abc1234, def5678)\n",
+			wantOne: "condition 2, on the environment -q's single * cannot distinguish",
+		},
+		{
+			name:    "a build is running",
+			builds:  map[string]gcb.BuildStatus{"bifrost": {Status: "WORKING", SHA: "0ab11f2", StartTime: now.Add(-2 * time.Minute)}},
+			want:    "bifrost  build 0ab11f2 is building (2m)\n",
+			wantOne: "condition 3: a build in flight",
+		},
+		{
+			// QUEUED has no start time yet, so there is no elapsed time to show.
+			name:    "a build is queued",
+			builds:  map[string]gcb.BuildStatus{"bifrost": {Status: "QUEUED", SHA: "0ab11f2"}},
+			want:    "bifrost  build 0ab11f2 is queued\n",
+			wantOne: "condition 3, before the build starts executing",
+		},
+		{
+			name:    "a successful build staging never picked up",
+			builds:  map[string]gcb.BuildStatus{"bifrost": {Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(-22 * time.Minute)}},
+			want:    "bifrost  build 0ab11f2 succeeded 22m ago, staging still on abc1234\n",
+			wantOne: "condition 4: the headline — a green build that never reached staging",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, builds := attentionFleet(t, tc.builds)
+			for ns, imgs := range tc.images {
+				c.images[ns] = imgs
+			}
+
+			out, _, code := execBuilds(t, c, builds, "status", "--attention")
+			if out != tc.want {
+				t.Errorf("stdout = %q, want %q (%s)", out, tc.want, tc.wantOne)
+			}
+			if code != 1 {
+				t.Errorf("exit = %d, want 1: something qualified (%s)", code, tc.wantOne)
+			}
+		})
+	}
+}
+
+// TestAttentionReportsAStalledSyncWithNoGracePeriod is the anti-threshold
+// assertion. A build that went green seconds ago and has not reached staging
+// yet is a state an operator explicitly wants to be able to SEE right after a
+// push — so it is reported, not suppressed, and the elapsed time in the line is
+// what tells a moment's lag apart from a sync that stopped days ago.
+//
+// If a grace period, threshold or "settle" delay is ever added to condition 4,
+// the "just now" row here fails.
+func TestAttentionReportsAStalledSyncWithNoGracePeriod(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		finished time.Duration
+		want     string
+	}{
+		{"seconds after the push", 0, "bifrost  build 0ab11f2 succeeded just now, staging still on abc1234\n"},
+		{"a minute after the push", 40 * time.Second, "bifrost  build 0ab11f2 succeeded just now, staging still on abc1234\n"},
+		{"ten minutes later", 10 * time.Minute, "bifrost  build 0ab11f2 succeeded 10m ago, staging still on abc1234\n"},
+		{"three days later", 3 * 24 * time.Hour, "bifrost  build 0ab11f2 succeeded 3d ago, staging still on abc1234\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+				"bifrost": {Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(-tc.finished)},
+			})
+			out, _, code := execBuilds(t, c, builds, "status", "--attention")
+			if out != tc.want {
+				t.Errorf("stdout = %q, want %q", out, tc.want)
+			}
+			if code != 1 {
+				t.Errorf("exit = %d, want 1", code)
+			}
+		})
+	}
+}
+
+// TestAttentionQuietWhenStagingHasTheBuild is the other half of condition 4:
+// the states it must NOT fire on. Firing on a healthy fleet is how this command
+// becomes one you learn to ignore, and an ignored command detects nothing.
+func TestAttentionQuietWhenStagingHasTheBuild(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name   string
+		images map[string][]string
+		build  gcb.BuildStatus
+		// want is the whole of stdout: the all-clear, unless some OTHER
+		// condition legitimately fires. What no row may produce is a stalled
+		// sync.
+		want     string
+		wantCode int
+		why      string
+	}{
+		{
+			name:  "staging is running the build",
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "abc1234", FinishTime: now.Add(-3 * time.Hour)},
+			why:   "the SHA reached staging; there is nothing stalled",
+		},
+		{
+			name: "staging is mid-rollout onto the build",
+			images: map[string][]string{
+				"bifrost-staging": {image("bifrost", "abc1234"), image("bifrost", "0ab11f2")},
+				"bifrost-prod":    {image("bifrost", "abc1234")},
+			},
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(-3 * time.Hour)},
+			// The rollout reports itself as a rollout — and as nothing else.
+			want:     "bifrost  deploy in progress: staging is running 2 images (0ab11f2, abc1234)\n",
+			wantCode: 1,
+			why:      "one of staging's images is the build, so the SHA did reach staging; it is rolling, not stuck",
+		},
+		{
+			name:  "the newest build failed",
+			build: gcb.BuildStatus{Status: "FAILURE", SHA: "0ab11f2", FinishTime: now.Add(-3 * time.Hour)},
+			why:   "a failed build was never going to reach staging; nothing is stuck",
+		},
+		{
+			name:  "the tag carries a longer abbreviation of the same commit",
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "abc1234", FinishTime: now.Add(-3 * time.Hour)},
+			images: map[string][]string{
+				"bifrost-staging": {image("bifrost", "abc12345678")},
+				"bifrost-prod":    {image("bifrost", "abc12345678")},
+			},
+			why: "SHORT_SHA and a tag's SHA are abbreviations of one hash, not necessarily to the same length",
+		},
+		{
+			name:   "staging has no pods to compare",
+			build:  gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(-3 * time.Hour)},
+			images: map[string][]string{"bifrost-staging": nil},
+			why:    "no pods is 'cannot tell', and `bif status` already calls that indeterminate",
+		},
+		{
+			name:  "staging is on an unpinned tag",
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: now.Add(-3 * time.Hour)},
+			images: map[string][]string{
+				"bifrost-staging": {image("bifrost", "latest")},
+				"bifrost-prod":    {image("bifrost", "latest")},
+			},
+			why: "a mutable tag's content cannot be compared to a commit",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, builds := attentionFleet(t, map[string]gcb.BuildStatus{"bifrost": tc.build})
+			for ns, imgs := range tc.images {
+				c.images[ns] = imgs
+			}
+			want := tc.want
+			if want == "" {
+				want = attentionAllClear + "\n"
+			}
+
+			out, _, code := execBuilds(t, c, builds, "status", "--attention")
+			if strings.Contains(out, "succeeded") {
+				t.Errorf("a stalled sync was reported but %s:\n%s", tc.why, out)
+			}
+			if code != tc.wantCode {
+				t.Errorf("exit = %d, want %d (%s):\n%s", code, tc.wantCode, tc.why, out)
+			}
+			if out != want {
+				t.Errorf("stdout = %q, want %q (%s)", out, want, tc.why)
+			}
+		})
+	}
+}
+
+// TestAttentionAllClearIsSaidOutLoud: the positive answer is a line, not
+// silence, so the reader can always tell "I checked and it is fine" from "I
+// could not check" and from "I did not run".
+func TestAttentionAllClearIsSaidOutLoud(t *testing.T) {
+	c, builds := attentionFleet(t, nil)
+	out, errOut, code := execBuilds(t, c, builds, "status", "--attention")
+	if out != attentionAllClear+"\n" {
+		t.Errorf("stdout = %q, want %q", out, attentionAllClear+"\n")
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if errOut != "" {
+		t.Errorf("stderr = %q, want nothing", errOut)
+	}
+}
+
+// TestAttentionBuildFailureIsNeverAnAllClear is the property that makes this
+// command worth trusting. Two of the four checks are unknowable without build
+// data, so a run that could not read Cloud Build must not print the all-clear
+// and must not exit 0 — that would be claiming a clean fleet on a half-finished
+// inspection, on the one command whose entire value is that its silence means
+// something.
+//
+// The skip is asserted on STDOUT, not merely stderr: `bif status -a
+// 2>/dev/null` must still be unreadable as "nothing to do".
+func TestAttentionBuildFailureIsNeverAnAllClear(t *testing.T) {
+	tests := []struct {
+		name    string
+		builds  *fakeBuilds
+		wantErr string
+	}{
+		{"no credentials", &fakeBuilds{dialErr: errors.New("could not find default credentials")}, "could not find default credentials"},
+		{"the API returns an error", &fakeBuilds{listErr: errors.New("403 caller lacks cloudbuild.builds.list")}, "cloudbuild.builds.list"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, code := execBuilds(t, fleet(t), tc.builds, "status", "--attention")
+
+			if code != 1 {
+				t.Errorf("exit = %d, want 1: two of four checks did not run, which is not 'fine'", code)
+			}
+			if strings.Contains(out, attentionAllClear) {
+				t.Errorf("stdout claims an all-clear it could not have established:\n%s", out)
+			}
+			if !strings.Contains(out, attentionSkippedNote) {
+				t.Errorf("stdout does not say the build checks were skipped:\n%s", out)
+			}
+			if !strings.Contains(errOut, tc.wantErr) {
+				t.Errorf("stderr = %q, want it to name %q", errOut, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestAttentionStillReportsClusterFindingsWhenBuildsAreUnreadable: the two
+// cluster-only conditions do not need Cloud Build, so they must still be
+// reported — degraded, but not blank. The skip note comes after them.
+func TestAttentionStillReportsClusterFindingsWhenBuildsAreUnreadable(t *testing.T) {
+	c := fleet(t)
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+	out, _, code := execBuilds(t, c, &fakeBuilds{dialErr: errors.New("no credentials")}, "status", "--attention")
+	want := "bifrost  staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n" + attentionSkippedNote + "\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+}
+
+// TestAttentionListsEveryReasonForOneService: a service can be noteworthy for
+// more than one reason at once, and the stalled sync leads — it is the one that
+// explains why the promote suggested under it would appear to do nothing.
+func TestAttentionListsEveryReasonForOneService(t *testing.T) {
+	c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+		"bifrost": {Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)},
+	})
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+	out, _, code := execBuilds(t, c, builds, "status", "--attention")
+	want := "bifrost  build 0ab11f2 succeeded 3h ago, staging still on abc1234\n" +
+		"bifrost  staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+}
+
+// TestAttentionListsEveryQualifyingService: this is a list, not a first hit,
+// and every line names its own service so each one stands alone under grep.
+func TestAttentionListsEveryQualifyingService(t *testing.T) {
+	c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+		"comms": {Status: "WORKING", SHA: "4f2a1b0", StartTime: time.Now().Add(-3 * time.Minute)},
+	})
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+	c.images["identity-staging"] = []string{image("identity", "abc1234"), image("identity", "def5678")}
+
+	out, _, code := execBuilds(t, c, builds, "status", "--attention")
+	// Registry order is alphabetical, and the service column is padded to the
+	// widest name that actually appears.
+	want := "bifrost   staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n" +
+		"comms     build 4f2a1b0 is building (3m)\n" +
+		"identity  deploy in progress: staging is running 2 images (abc1234, def5678)\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+}
+
+// TestAttentionUsesTheRegistryRepoName is the trap this codebase has now walked
+// into three times, asserted for the new build-based checks: LatestBuilds keys
+// on Cloud Build's REPO_NAME, which is the GitHub repo and NOT the registry
+// key. asset-manager lives in asset_manager, so a lookup by service name finds
+// nothing for it — and finds the right thing for the other six, which is
+// exactly why it survives review.
+//
+// Both directions are asserted: keyed by the repo the stalled sync is found,
+// keyed by the service name the command wrongly reports an all-clear.
+func TestAttentionUsesTheRegistryRepoName(t *testing.T) {
+	reg, err := registry.Load()
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	const svc = "asset-manager"
+	repo := reg.RepoFor(svc)
+	if repo == svc {
+		t.Fatalf("%s's repo no longer differs from its registry key; this test covers nothing until it is pointed at a service where they differ", svc)
+	}
+	build := gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)}
+
+	t.Run("keyed by repo name", func(t *testing.T) {
+		c, builds := attentionFleet(t, map[string]gcb.BuildStatus{repo: build})
+		out, _, code := execBuilds(t, c, builds, "status", "--attention")
+		want := "asset-manager  build 0ab11f2 succeeded 3h ago, staging still on abc1234\n"
+		if out != want {
+			t.Errorf("stdout = %q, want %q", out, want)
+		}
+		if code != 1 {
+			t.Errorf("exit = %d, want 1", code)
+		}
+	})
+
+	t.Run("keyed by service name finds nothing", func(t *testing.T) {
+		c, builds := attentionFleet(t, map[string]gcb.BuildStatus{svc: build})
+		out, _, code := execBuilds(t, c, builds, "status", "--attention")
+		if out != attentionAllClear+"\n" || code != 0 {
+			t.Errorf("a build keyed by the service name must not be found (Cloud Build keys on %q); stdout = %q, exit = %d", repo, out, code)
+		}
+	})
+}
+
+// TestAttentionIsOneBuildCallForTheWholeFleet: --attention needs build data for
+// every service, and LatestBuilds answers for every repo at once. Seven round
+// trips to Google is the shape that makes a command slow enough to stop
+// running from cron.
+func TestAttentionIsOneBuildCallForTheWholeFleet(t *testing.T) {
+	reg, err := registry.Load()
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	if len(reg.Names()) < 2 {
+		t.Fatal("a one-service registry cannot tell one call from one per service")
+	}
+
+	c, builds := attentionFleet(t, nil)
+	if _, _, code := execBuilds(t, c, builds, "status", "--attention"); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if dials, calls := builds.counts(); dials != 1 || calls != 1 {
+		t.Errorf("dialled %d times and called LatestBuilds %d times for %d services; want 1 and 1", dials, calls, len(reg.Names()))
+	}
+}
+
+// TestAttentionFlagAcceptedAnywhere: -a and --attention are the same flag, and
+// like -q they may appear before or after the service name.
+func TestAttentionFlagAcceptedAnywhere(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "-a"},
+		{"status", "--attention"},
+		{"status", "bifrost", "-a"},
+		{"status", "-a", "bifrost"},
+		{"status", "bifrost", "--attention"},
+		{"status", "--attention", "bifrost"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			c, builds := attentionFleet(t, nil)
+			c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+			out, _, code := execBuilds(t, c, builds, args...)
+			want := "bifrost  staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n"
+			if out != want {
+				t.Errorf("stdout = %q, want %q", out, want)
+			}
+			if code != 1 {
+				t.Errorf("exit = %d, want 1", code)
+			}
+		})
+	}
+}
+
+// TestAttentionWithAnAppIsScopedToThatApp: the combination is accepted, not
+// rejected — the same four questions about one service is a real thing to want
+// — and it must answer for that service ALONE, or it is just the fleet form
+// with extra typing.
+func TestAttentionWithAnAppIsScopedToThatApp(t *testing.T) {
+	c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+		"identity": {Status: "WORKING", SHA: "4f2a1b0", StartTime: time.Now().Add(-3 * time.Minute)},
+	})
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+
+	// identity is noteworthy too, and must not appear.
+	out, _, code := execBuilds(t, c, builds, "status", "bifrost", "-a")
+	want := "bifrost  staging and prod differ: staging abc1234, prod def5678 (bif promote bifrost)\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+
+	// And a quiet service scoped to itself is a real all-clear, exit 0, even
+	// though the fleet as a whole is not clean.
+	c2, builds2 := attentionFleet(t, nil)
+	c2.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+	out, _, code = execBuilds(t, c2, builds2, "status", "comms", "-a")
+	if out != attentionAllClear+"\n" || code != 0 {
+		t.Errorf("stdout = %q, exit = %d; want the all-clear and 0", out, code)
+	}
+}
+
+// TestAttentionAndQuietAreRefusedTogether: they are two different answers to
+// "what should stdout be", with no sensible winner. Resolving it either way
+// would silently take something away — -q's offline guarantee, or the mode the
+// operator actually asked for — so the combination is an error, and it is one
+// diagnosed on argv alone, before anything is dialled.
+func TestAttentionAndQuietAreRefusedTogether(t *testing.T) {
+	for _, args := range [][]string{
+		{"status", "-q", "-a"},
+		{"status", "-a", "-q"},
+		{"status", "bifrost", "--quiet", "--attention"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			c, builds := attentionFleet(t, nil)
+			out, errOut, code := execBuilds(t, c, builds, args...)
+			if code != 1 {
+				t.Errorf("exit = %d, want 1", code)
+			}
+			if out != "" {
+				t.Errorf("stdout = %q, want nothing", out)
+			}
+			if !strings.Contains(errOut, "-q") || !strings.Contains(errOut, "--attention") {
+				t.Errorf("stderr = %q, want it to name both flags", errOut)
+			}
+			if dials, calls := builds.counts(); dials != 0 || calls != 0 {
+				t.Errorf("dialled Cloud Build %d times and called it %d times before rejecting the invocation; want 0 and 0", dials, calls)
+			}
+			if len(c.calls) != 0 {
+				t.Errorf("read %v before rejecting the invocation; want nothing", c.calls)
+			}
+		})
+	}
+}
