@@ -103,7 +103,11 @@ func TestLoad(t *testing.T) {
 		if svc.Preview.Neon == nil {
 			t.Fatal("Preview.Neon = nil, want non-nil")
 		}
-		wantNeon := NeonRef{Project: "aged-river-81935268", Database: "neondb", Role: "neondb_owner"}
+		// Parent is footstrike-api's STAGING branch, not this project's Neon
+		// default (`production`). Previews are cut from it so they don't
+		// clone production data onto a schema that lags staging; see the
+		// comment on this key in registry.yaml.
+		wantNeon := NeonRef{Project: "aged-river-81935268", Database: "neondb", Role: "neondb_owner", Parent: "development"}
 		if *svc.Preview.Neon != wantNeon {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
 		}
@@ -170,7 +174,9 @@ func TestLoad(t *testing.T) {
 		if svc.Preview == nil {
 			t.Fatal("Preview = nil, want non-nil")
 		}
-		wantNeon := NeonRef{Project: "plain-heart-27630935", Database: "neondb", Role: "app"}
+		// Same reasoning as footstrike-api's above: identity's staging
+		// branch, not its Neon default (`production`).
+		wantNeon := NeonRef{Project: "plain-heart-27630935", Database: "neondb", Role: "app", Parent: "development"}
 		if *svc.Preview.Neon != wantNeon {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
 		}
@@ -301,6 +307,70 @@ foo:
 		}
 		if reg["foo"].Preview.Migrate != nil {
 			t.Errorf("Preview.Migrate = %v, want nil (not declared)", reg["foo"].Preview.Migrate)
+		}
+	})
+
+	t.Run("neon parent parses as a branch name", func(t *testing.T) {
+		// A NAME, not an ID: registry.yaml is hand-edited and reviewed in a
+		// diff, where `br-solitary-sun-ad74wwhf` would be unverifiable. The
+		// name is resolved against the project's live branch list at
+		// branch-creation time (internal/preview.ensureNeonBranch).
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: owner
+      parent: development
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := NeonRef{Project: "proj-1", Database: "db", Role: "owner", Parent: "development"}
+		if *reg["foo"].Preview.Neon != want {
+			t.Errorf("Preview.Neon = %+v, want %+v", *reg["foo"].Preview.Neon, want)
+		}
+	})
+
+	t.Run("neon parent is empty when omitted", func(t *testing.T) {
+		// The backwards-compatibility guarantee: an app that predates
+		// parent: (or simply doesn't want one) parses to the empty string,
+		// which internal/preview passes to Neon as "branch from the project
+		// default". Anything else here would silently change where an
+		// existing app's previews get their data.
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: owner
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := reg["foo"].Preview.Neon.Parent; got != "" {
+			t.Errorf("Preview.Neon.Parent = %q, want \"\" when the key is omitted", got)
+		}
+	})
+
+	t.Run("unknown field nested inside neon: errors", func(t *testing.T) {
+		// `parents:`/`parent_branch:` and friends must not be accepted and
+		// then ignored: a typo'd key would leave the parent empty and send
+		// previews back to the default (production) branch with nothing
+		// saying so.
+		_, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: owner
+      parent_branch: development
+`))
+		if err == nil {
+			t.Fatal("expected an error for an unknown field nested inside neon:, got nil")
 		}
 	})
 

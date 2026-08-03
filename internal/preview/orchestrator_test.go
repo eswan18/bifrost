@@ -97,6 +97,19 @@ type fakeNeon struct {
 	// it, which no assertion on the resulting deletions can distinguish (a
 	// second pass over the same project deletes nothing either way).
 	listCalls map[string]int
+	// createCalls records every CreateBranch, in order, WITH the parentID it
+	// was given. The resulting branch list can't stand in for this: a branch
+	// records no parent, so "cut from staging" and "cut from the project
+	// default" are indistinguishable after the fact — which is exactly the
+	// bug preview.neon.parent exists to fix.
+	createCalls []neonCreateCall
+}
+
+// neonCreateCall is one recorded CreateBranch, parentID included.
+type neonCreateCall struct {
+	project  string
+	name     string
+	parentID string
 }
 
 func (f *fakeNeon) ListBranches(_ context.Context, projectID string) ([]neon.Branch, error) {
@@ -129,9 +142,88 @@ func (f *fakeNeon) listCallsFor(projectID string) int {
 	return f.listCalls[projectID]
 }
 
-func (f *fakeNeon) CreateBranch(_ context.Context, projectID, name, _ string) (neon.Branch, error) {
+// previewBranchesFor returns only the preview-* branches in a project — what
+// a run of Up is responsible for creating. The seeded long-lived branches
+// (see seedRegistryNeonBranches) are deliberately excluded: those model the
+// project's pre-existing `development`/`production` and are not this
+// package's to create, count, or delete.
+func (f *fakeNeon) previewBranchesFor(projectID string) []neon.Branch {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var out []neon.Branch
+	for _, b := range f.branches[projectID] {
+		if strings.HasPrefix(b.Name, "preview-") {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// createCallsFor returns the recorded CreateBranch calls for a project.
+func (f *fakeNeon) createCallsFor(projectID string) []neonCreateCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []neonCreateCall
+	for _, c := range f.createCalls {
+		if c.project == projectID {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// seededBranchID is the ID the fake gives a seeded long-lived branch. It
+// embeds the project as well as the branch name so that two projects whose
+// parent branches share a NAME — footstrike-api and identity both use
+// `development` — still get distinct IDs. Without that, a resolver that
+// looked the parent up in the wrong project's branch list would return the
+// right-looking ID and no assertion could tell.
+func seededBranchID(projectID, branch string) string {
+	return "br-" + projectID + "-" + branch
+}
+
+// seededDefaultBranch is the name of the decoy branch seedRegistryNeonBranches
+// puts in every project ALONGSIDE the registry's declared parent. It stands in
+// for the project's Neon default branch — `production` in both projects that
+// declare a parent today — which is precisely what a preview lands on when
+// CreateBranch is passed an empty parentID. Its presence is what makes a
+// parent-resolution assertion discriminate: with only one branch seeded, "we
+// resolved the configured name" is indistinguishable from "we grabbed
+// whatever branch was there."
+const seededDefaultBranch = "production"
+
+// seedRegistryNeonBranches puts every Neon project named by the real embedded
+// registry.yaml into the state the live project is in: the branch that
+// entry's preview.neon.parent names, plus the default branch it is NOT
+// supposed to use. The decoy is listed FIRST, so an implementation that took
+// the head of the branch list rather than matching by name would pick the
+// wrong one and fail.
+//
+// Without this, every Up in this file fails Up's parent pre-flight — correct
+// behavior, but not what most of these tests are about.
+func (f *fakeNeon) seedRegistryNeonBranches(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.branches == nil {
+		f.branches = map[string][]neon.Branch{}
+	}
+	for _, svc := range testRegistry(t) {
+		ref := svc.Neon
+		if ref == nil || ref.Parent == "" {
+			continue
+		}
+		f.branches[ref.Project] = []neon.Branch{
+			{ID: seededBranchID(ref.Project, seededDefaultBranch), Name: seededDefaultBranch},
+			{ID: seededBranchID(ref.Project, ref.Parent), Name: ref.Parent},
+		}
+	}
+}
+
+func (f *fakeNeon) CreateBranch(_ context.Context, projectID, name, parentID string) (neon.Branch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCalls = append(f.createCalls, neonCreateCall{project: projectID, name: name, parentID: parentID})
 	if err, ok := f.createErr[projectID]; ok {
 		return neon.Branch{}, err
 	}
@@ -762,6 +854,7 @@ func newTwoMemberDeps(t *testing.T) *testDeps {
 		},
 	}
 	nc := &fakeNeon{}
+	nc.seedRegistryNeonBranches(t)
 	gc := &fakeGCB{}
 	kc := newFakeKube()
 	o := &Orchestrator{
@@ -864,9 +957,9 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 	}
 
 	// The Neon branch was actually created for footstrike-api's project.
-	branches := d.neon.branches["aged-river-81935268"]
+	branches := d.neon.previewBranchesFor("aged-river-81935268")
 	if len(branches) != 1 || branches[0].Name != "preview-hae-cadence" {
-		t.Errorf("aged-river-81935268 branches = %+v, want exactly one named preview-hae-cadence", branches)
+		t.Errorf("aged-river-81935268 preview branches = %+v, want exactly one named preview-hae-cadence", branches)
 	}
 }
 
@@ -912,8 +1005,8 @@ func TestUpIsIdempotentOnRerun(t *testing.T) {
 	if ns.annotations["bifrost/phase"] != "ready" {
 		t.Errorf("bifrost/phase after rerun = %q, want ready", ns.annotations["bifrost/phase"])
 	}
-	if len(d.neon.branches["aged-river-81935268"]) != 1 {
-		t.Errorf("aged-river-81935268 branches after rerun = %+v, want still exactly one (scan-then-create, no duplicate)", d.neon.branches["aged-river-81935268"])
+	if len(d.neon.previewBranchesFor("aged-river-81935268")) != 1 {
+		t.Errorf("aged-river-81935268 preview branches after rerun = %+v, want still exactly one (scan-then-create, no duplicate)", d.neon.previewBranchesFor("aged-river-81935268"))
 	}
 }
 
@@ -1586,6 +1679,178 @@ func TestUpRecordsSourceSHAsBeforeBuilding(t *testing.T) {
 	}
 }
 
+// ---- Up: the Neon parent branch ------------------------------------------------
+
+// setNeonParent replaces svc's registry Neon parent, copying the NeonRef
+// rather than writing through the pointer so one test can't disturb another
+// (testRegistry re-parses the YAML per call, but the copy makes that
+// independence explicit rather than incidental).
+func setNeonParent(t *testing.T, reg Registry, svc, parent string) {
+	t.Helper()
+	entry, ok := reg[svc]
+	if !ok || entry.Neon == nil {
+		t.Fatalf("registry entry for %s has no neon block to reparent", svc)
+	}
+	ref := *entry.Neon
+	ref.Parent = parent
+	entry.Neon = &ref
+	reg[svc] = entry
+}
+
+// TestUpCutsTheNeonBranchFromTheRegistryParent is the whole point of
+// preview.neon.parent: a preview's database branch must be cut from the
+// branch staging runs on, not from the project's Neon default (production).
+//
+// It asserts on the parentID CreateBranch RECEIVED, because that is the only
+// place the distinction is observable — the created branch object records no
+// parent, so "cut from staging" and "cut from production" produce identical
+// state in the fake and in Neon's own branch list.
+func TestUpCutsTheNeonBranchFromTheRegistryParent(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	const project = "aged-river-81935268"
+	ref := d.orch.Registry["footstrike-api"].Neon
+	if ref.Parent == "" {
+		t.Fatal("registry.yaml declares no preview.neon.parent for footstrike-api; this test exists to prove that parent is honored")
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	calls := d.neon.createCallsFor(project)
+	if len(calls) != 1 {
+		t.Fatalf("CreateBranch calls for %s = %+v, want exactly one", project, calls)
+	}
+	got := calls[0].parentID
+	// Spelled out as three checks rather than one equality, so a failure says
+	// WHICH way it went wrong. The two named wrong answers are the two real
+	// regressions: "" is the pre-parent behavior (Neon silently picks the
+	// default branch, which is production), and the default branch's own ID
+	// is what a resolver matching the wrong entry would hand back.
+	if got == "" {
+		t.Error("CreateBranch parentID is empty: the branch was cut from the project's DEFAULT branch (production) — exactly the bug preview.neon.parent exists to fix")
+	}
+	if got == seededBranchID(project, seededDefaultBranch) {
+		t.Errorf("CreateBranch parentID = %q, the %q branch — the configured parent name resolved to the wrong branch", got, seededDefaultBranch)
+	}
+	if want := seededBranchID(project, ref.Parent); got != want {
+		t.Errorf("CreateBranch parentID = %q, want %q (the ID of branch %q, resolved from its name)", got, want, ref.Parent)
+	}
+}
+
+// TestUpWithoutARegistryParentBranchesFromTheNeonDefault pins the
+// backwards-compatible half of the contract: an app whose neon: block omits
+// parent: must behave exactly as it did before the key existed — an empty
+// parentID, which Neon reads as "use the project's default branch". Every
+// previewable app was in this state until this commit, and any future one
+// that skips the key stays in it.
+func TestUpWithoutARegistryParentBranchesFromTheNeonDefault(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	const project = "aged-river-81935268"
+	setNeonParent(t, d.orch.Registry, "footstrike-api", "")
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	calls := d.neon.createCallsFor(project)
+	if len(calls) != 1 {
+		t.Fatalf("CreateBranch calls for %s = %+v, want exactly one", project, calls)
+	}
+	if calls[0].parentID != "" {
+		t.Errorf("CreateBranch parentID = %q, want \"\": an omitted parent: must pass the empty parent Neon reads as 'the project default', not resolve to some branch of its own choosing", calls[0].parentID)
+	}
+}
+
+// TestUpUnknownNeonParentFailsBeforeTheNamespaceExists covers the failure
+// mode a silent fallback would hide. A parent: naming a branch the project
+// doesn't have is a typo in a hand-edited registry, and the only safe
+// response is to refuse: branching from the default instead would put the
+// preview back on production data with nothing in the diff to show it.
+//
+// It must also fail EARLY. The check ensureNeonBranch does at creation time
+// is the real gate, but it runs at stage 5 — after EnsureNamespace and after
+// every member has been built — so it would leave a phase=failed namespace to
+// clean up by hand plus a round of wasted builds, for a static config error
+// knowable before the run started. Hence Up's pre-flight, and hence the
+// no-namespace/no-build assertions below.
+func TestUpUnknownNeonParentFailsBeforeTheNamespaceExists(t *testing.T) {
+	d := newTwoMemberDeps(t)
+	const project = "aged-river-81935268"
+	setNeonParent(t, d.orch.Registry, "footstrike-api", "staging-typo")
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected an error for a parent: naming a branch that does not exist, got nil")
+	}
+	// Asserted verbatim, not by substring: this message IS the deliverable —
+	// it has to name the service, the project, and the missing branch, and
+	// say which registry key to go fix, since none of those is recoverable
+	// from the others when staring at a failed `bif preview up`.
+	const wantErr = `preview: Up: pre-flight: neon parent branch for footstrike-api: ` +
+		`neon project aged-river-81935268 has no branch named "staging-typo" (registry preview.neon.parent)`
+	if err.Error() != wantErr {
+		t.Errorf("error =\n  %q\nwant\n  %q", err.Error(), wantErr)
+	}
+	if len(d.kube.namespaces) != 0 {
+		t.Errorf("namespaces = %v, want none: an unknown parent must be caught before the namespace exists, or it leaves a zombie failed preview behind", d.kube.namespaces)
+	}
+	if len(d.gcb.runCalls) != 0 {
+		t.Errorf("RunTrigger calls = %v, want none: the pre-flight must run before any build minutes are spent", d.gcb.runCalls)
+	}
+	if got := d.neon.createCallsFor(project); len(got) != 0 {
+		t.Errorf("CreateBranch calls = %+v, want none — under no circumstances may an unresolvable parent fall back to the default branch", got)
+	}
+}
+
+// TestEnsureNeonBranchRejectsAParentMissingAtCreationTime exercises the
+// creation-time gate on its own, without Up's pre-flight in front of it. That
+// gate is the one that actually governs what CreateBranch is passed: the
+// pre-flight is an early-warning copy, and a branch can be deleted in the
+// minutes between the two (a preview's builds are not instant). Neither check
+// may fall back to the default branch.
+func TestEnsureNeonBranchRejectsAParentMissingAtCreationTime(t *testing.T) {
+	nc := &fakeNeon{branches: map[string][]neon.Branch{
+		// Only the default branch is present — the parent is gone, which is
+		// what the pre-flight would have seen a moment earlier had it run.
+		"proj-api": {{ID: "br-default", Name: "production"}},
+	}}
+	o := &Orchestrator{Neon: nc}
+	ref := NeonRef{Project: "proj-api", Database: "fitnessdb", Role: "owner", Parent: "development"}
+
+	_, err := o.ensureNeonBranch(context.Background(), ref, "hae-cadence")
+	if err == nil {
+		t.Fatal("expected an error when the configured parent branch is absent at creation time, got nil")
+	}
+	const wantErr = `neon project proj-api has no branch named "development" (registry preview.neon.parent)`
+	if err.Error() != wantErr {
+		t.Errorf("error = %q, want %q", err.Error(), wantErr)
+	}
+	if got := nc.createCallsFor("proj-api"); len(got) != 0 {
+		t.Errorf("CreateBranch calls = %+v, want none: a missing parent must abort the create, not fall back to the project default", got)
+	}
+}
+
+// TestEnsureNeonBranchReusesAnExistingPreviewBranchWithoutResolvingTheParent
+// pins that parent resolution happens only on the create path. A re-run over
+// a live preview finds its branch by name and must not fail merely because
+// the parent has since been renamed or removed — the branch it would have
+// been the parent of already exists.
+func TestEnsureNeonBranchReusesAnExistingPreviewBranchWithoutResolvingTheParent(t *testing.T) {
+	nc := &fakeNeon{branches: map[string][]neon.Branch{
+		"proj-api": {{ID: "br-existing", Name: previewBranchName("hae-cadence")}},
+	}}
+	o := &Orchestrator{Neon: nc}
+	ref := NeonRef{Project: "proj-api", Database: "fitnessdb", Role: "owner", Parent: "long-gone"}
+
+	if _, err := o.ensureNeonBranch(context.Background(), ref, "hae-cadence"); err != nil {
+		t.Fatalf("ensureNeonBranch failed: %v", err)
+	}
+	if got := nc.createCallsFor("proj-api"); len(got) != 0 {
+		t.Errorf("CreateBranch calls = %+v, want none (the preview branch already existed)", got)
+	}
+}
+
 // ---- Up: failure paths --------------------------------------------------------
 
 func TestUpRejectsEmptyBranch(t *testing.T) {
@@ -1722,8 +1987,8 @@ func TestUpBuildFailureSetsPhaseFailed(t *testing.T) {
 	}
 
 	// Failure happened before the Neon/secrets stages — neither should have run.
-	if len(d.neon.branches["aged-river-81935268"]) != 0 {
-		t.Errorf("aged-river-81935268 branches = %+v, want none created (build failed first)", d.neon.branches["aged-river-81935268"])
+	if len(d.neon.previewBranchesFor("aged-river-81935268")) != 0 {
+		t.Errorf("aged-river-81935268 preview branches = %+v, want none created (build failed first)", d.neon.previewBranchesFor("aged-river-81935268"))
 	}
 	if len(d.kube.copySecretCalls) != 0 {
 		t.Errorf("CopySecret called %d times, want 0 (build failed first)", len(d.kube.copySecretCalls))
@@ -2461,8 +2726,8 @@ func TestDownWorksAfterAReadinessFailure(t *testing.T) {
 	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err == nil {
 		t.Fatal("expected the Up to fail its readiness wait, got nil")
 	}
-	if len(d.neon.branches["aged-river-81935268"]) != 1 {
-		t.Fatalf("expected the Neon branch to exist after the failed Up, got %+v", d.neon.branches["aged-river-81935268"])
+	if len(d.neon.previewBranchesFor("aged-river-81935268")) != 1 {
+		t.Fatalf("expected the Neon preview branch to exist after the failed Up, got %+v", d.neon.previewBranchesFor("aged-river-81935268"))
 	}
 
 	if err := d.orch.Down(context.Background(), "hae-cadence"); err != nil {
@@ -2471,8 +2736,8 @@ func TestDownWorksAfterAReadinessFailure(t *testing.T) {
 	if _, stillPresent := d.kube.namespaces[ns]; stillPresent {
 		t.Error("namespace still present after Down")
 	}
-	if len(d.neon.branches["aged-river-81935268"]) != 0 {
-		t.Errorf("aged-river-81935268 branches = %+v, want the preview branch deleted", d.neon.branches["aged-river-81935268"])
+	if len(d.neon.previewBranchesFor("aged-river-81935268")) != 0 {
+		t.Errorf("aged-river-81935268 preview branches = %+v, want the preview branch deleted", d.neon.previewBranchesFor("aged-river-81935268"))
 	}
 }
 
