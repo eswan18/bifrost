@@ -213,11 +213,11 @@ type UpOptions struct {
 // Every stage past EnsureNamespace that fails — the readiness wait
 // included — marks the namespace bifrost/phase=failed with a sanitized
 // bifrost/error annotation before returning; stage-1 validation failures
-// (bad membership, an unresolvable dashboard triple), and both pre-flight
-// refusals that immediately precede EnsureNamespace (a still-Terminating
-// namespace, and one another branch already owns — see
-// refuseUnusableNamespace), all return before the namespace is ever touched,
-// so they never leave a zombie behind.
+// (bad membership, an unresolvable dashboard triple, a registry-declared Neon
+// parent branch that doesn't exist), and both pre-flight refusals that
+// immediately precede EnsureNamespace (a still-Terminating namespace, and one
+// another branch already owns — see refuseUnusableNamespace), all return
+// before the namespace is ever touched, so they never leave a zombie behind.
 //
 // Idempotent re-`Up` (e.g. after a bifrost restart mid-creation, or a
 // deliberate re-POST once the branch has new commits) is the recovery path:
@@ -280,6 +280,14 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 		if _, err := envConfigFor(svc, tag, members, map[string]string{}, o.Cfg, o.Registry, o.Fleet); err != nil {
 			return fmt.Errorf("preview: Up: pre-flight: %w", err)
 		}
+	}
+	// Second pre-flight, same rationale and same "before the cluster is
+	// touched" placement: a registry-declared Neon parent branch that doesn't
+	// exist is a static config error, and finding it at stage 5 would cost a
+	// zombie failed namespace and a full round of builds. See
+	// verifyNeonParents.
+	if err := o.verifyNeonParents(ctx, members); err != nil {
+		return fmt.Errorf("preview: Up: pre-flight: %w", err)
 	}
 
 	ns := previewNamespace(tag)
@@ -1128,23 +1136,99 @@ func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, memb
 	return dbURIs, nil
 }
 
+// branchIDByName returns the ID of the branch named name, or "" if no branch
+// in branches carries that name.
+func branchIDByName(branches []neon.Branch, name string) string {
+	for _, b := range branches {
+		if b.Name == name {
+			return b.ID
+		}
+	}
+	return ""
+}
+
+// errMissingNeonParent is the one error text for "the registry names a parent
+// branch this project doesn't have", shared by the pre-flight and the
+// branch-creation path so the two can never drift. It names both the project
+// and the missing branch, since neither alone identifies the registry line to
+// fix.
+//
+// This must stay an error and never degrade to "branch from the default
+// instead": the default IS production in every project here, so a silent
+// fallback would restore the exact bug parent: was added to fix, invisibly.
+func errMissingNeonParent(ref NeonRef) error {
+	return fmt.Errorf("neon project %s has no branch named %q (registry preview.neon.parent)", ref.Project, ref.Parent)
+}
+
+// resolveNeonParentID maps ref's configured parent branch NAME to its Neon
+// branch ID against an already-fetched branch list. A ref with no parent
+// resolves to "" — the empty parentID CreateBranch treats as "use the
+// project's default branch", i.e. exactly the pre-parent behavior.
+func resolveNeonParentID(branches []neon.Branch, ref NeonRef) (string, error) {
+	if ref.Parent == "" {
+		return "", nil
+	}
+	id := branchIDByName(branches, ref.Parent)
+	if id == "" {
+		return "", errMissingNeonParent(ref)
+	}
+	return id, nil
+}
+
+// verifyNeonParents is Up's pre-flight for registry-declared Neon parent
+// branches: every member whose neon: block names a parent must have that
+// branch present in its project before the run touches the cluster.
+//
+// It is deliberately redundant with the check ensureNeonBranch does at
+// creation time. That one is the real gate — it runs against the branch list
+// the create is actually based on — but it fires at stage 5, minutes into a
+// run, AFTER EnsureNamespace and after every member has been built. A typo in
+// registry.yaml's parent: would fail there as a `failed`-phase namespace,
+// i.e. a zombie preview to clean up by hand, plus wasted build minutes, for
+// what is purely a static config error knowable up front. So it is also
+// checked here, alongside the required-key pre-flight, where a failure
+// returns before the namespace is ever created.
+//
+// A ListBranches error is fatal rather than skipped: "couldn't check" is not
+// evidence the parent exists, and letting the run continue would land it on
+// Neon's default (production) branch if the parent really was missing.
+func (o *Orchestrator) verifyNeonParents(ctx context.Context, members []string) error {
+	for _, svc := range members {
+		ref := o.Registry[svc].Neon
+		if ref == nil || ref.Parent == "" {
+			continue
+		}
+		branches, err := o.Neon.ListBranches(ctx, ref.Project)
+		if err != nil {
+			return fmt.Errorf("neon parent branch for %s: listing branches: %w", svc, err)
+		}
+		if _, err := resolveNeonParentID(branches, *ref); err != nil {
+			return fmt.Errorf("neon parent branch for %s: %w", svc, err)
+		}
+	}
+	return nil
+}
+
 // ensureNeonBranch finds (or creates) ref's project's preview-<tag> branch
 // and returns its connection URI for ref's database/role.
+//
+// A created branch is cut from ref's registry-declared parent (resolved from
+// name to ID against the same ListBranches result used to find an existing
+// preview branch — no extra API call), or from the project's default branch
+// when the registry declares none.
 func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (string, error) {
 	branchName := previewBranchName(tag)
 	branches, err := o.Neon.ListBranches(ctx, ref.Project)
 	if err != nil {
 		return "", fmt.Errorf("listing branches: %w", err)
 	}
-	var branchID string
-	for _, b := range branches {
-		if b.Name == branchName {
-			branchID = b.ID
-			break
-		}
-	}
+	branchID := branchIDByName(branches, branchName)
 	if branchID == "" {
-		created, err := o.Neon.CreateBranch(ctx, ref.Project, branchName, "")
+		parentID, err := resolveNeonParentID(branches, ref)
+		if err != nil {
+			return "", err
+		}
+		created, err := o.Neon.CreateBranch(ctx, ref.Project, branchName, parentID)
 		if err != nil {
 			return "", fmt.Errorf("creating branch: %w", err)
 		}

@@ -29,6 +29,17 @@ type NeonRef struct {
 	Project  string `json:"project"`
 	Database string `json:"database"`
 	Role     string `json:"role"`
+	// Parent is the NAME of the branch a preview's branch is cut from —
+	// "development", not "br-solitary-sun-ad74wwhf". This file is hand-edited
+	// and reviewed in a diff, where an opaque branch ID would be
+	// unverifiable; the name is resolved to its ID at branch-creation time
+	// (internal/preview.ensureNeonBranch) against the ListBranches call it
+	// already makes.
+	//
+	// Empty means "let Neon pick" — the project's DEFAULT branch — which in
+	// every project here is production. See registry.yaml's per-service
+	// comments for why that default is the wrong one for previews.
+	Parent string `json:"parent,omitempty"`
 }
 
 // Preview is a previewable service's preview wiring: its Neon reference

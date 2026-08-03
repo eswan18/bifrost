@@ -52,7 +52,8 @@ types:
 - **`preview`** (optional, entirely separate concern) — present only if the
   service should be part of `bif preview up`. See
   [`docs/preview-environments.md`](preview-environments.md) for its
-  `neon`/`env`/`required`/`migrate` fields and the env-template resolution
+  `neon` (including `neon.parent`, which decides where a preview's data comes
+  from)/`env`/`required`/`migrate` fields and the env-template resolution
   cascade; a service with no `preview:` block simply isn't a preview
   candidate, and everything above still works without it.
 
@@ -129,9 +130,11 @@ a `<name>-preview-build` trigger). That's strictly additive to everything
 above — a service is a normal fleet member first, previewable second.
 
 **If the service has a database, decide about `migrate:` deliberately.** A
-preview gets its own Neon branch, so it starts on whatever schema that branch
-was cut from — a branch carrying new migrations needs them applied before the
-app starts. `migrate:` supplies the command to run as an initContainer, right
+preview gets its own Neon branch, cut from the branch its `neon.parent` names
+(staging's, for every service that sets it — omit the key and you get the
+project's Neon *default*, which is production), so it starts on whatever
+schema that branch was cut from — a branch carrying new migrations needs them
+applied before the app starts. `migrate:` supplies the command to run as an initContainer, right
 after the database is branched. Whether you need it depends on what the app
 does at startup: footstrike-api *verifies* migrations and refuses to boot on a
 mismatch (a deliberate prod safety property), so without `migrate:` every

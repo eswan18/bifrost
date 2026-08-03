@@ -50,6 +50,25 @@ footstrike-api:
       project: aged-river-81935268
       database: neondb
       role: neondb_owner
+      # Cut previews from staging's branch, NOT this project's Neon default.
+      # Omitting parent: means "Neon's default branch", which here is
+      # `production` — so every preview used to come up as a copy-on-write
+      # clone of PRODUCTION data, on production's schema. Two things were
+      # wrong with that: previews carried real user data nobody intended to
+      # hand out with a preview URL, and because promotion to prod is manual,
+      # they started on a schema BEHIND staging — so a preview of a branch
+      # whose migration was already live in staging replayed migrations that
+      # staging had long since applied.
+      #
+      # `development` is footstrike-api's staging branch. Verified by matching
+      # the endpoint ID inside the `footstrike_api_staging_database_url`
+      # secret against this project's Neon endpoints, not by trusting the
+      # branch's name — the name and the deployment can disagree, and only the
+      # endpoint says which branch staging actually talks to. Re-verify that
+      # way if this ever changes; a wrong-but-existing name here fails
+      # silently in the only way that matters (the preview simply branches the
+      # wrong data).
+      parent: development
     env:
       ENV: staging
       PUBLIC_API_BASE_URL: "{{ url self }}"
@@ -86,6 +105,18 @@ identity:
       project: plain-heart-27630935
       database: neondb
       role: app
+      # Staging's branch, for the same reason footstrike-api's parent: exists
+      # above (read that comment first — it explains why the Neon default is
+      # the wrong parent). identity's default branch is `production` too, so
+      # without this key its previews clone production identity data.
+      #
+      # Confirmed to be staging's branch by matching the endpoint ID in the
+      # `identity_staging_database_url` secret against this project's
+      # endpoints. That it is spelled the same as footstrike-api's is a
+      # coincidence of two projects being set up alike, not a convention:
+      # forecasting's equivalent pair is `dev`/`main`. Check the endpoint,
+      # never the name, when adding the next one.
+      parent: development
     # Absolute "/app/auth-service", NOT bare "auth-service" like
     # footstrike-api's bare "alembic" above: identity's Dockerfile sets
     # WORKDIR /app and copies the binary to /app/auth-service

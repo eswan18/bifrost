@@ -213,6 +213,19 @@ ran `up` for is the symptom.
    resolved against an empty staging baseline, before the namespace or
    anything else is touched. This fails fast, cleanly, if — for
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
+
+   **Neon parent pre-flight**, in the same place and for the same reason: any
+   member whose `neon:` block names a `parent:` must have that branch present
+   in its Neon project, or the run aborts with e.g. `preview: Up: pre-flight:
+   neon parent branch for footstrike-api: neon project aged-river-81935268 has
+   no branch named "staging-typo" (registry preview.neon.parent)`. Step 5
+   checks the same thing again at the moment it creates the branch — that is
+   the real gate, since a branch can vanish in the minutes between — but a
+   failure *there* would leave a `failed`-phase namespace to clean up by hand
+   plus a full round of wasted build minutes, for what is almost always a typo
+   in a hand-edited registry. Neither check ever falls back to the project's
+   default branch: that default *is* production, so a silent fallback would
+   restore the very bug `parent:` exists to fix, invisibly.
 3. **Refuse an unusable namespace**, then **ensure the namespace**. The
    refusals are a single `GetNamespace` immediately before the write below
    (`refuseUnusableNamespace` in `orchestrator.go` — one API call, two
@@ -418,10 +431,30 @@ ran `up` for is the symptom.
    redundant rebuild on the retry.
 5. **Neon branch** (step: `branching databases`): for every member with a
    registry `neon:` reference,
-   find-or-create a `preview-<tag>` branch off that project's default branch
-   (empty parent ID) and fetch its connection URI for the registry's
+   find-or-create a `preview-<tag>` branch off the branch that entry's
+   `parent:` names, and fetch its connection URI for the registry's
    `database`/`role`. A service with no `neon:` entry (e.g.
    `footstrike-dashboard`) is skipped.
+
+   **A preview's data is a copy-on-write clone of whatever branch it was cut
+   from**, so `parent:` decides both what data a preview URL hands out and
+   what schema it starts on. Today it names each project's **staging** branch
+   (`development` for both `footstrike-api` and `identity`). It used to be
+   omitted, which means Neon's default branch — and the default in every one
+   of these projects is **`production`**. That was wrong twice over: previews
+   carried a clone of real production data, and because promotion to prod is
+   manual they came up on a schema *behind* staging, so a branch whose
+   migration was already live in staging replayed migrations staging had long
+   since applied.
+
+   `parent:` holds a branch **name**, not a Neon branch ID; the name is
+   resolved against the same `ListBranches` call that looks for an existing
+   `preview-<tag>` branch, so honoring it costs no extra API call. Resolution
+   happens only on the create path — a re-run that finds its preview branch
+   already there never consults the parent at all. An omitted `parent:` still
+   passes the empty parent ID, i.e. exactly the pre-`parent:` behavior, so an
+   app that doesn't declare one is unaffected. See "The registry" below for
+   how to verify a project's staging branch before writing one down.
 6. **Copy secrets** (step: `copying secrets`): each Neon-backed member's
    `{svc}-staging-secrets` Secret
    Store CSI secret is copied into the preview namespace with `DATABASE_URL`
@@ -800,6 +833,7 @@ footstrike-api:
       project: aged-river-81935268
       database: neondb
       role: neondb_owner
+      parent: development                 # branch NAME to cut previews from
     migrate: ["alembic", "upgrade", "head"]  # omit for apps with no migrations
     env:
       ENV: staging
@@ -810,12 +844,34 @@ footstrike-api:
     required: [...]                       # keys that must render non-empty
 ```
 
+`parent:` names the branch each preview's Neon branch is cut from, and
+therefore where a preview's data and starting schema come from — see step 5
+above for why omitting it (Neon's default branch = **production**) was the
+wrong answer. Two things to know before adding one:
+
+- **It is a branch name, resolved to an ID at branch-creation time.** An ID
+  (`br-solitary-sun-ad74wwhf`) would make this file unreviewable in a diff.
+  The cost is that a name naming nothing is only detectable against the live
+  project, which is what the pre-flight in step 2 is for.
+- **Verify it by endpoint, not by name.** Read the endpoint ID out of the
+  service's `{svc}_staging_database_url` secret and match it against the
+  project's Neon endpoints to learn which branch staging *actually* talks to.
+  Branch names are not a convention across projects and can outlive what they
+  describe: `footstrike-api` and `identity` both call it `development` while
+  `forecasting`'s equivalent pair is `dev`/`main`. A name that exists but is
+  the wrong one fails in the only way that matters — the preview quietly
+  branches the wrong database — and nothing downstream will catch it.
+
 `migrate:`, when present, is run as a **`migrate` initContainer** before the
 app container starts — same image (including the `preview-<sha>` tag
 override) and same `envFrom`, so it sees `DATABASE_URL` pointing at this
-preview's fresh Neon branch. A preview branches staging's database at
-staging's revision, so a branch carrying a new migration would otherwise come
-up against an out-of-date schema. Omitting `migrate:` renders no
+preview's fresh Neon branch. A preview branches the database named by
+`parent:` at that branch's current revision — staging's, for both services
+that set it — so a branch carrying a new migration would otherwise come
+up against an out-of-date schema. (While `parent:` was omitted this said
+"staging's" but meant *production's*, which lags staging by however long
+promotion has been sitting: previews replayed migrations staging had already
+applied.) Omitting `migrate:` renders no
 initContainers at all. Because the whole pod is blocked on it, a failed
 migration is what step 8's readiness wait is most often reporting.
 
@@ -897,7 +953,10 @@ changes:
    templates (`{{ url X }}` / `{{ internalUrl X }}` / `{{ config KEY }}`, or
    plain literals), and a `required:` list for any keys that must render
    non-empty (a required key with no matching `env` entry is rejected at
-   load time).
+   load time). If it has a database, **set `neon.parent` to its staging
+   branch** — verified by endpoint, per "The registry" above. Leaving it out
+   is not a neutral default: previews will clone that project's *production*
+   branch.
 2. **A `cloudbuild-preview.yaml` in the app's own repo** that builds and
    pushes `{image}:preview-$SHORT_SHA` (see
    `footstrike-api/cloudbuild-preview.yaml` for the working pattern — no
