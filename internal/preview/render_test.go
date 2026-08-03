@@ -1072,3 +1072,65 @@ patchesStrategicMerge:
 		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
 	}
 }
+
+// TestRenderKeepsAnEmptyEnvValue is the render-layer half of forecasting's
+// SENTRY_DSN: "" (internal/preview's TestEnvConfigEmptyOverrideBeatsThe
+// StagingBaseline is the env-computation half): an empty value must survive
+// the whole generated overlay -- the ConfigMap this package writes, the YAML
+// round-trip through the in-memory filesystem, and kustomize's own build --
+// and come out as a key that is PRESENT with an empty value.
+//
+// Present-and-empty is the distinction that matters and the one a naive
+// implementation loses. forecasting's Sentry configs read
+// `process.env.SENTRY_DSN || undefined`, so an empty string disables the SDK
+// -- but a DROPPED key would fall back to whatever the container's other env
+// sources supply, which for a preview is staging's ConfigMap, i.e. staging's
+// real DSN. Any layer here that treated "" as "unset" (a YAML marshaller
+// with omitempty, a kustomize transformer pruning empty scalars) would send
+// every preview's errors into the Sentry project someone actually watches,
+// and would do it silently.
+func TestRenderKeepsAnEmptyEnvValue(t *testing.T) {
+	envConfig := map[string]string{
+		"SENTRY_DSN":      "",
+		"PUBSUB_TOPIC":    "forecasting-staging-notifications",
+		"APP_BASE_URL":    "https://footstrike-api-hae-cadence.preview.footstrike.run",
+		"EMPTY_LOOKALIKE": `""`,
+	}
+	objs, err := Render(RenderInput{
+		Service:   "footstrike-api",
+		Tag:       "hae-cadence",
+		ShortSHA:  "abc1234",
+		K8sFiles:  loadK8sFixture(t, "footstrike-api"),
+		EnvConfig: envConfig,
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	cm := findObject(t, objs, "ConfigMap", "footstrike-api-preview-env")
+	data, found, err := unstructured.NestedStringMap(cm.Object, "data")
+	if err != nil || !found {
+		t.Fatalf("preview-env ConfigMap data missing (found=%v, err=%v)", found, err)
+	}
+	got, present := data["SENTRY_DSN"]
+	if !present {
+		t.Fatalf("SENTRY_DSN was dropped from the rendered ConfigMap (data = %v); an absent key falls through to staging's value, an empty one disables the SDK", data)
+	}
+	if got != "" {
+		t.Errorf("SENTRY_DSN = %q, want the empty string", got)
+	}
+	// The non-empty siblings are still intact, so a passing empty-key
+	// assertion can't be an artifact of the whole map being mangled.
+	if data["PUBSUB_TOPIC"] != envConfig["PUBSUB_TOPIC"] {
+		t.Errorf("PUBSUB_TOPIC = %q, want %q", data["PUBSUB_TOPIC"], envConfig["PUBSUB_TOPIC"])
+	}
+	// A value that merely LOOKS empty must not be confused with one that is:
+	// this one is two literal quote characters, and it has to survive as
+	// such rather than being re-parsed into "".
+	if data["EMPTY_LOOKALIKE"] != `""` {
+		t.Errorf("EMPTY_LOOKALIKE = %q, want the two-character string %q", data["EMPTY_LOOKALIKE"], `""`)
+	}
+	if len(data) != len(envConfig) {
+		t.Errorf("ConfigMap data has %d entries, want %d: %v", len(data), len(envConfig), data)
+	}
+}

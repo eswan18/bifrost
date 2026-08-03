@@ -24,6 +24,58 @@ forecasting:
   urls:
     staging: https://forecasting-staging.tailc06f30.ts.net
     prod: https://forecasting.ethanswan.com
+  preview:
+    neon:
+      project: blue-term-48495338
+      database: neondb
+      role: app_user
+      # app_user has NO CREATE on the database and none on schema public
+      # either; every table here is owned by neondb_owner. Without this split
+      # the migrate initContainer below could not create or alter a single
+      # table -- see identity's entry above for the full story, including why
+      # the app deliberately keeps the lesser role.
+      migrateRole: neondb_owner
+      # forecasting's STAGING branch. Note the names: this project's pair is
+      # `dev`/`main`, not the `development`/`production` both other projects
+      # use -- `main` is this project's Neon default and is what prod runs on,
+      # so omitting parent: here would clone PROD, exactly as it would there.
+      # That the three projects disagree is the reason the rule is "check the
+      # endpoint, never the name": confirmed by matching the endpoint ID
+      # inside the `forecasting_staging_database_url` secret against this
+      # project's Neon endpoints. Do the same for the next one.
+      parent: dev
+    # A bundled JS entry point, not a CLI -- the same "what does THIS image
+    # actually have" question footstrike-api's bare `alembic` and identity's
+    # absolute `/app/auth-service` each answer differently. forecasting's
+    # runner image carries neither kysely-ctl nor tsx, so there is no
+    # migration CLI to invoke; forecasting#168 added an esbuild bundle at
+    # /app/migrate/index.js precisely so the initContainer has something
+    # `node` can run with no dev dependencies present. Check the image before
+    # "simplifying" this into a package script.
+    migrate: ["node", "/app/migrate/index.js"]
+    env:
+      APP_BASE_URL: "{{ url self }}"
+      IDP_BASE_URL: "{{ internalUrl identity }}"
+      IDP_PUBLIC_URL: "{{ url identity }}"
+      # Deliberately empty, and deliberately NOT in required: (which rejects
+      # an empty value by design). All three of forecasting's Sentry configs
+      # read `dsn: process.env.SENTRY_DSN || undefined`, so an empty string
+      # disables the SDK. Without this override the key would fall through to
+      # forecasting's own staging ConfigMap and every preview would report its
+      # errors into STAGING's Sentry project, mixing throwaway branch noise
+      # into the signal someone actually watches.
+      SENTRY_DSN: ""
+    # Two keys are deliberately absent:
+    #
+    # PUBSUB_TOPIC -- previews inherit staging's topic and therefore fire
+    # REAL notifications. That is a decision, not an oversight: the owner
+    # accepted it rather than hold up onboarding, and comms#6 tracks giving
+    # previews their own topic. If you are here because a preview sent
+    # somebody a message, that issue is the fix.
+    #
+    # ENV -- needs no override. forecasting's staging value is already what a
+    # preview wants, and the cascade keeps an app's own staging ConfigMap
+    # value untouched when this registry says nothing about the key.
 
 # Previewable services. Adding one here + a cloudbuild-preview.yaml and
 # {service}-preview-build trigger in its repo is the whole onboarding path —

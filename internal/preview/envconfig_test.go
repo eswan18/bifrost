@@ -585,3 +585,56 @@ func TestEnvConfigForRequiredKeyRenderedEmptyErrors(t *testing.T) {
 		t.Errorf("error = %q, want it to name the empty required key", err.Error())
 	}
 }
+
+// TestEnvConfigEmptyOverrideBeatsTheStagingBaseline is forecasting's
+// SENTRY_DSN: "" re-verified rather than assumed, against the real embedded
+// registry. Three separate claims, each one load-bearing for that entry, and
+// each one a plausible implementation could get wrong:
+//
+//  1. an empty registry template OVERWRITES a non-empty staging baseline. A
+//     renderer that treated "" as "nothing to say" -- skipping the key, or
+//     preferring the baseline -- would leave staging's real DSN in place and
+//     every forecasting preview would report its errors into the Sentry
+//     project someone actually watches. The baseline below is deliberately
+//     non-empty and recognizable, so a passthrough is visible.
+//  2. it does not disturb the app's other staging keys. PUBSUB_TOPIC is here
+//     because forecasting deliberately does NOT override it (comms#6);
+//     previews inherit staging's topic, and this pins that inheriting is what
+//     happens rather than something the registry has to restate.
+//  3. Required rejects an empty rendered value -- which is why SENTRY_DSN
+//     must stay out of required:. Asserted here on a synthetic entry rather
+//     than by breaking the real one.
+func TestEnvConfigEmptyOverrideBeatsTheStagingBaseline(t *testing.T) {
+	staging := map[string]string{
+		"SENTRY_DSN":   "https://realkey@o123.ingest.sentry.io/456",
+		"PUBSUB_TOPIC": "forecasting-staging-notifications",
+		"ENV":          "staging",
+	}
+	got, err := envConfigFor("forecasting", "hae-cadence", []string{"forecasting"}, staging, &config.Config{}, testRegistry(t), testFleet(t))
+	if err != nil {
+		t.Fatalf("envConfigFor: %v", err)
+	}
+
+	dsn, ok := got["SENTRY_DSN"]
+	if !ok {
+		t.Fatal("SENTRY_DSN missing from the rendered config; the key must be PRESENT and empty, since the app reads process.env.SENTRY_DSN")
+	}
+	if dsn != "" {
+		t.Errorf("SENTRY_DSN = %q, want \"\": the registry's empty override must beat the staging baseline, or previews report into staging's Sentry project", dsn)
+	}
+	if got["PUBSUB_TOPIC"] != staging["PUBSUB_TOPIC"] {
+		t.Errorf("PUBSUB_TOPIC = %q, want staging's %q untouched (previews deliberately share staging's topic -- comms#6)", got["PUBSUB_TOPIC"], staging["PUBSUB_TOPIC"])
+	}
+	if got["ENV"] != "staging" {
+		t.Errorf("ENV = %q, want staging's value untouched (forecasting declares no override for it)", got["ENV"])
+	}
+
+	// Claim 3, on a synthetic entry: listing a key that renders empty in
+	// required: turns every preview of that service into a pre-flight
+	// failure. This is why forecasting's required: is absent, not why its
+	// SENTRY_DSN is empty -- two facts that have to stay consistent.
+	reg := Registry{"svc": Service{Env: map[string]string{"SENTRY_DSN": ""}, Required: []string{"SENTRY_DSN"}}}
+	if _, err := envConfigFor("svc", "t", []string{"svc"}, staging, &config.Config{}, reg, nil); err == nil {
+		t.Error("expected an error for a required key whose template is the empty string, got nil")
+	}
+}

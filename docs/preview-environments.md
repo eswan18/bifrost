@@ -460,9 +460,11 @@ ran `up` for is the symptom.
    **A preview's data is a copy-on-write clone of whatever branch it was cut
    from**, so `parent:` decides both what data a preview URL hands out and
    what schema it starts on. Today it names each project's **staging** branch
-   (`development` for both `footstrike-api` and `identity`). It used to be
-   omitted, which means Neon's default branch — and the default in every one
-   of these projects is **`production`**. That was wrong twice over: previews
+   — `development` for `footstrike-api` and `identity`, `dev` for
+   `forecasting`, whose project also calls its default `main` rather than
+   `production`. It used to be
+   omitted, which means Neon's default branch — and that default is the
+   **production** branch in every one of these projects. That was wrong twice over: previews
    carried a clone of real production data, and because promotion to prod is
    manual they came up on a schema *behind* staging, so a branch whose
    migration was already live in staging replayed migrations staging had long
@@ -800,8 +802,9 @@ that has already been deleted.
 
 It's cheap: the work is O(distinct Neon projects), not O(previews).
 `ListBranches` returns a whole project in one call, and `registry.yaml` names
-two distinct projects today (`footstrike-api`'s and `identity`'s), so a full
-orphan check is **two extra HTTP calls per sweep** however many previews exist.
+three distinct projects today (`footstrike-api`'s, `identity`'s and
+`forecasting`'s), so a full orphan check is **three extra HTTP calls per
+sweep** however many previews exist.
 Projects are de-duplicated by ID, so two services sharing one Neon project
 still cost one call.
 
@@ -846,7 +849,8 @@ the detection site in `reaper.go`.
 
 **It will collect a branch you made by hand.** The sweep has no way to tell a
 branch bifrost created from one a human created: any branch named `preview-*`
-in `footstrike-api`'s or `identity`'s Neon project, older than an hour, with no
+in `footstrike-api`'s, `identity`'s or `forecasting`'s Neon project, older than
+an hour, with no
 matching `preview-<tag>` namespace in the cluster, is deleted on the next tick.
 If you need a scratch branch in one of those projects to survive, **do not name
 it `preview-something`** — any other prefix is ignored entirely.
@@ -892,10 +896,11 @@ wrong answer. Two things to know before adding one:
   service's `{svc}_staging_database_url` secret and match it against the
   project's Neon endpoints to learn which branch staging *actually* talks to.
   Branch names are not a convention across projects and can outlive what they
-  describe: `footstrike-api` and `identity` both call it `development` while
-  `forecasting`'s equivalent pair is `dev`/`main`. A name that exists but is
-  the wrong one fails in the only way that matters — the preview quietly
-  branches the wrong database — and nothing downstream will catch it.
+  describe: `footstrike-api` and `identity` both call it `development`, while
+  `forecasting`'s pair is `dev`/`main` — three onboarded apps, two naming
+  schemes, which is the whole argument for checking the endpoint. A name that
+  exists but is the wrong one fails in the only way that matters — the preview
+  quietly branches the wrong database — and nothing downstream will catch it.
 
 `migrate:`, when present, is run as a **`migrate` initContainer** before the
 app container starts — same image (including the `preview-<sha>` tag
@@ -911,16 +916,25 @@ initContainers at all. Because the whole pod is blocked on it, a failed
 migration is what step 8's readiness wait is most often reporting.
 
 The command is whatever invokes that ability inside the service's own
-runtime image, and the two services that declare one today resolve it
-differently: footstrike-api's `["alembic", "upgrade", "head"]` is a bare
-command because its image puts `.venv/bin` on `PATH` via its own `ENV`;
-identity's `["/app/auth-service", "migrate"]` is an absolute path because
-identity's image never adds its `WORKDIR /app` to `PATH`, so a bare
-`auth-service` would fail the initContainer immediately with "executable
-file not found in $PATH" before the `migrate` subcommand ever ran. Each
-service's entry carries a comment explaining which convention it needs and
-why — don't "simplify" one to match the other without checking that
-service's own Dockerfile first.
+runtime image, and the three services that declare one today resolve it three
+different ways — which is the point: the question is always "what does *this*
+image actually have", never "what does the sibling entry say".
+
+- **footstrike-api**: `["alembic", "upgrade", "head"]` — a bare command,
+  because its image puts `.venv/bin` on `PATH` via its own `ENV`.
+- **identity**: `["/app/auth-service", "migrate"]` — an absolute path, because
+  identity's image never adds its `WORKDIR /app` to `PATH`, so a bare
+  `auth-service` would fail the initContainer immediately with "executable
+  file not found in $PATH" before the `migrate` subcommand ever ran.
+- **forecasting**: `["node", "/app/migrate/index.js"]` — a bundled JS entry
+  point rather than a CLI at all, because forecasting's runner image carries
+  neither `kysely-ctl` nor `tsx`. forecasting#168 added the esbuild bundle
+  specifically so there is something `node` can run with no dev dependencies
+  installed.
+
+Each service's entry carries a comment explaining which convention it needs and
+why — don't "simplify" one to match another without checking that service's
+own Dockerfile first.
 
 ### `migrateRole:` — running migrations as someone else
 
@@ -986,6 +1000,17 @@ literal (no `{{`/`}}`, passed through unchanged) or exactly one
 - **`{{ config KEY }}`** — an operator-supplied value from bifrost's own
   config. Only `previewOAuthClientID` (-> `PREVIEW_OAUTH_CLIENT_ID`) is
   recognized today.
+
+**The empty string is a literal, not "no value".** `SENTRY_DSN: ""` — which
+forecasting sets — renders to `""` and **overwrites** whatever the app's own
+staging ConfigMap had for that key, then survives into the preview ConfigMap as
+a key that is *present and empty*. That distinction is the whole mechanism:
+forecasting's Sentry configs read `process.env.SENTRY_DSN || undefined`, so an
+empty value disables the SDK, while a *missing* key would fall through to
+staging's real DSN and every preview would report its errors into the Sentry
+project someone actually watches. Note the interaction with `required:`, which
+rejects a key that renders empty — a key you deliberately blank must stay out
+of that list.
 
 A malformed template (unbalanced braces, wrong arg count, unknown function or
 config key) is a load-/render-time error naming the offending string — a
@@ -1095,6 +1120,13 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   bifrost's logs: the POST already returned `202`, so what you see is your tag
   sitting there against somebody else's branch. Rename your branch or tear
   their preview down; see "Two branches can derive the same tag" above.
+- **A forecasting preview sends real notifications.** Its registry entry
+  deliberately does *not* override `PUBSUB_TOPIC`, so a preview inherits
+  staging's topic and anything downstream of it fires for real. This is a
+  decision, not an oversight — it was accepted rather than hold up onboarding,
+  and comms#6 tracks giving previews their own topic. The registry entry says
+  so in a comment; don't "fix" it silently, and do know it before previewing a
+  branch that generates notifications in a loop.
 - **A stuck `creating` phase** (e.g. bifrost restarted mid-create) recovers
   by re-running `bif preview up <branch>` — safe, since every stage is
   idempotent, and cheap, since a member whose commit already has an image

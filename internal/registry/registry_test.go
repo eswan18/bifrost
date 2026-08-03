@@ -19,7 +19,10 @@ func TestLoad(t *testing.T) {
 		t.Errorf("Names() = %v, want %v", got, wantNames)
 	}
 
-	wantPreviewNames := []string{"footstrike-api", "footstrike-dashboard", "identity"}
+	// Sorted, and note the order: "footstrike-" sorts BEFORE "forecasting"
+	// ('o' < 'r' at the third character), which is not the order the fleet's
+	// Names() list above reads in at a glance.
+	wantPreviewNames := []string{"footstrike-api", "footstrike-dashboard", "forecasting", "identity"}
 	if got := reg.PreviewNames(); !reflect.DeepEqual(got, wantPreviewNames) {
 		t.Errorf("PreviewNames() = %v, want %v", got, wantPreviewNames)
 	}
@@ -74,7 +77,7 @@ func TestLoad(t *testing.T) {
 		}
 	})
 
-	t.Run("forecasting: urls, no preview", func(t *testing.T) {
+	t.Run("forecasting: urls and preview (neon + migrate + env)", func(t *testing.T) {
 		svc, ok := reg["forecasting"]
 		if !ok {
 			t.Fatal("forecasting missing from registry")
@@ -83,8 +86,79 @@ func TestLoad(t *testing.T) {
 		if svc.URLs != wantURLs {
 			t.Errorf("URLs = %+v, want %+v", svc.URLs, wantURLs)
 		}
-		if svc.Preview != nil {
-			t.Errorf("Preview = %+v, want nil", svc.Preview)
+		if svc.Preview == nil {
+			t.Fatal("Preview = nil, want non-nil")
+		}
+		if svc.Preview.Neon == nil {
+			t.Fatal("Preview.Neon = nil, want non-nil")
+		}
+		// `dev`, NOT `development`: this project's staging/prod pair is
+		// dev/main, unlike the other two projects' development/production.
+		// That disagreement is exactly why the rule is "verify the parent by
+		// matching the endpoint ID in the staging secret, never by name" --
+		// a name copied from a sibling entry would be a branch that doesn't
+		// exist here, and a name that exists but is the wrong one fails
+		// silently, by branching the wrong data.
+		//
+		// app_user/neondb_owner for the same reason identity splits its
+		// roles: app_user cannot create a table, so it cannot run a
+		// migration, but the app must go on connecting as it anyway.
+		wantNeon := NeonRef{
+			Project:     "blue-term-48495338",
+			Database:    "neondb",
+			Role:        "app_user",
+			MigrateRole: "neondb_owner",
+			Parent:      "dev",
+		}
+		if *svc.Preview.Neon != wantNeon {
+			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
+		}
+		if svc.Preview.Neon.Parent == "development" {
+			t.Error("Preview.Neon.Parent = development; forecasting's staging branch is `dev` -- this project does not follow the other two's naming")
+		}
+		wantEnv := map[string]string{
+			"APP_BASE_URL":   "{{ url self }}",
+			"IDP_BASE_URL":   "{{ internalUrl identity }}",
+			"IDP_PUBLIC_URL": "{{ url identity }}",
+			"SENTRY_DSN":     "",
+		}
+		if !reflect.DeepEqual(svc.Preview.Env, wantEnv) {
+			t.Errorf("Preview.Env = %v, want %v", svc.Preview.Env, wantEnv)
+		}
+		// The empty override is the whole point of the SENTRY_DSN key, so it
+		// gets an assertion of its own rather than living inside the map
+		// compare: an entry that dropped it (or "helpfully" filled it in)
+		// would send every preview's errors into staging's Sentry project.
+		// forecasting's Sentry configs read `process.env.SENTRY_DSN ||
+		// undefined`, so "" disables the SDK -- see
+		// TestEnvConfigEmptyOverrideBeatsTheStagingBaseline in
+		// internal/preview for the proof that "" really does overwrite a
+		// non-empty staging value rather than being skipped.
+		dsn, ok := svc.Preview.Env["SENTRY_DSN"]
+		if !ok {
+			t.Error("Preview.Env has no SENTRY_DSN; without it previews report into staging's Sentry project")
+		} else if dsn != "" {
+			t.Errorf("Preview.Env[SENTRY_DSN] = %q, want the empty string that disables the SDK", dsn)
+		}
+		// ...and it must stay OUT of required:, which rejects an empty
+		// rendered value by design. Listing it there would make every
+		// forecasting preview fail its pre-flight.
+		if len(svc.Preview.Required) != 0 {
+			t.Errorf("Preview.Required = %v, want empty: SENTRY_DSN renders empty on purpose and required rejects that", svc.Preview.Required)
+		}
+		// PUBSUB_TOPIC is deliberately NOT overridden -- previews inherit
+		// staging's topic and fire real notifications (comms#6). Asserted so
+		// that adding an override becomes a deliberate act with a test to
+		// update, not a silent change to who gets messaged.
+		if _, ok := svc.Preview.Env["PUBSUB_TOPIC"]; ok {
+			t.Error("Preview.Env sets PUBSUB_TOPIC; previews deliberately inherit staging's topic (comms#6) -- if that changed, say so here")
+		}
+		// A bundled JS entry point, because forecasting's runner image has
+		// no kysely-ctl and no tsx to invoke a migration CLI with
+		// (forecasting#168).
+		wantMigrate := []string{"node", "/app/migrate/index.js"}
+		if !reflect.DeepEqual(svc.Preview.Migrate, wantMigrate) {
+			t.Errorf("Preview.Migrate = %v, want %v", svc.Preview.Migrate, wantMigrate)
 		}
 	})
 
