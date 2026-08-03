@@ -1028,24 +1028,41 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 		apiCall.dstNS != ns || apiCall.dstName != "footstrike-api-preview-secrets" {
 		t.Errorf("api secret copy = %+v, unexpected shape", apiCall)
 	}
-	// footstrike-api's Neon project/database/role in the real registry: see
+	// footstrike-api's Neon project/database/roles in the real registry: see
 	// registry.yaml. The role is part of the fake's URI (see ConnectionURI),
-	// so this also pins WHICH role the app's connection string was minted for.
-	wantURI := "postgres://neondb_owner:fakesecret@aged-river-81935268/neondb"
-	if string(apiCall.overrides["DATABASE_URL"]) != wantURI {
-		t.Errorf("DATABASE_URL override = %q, want %q", apiCall.overrides["DATABASE_URL"], wantURI)
+	// so these pin WHICH role each of the two connection strings was minted
+	// for — the app's and the migrate initContainer's.
+	const apiProject = "aged-river-81935268"
+	wantAppURI := "postgres://app_user:fakesecret@" + apiProject + "/neondb"
+	wantMigrateURI := "postgres://neondb_owner:fakesecret@" + apiProject + "/neondb"
+	if got := string(apiCall.overrides["DATABASE_URL"]); got != wantAppURI {
+		t.Errorf("DATABASE_URL override = %q, want %q (the APP's DML-only role)", got, wantAppURI)
 	}
-	// footstrike-api declares no migrateRole, so its preview Secret must be
-	// exactly what it always was: one key. An extra key here would mean a
-	// service nobody onboarded had its behavior changed.
-	if got := overrideKeys(apiCall.overrides); !reflect.DeepEqual(got, []string{"DATABASE_URL"}) {
-		t.Errorf("override keys = %v, want exactly [DATABASE_URL]: a service with no migrateRole must get no extra Secret key", got)
+	if got := string(apiCall.overrides[migrateDBURLSecretKey]); got != wantMigrateURI {
+		t.Errorf("%s override = %q, want %q (the role migrations need)", migrateDBURLSecretKey, got, wantMigrateURI)
 	}
-	// ...and it makes no ListRoles call at all. This is the assertion that
-	// "omitting migrateRole preserves today's behavior exactly" reaches down
-	// to the API calls, not just the outcome.
-	if got := d.neon.rolesCallsFor("aged-river-81935268"); got != 0 {
-		t.Errorf("ListRoles calls for aged-river-81935268 = %d, want 0: a ref with no migrateRole must not add an API call", got)
+	// That the two DIFFER, stated on its own even though the pair above
+	// implies it: this is the property, and the pair above is only today's
+	// spelling of it. footstrike-api connected as neondb_owner in every
+	// environment until 2026-08-04 — the app held DROP on production, and its
+	// previews could not catch a migration that created a table without
+	// granting the app access, because the app WAS the owner. Collapsing the
+	// two roles back into one would restore exactly that, and this says so in
+	// those words rather than as two value mismatches to reconcile by hand.
+	if string(apiCall.overrides["DATABASE_URL"]) == string(apiCall.overrides[migrateDBURLSecretKey]) {
+		t.Errorf("DATABASE_URL and %s are the same URI: the app must connect as a lesser role than migrations do", migrateDBURLSecretKey)
+	}
+	if got := overrideKeys(apiCall.overrides); !reflect.DeepEqual(got, []string{"DATABASE_URL", migrateDBURLSecretKey}) {
+		t.Errorf("override keys = %v, want exactly [DATABASE_URL %s]", got, migrateDBURLSecretKey)
+	}
+	// ONE roles call, not two: the pre-flight checks migrateRole: and nothing
+	// else. role: keeps the only gate it has ever had — the ConnectionURI call
+	// that mints it — so a pre-flight that grew into a general "verify every
+	// role:" would show up here as a second call and nowhere else. The zero
+	// case (a ref with no migrateRole asks for no roles at all) is
+	// TestUpWithoutAMigrateRoleAddsNoSecretKeyAndNoRolesCall.
+	if got := d.neon.rolesCallsFor(apiProject); got != 1 {
+		t.Errorf("ListRoles calls for %s = %d, want exactly 1 (the migrateRole check, and only it)", apiProject, got)
 	}
 	tlsCall := d.kube.copySecretCalls[1]
 	if tlsCall.srcNS != "previews" || tlsCall.srcName != previewTLSSecret ||
@@ -1778,9 +1795,10 @@ func TestUpRecordsSourceSHAsBeforeBuilding(t *testing.T) {
 
 // ---- Up: the Neon migrate role -------------------------------------------------
 
-// newIdentityMemberDeps sets up a single-member preview of identity — the one
-// onboarded service whose registry entry declares a migrateRole, and the
-// reason the field exists (its `app` role cannot create a table).
+// newIdentityMemberDeps sets up a single-member preview of identity — the
+// service migrateRole was added for, and the reason the field exists (its
+// `app` role cannot create a table). Every onboarded service declares one
+// today; identity is where the need was found.
 func newIdentityMemberDeps(t *testing.T) *testDeps {
 	t.Helper()
 	gh := &fakeGitHub{
@@ -1831,6 +1849,22 @@ func setNeonMigrateRole(t *testing.T, reg Registry, svc, role string) {
 	}
 	ref := *entry.Neon
 	ref.MigrateRole = role
+	entry.Neon = &ref
+	reg[svc] = entry
+}
+
+// setNeonRef replaces svc's registry Neon reference OUTRIGHT, keeping nothing
+// from the real entry — unlike setNeonMigrateRole/setNeonParent, which edit one
+// field of it. That is the point rather than a shortcut: a test whose subject is
+// the shape of a NeonRef should state the whole ref itself, so registry.yaml
+// cannot change what it is testing. See
+// TestUpWithoutAMigrateRoleAddsNoSecretKeyAndNoRolesCall.
+func setNeonRef(t *testing.T, reg Registry, svc string, ref NeonRef) {
+	t.Helper()
+	entry, ok := reg[svc]
+	if !ok || entry.Neon == nil {
+		t.Fatalf("registry entry for %s has no neon block to replace", svc)
+	}
 	entry.Neon = &ref
 	reg[svc] = entry
 }
@@ -1919,6 +1953,83 @@ func TestUpGivesTheMigrateStepItsOwnRole(t *testing.T) {
 				t.Errorf("%s/%s applied with a connection string in its spec", o.GetKind(), o.GetName())
 			}
 		}
+	}
+}
+
+// TestUpWithoutAMigrateRoleAddsNoSecretKeyAndNoRolesCall is the other half of
+// TestUpGivesTheMigrateStepItsOwnRole: a ref that declares NO migrateRole must
+// come out exactly as it did before the field existed — one Secret key, no
+// env: override on the migrate initContainer, and not one extra API call.
+//
+// The ref under test is a FIXTURE, written here rather than read from
+// registry.yaml. This property used to be asserted through footstrike-api,
+// which happened to be the one onboarded service without a migrateRole; when
+// footstrike-api gained one on 2026-08-04 the property lost its test along with
+// its example, and no service was left to carry it. Nothing in registry.yaml
+// can take it away again: the subject is an empty MigrateRole field, not
+// whichever service currently has one.
+//
+// The fixture declares a parent:, and that is what makes the roles-call
+// assertion bite. verifyNeonRefs skips a ref with neither a parent nor a
+// migrateRole without looking at it, so a parentless fixture would make zero
+// ListRoles calls however the pre-flight behaved. With a parent, the pre-flight
+// engages this ref fully — lists its branches, resolves its parent — and must
+// still never ask for its roles.
+func TestUpWithoutAMigrateRoleAddsNoSecretKeyAndNoRolesCall(t *testing.T) {
+	const project = "proj-no-migrate-role"
+	d := newIdentityMemberDeps(t)
+	setNeonRef(t, d.orch.Registry, "identity", NeonRef{
+		Project:  project,
+		Database: "fixturedb",
+		Role:     "fixture_app",
+		Parent:   "development",
+	})
+	// The parent plus the default branch it must NOT pick, same decoy shape
+	// seedRegistryNeonBranches uses. Neither branch is given any ROLES: this
+	// run has no business asking for them, and a fake that answered would let
+	// an implementation that asked look identical to one that didn't.
+	d.neon.branches[project] = []neon.Branch{
+		{ID: "br-fixture-default", Name: "production", Default: true},
+		{ID: "br-fixture-parent", Name: "development"},
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	if len(d.kube.copySecretCalls) != 2 {
+		t.Fatalf("CopySecret called %d times, want 2 (member secret + tls): %+v", len(d.kube.copySecretCalls), d.kube.copySecretCalls)
+	}
+	svcCall := d.kube.copySecretCalls[0]
+	if got := overrideKeys(svcCall.overrides); !reflect.DeepEqual(got, []string{"DATABASE_URL"}) {
+		t.Errorf("override keys = %v, want exactly [DATABASE_URL]: a ref with no migrateRole must get no extra Secret key", got)
+	}
+	// Minted for the fixture's own role — so "no extra key" cannot be passing
+	// because nothing was minted at all, and the one key that IS there is the
+	// app's.
+	wantURI := "postgres://fixture_app:fakesecret@" + project + "/fixturedb"
+	if got := string(svcCall.overrides["DATABASE_URL"]); got != wantURI {
+		t.Errorf("DATABASE_URL override = %q, want %q", got, wantURI)
+	}
+	// The API-call half, which no assertion on the outcome can reach: a run
+	// that asked for this branch's roles and ignored the answer would produce
+	// the identical Secret.
+	if got := d.neon.rolesCallsFor(project); got != 0 {
+		t.Errorf("ListRoles calls for %s = %d, want 0: a ref with no migrateRole must not add an API call", project, got)
+	}
+	// And nothing points the migrate initContainer at a key that isn't there.
+	// renderAndApply passes MigrateSecretKey only for a ref that declares a
+	// migrateRole; were that made unconditional, this initContainer would
+	// carry a secretKeyRef to MIGRATE_DATABASE_URL — which the Secret above
+	// just proved is absent — and the pod would never start.
+	dep := appliedDeploymentObject(t, d.kube.applyCalls, "identity")
+	initContainers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers")
+	if err != nil || !found || len(initContainers) != 1 {
+		t.Fatalf("initContainers = %v (found=%v, err=%v), want exactly 1", initContainers, found, err)
+	}
+	initContainer, _ := initContainers[0].(map[string]any)
+	if env, hasEnv := initContainer["env"]; hasEnv {
+		t.Errorf("migrate initContainer has env = %v, want none when the ref declares no migrateRole", env)
 	}
 }
 

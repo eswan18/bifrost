@@ -148,12 +148,14 @@ crash-looping — set `migrate:` for that case too.
 The migration runs as `neon.role` unless you also set `neon.migrateRole`, and
 an app role that can't `CREATE` in schema `public` can't run a migration that
 adds a table — the failure lands in the initContainer, and it stays hidden
-until the first branch that carries a real migration. Two of the three apps
-onboarded today needed `migrateRole:`; only footstrike-api's role happened to
-own its own schema. Do **not** solve it by promoting `role:` to the owner:
-previews are supposed to catch a migration that creates a table and forgets to
-grant the app access, and they can only do that if the app connects with the
-privileges it really has. See "`migrateRole:`" in
+until the first branch that carries a real migration. All three apps onboarded
+today need `migrateRole:` — footstrike-api was the lone exception until
+2026-08-04, when its app role was narrowed from `neondb_owner` to a DML-only
+`app_user` — so assume you need it rather than that you're the next exception.
+Do **not** solve it by promoting `role:` to the owner: previews are supposed to
+catch a migration that creates a table and forgets to grant the app access, and
+they can only do that if the app connects with the privileges it really has.
+See "`migrateRole:`" in
 [`docs/preview-environments.md`](preview-environments.md).
 
 ## Gotcha: the CLI has its own copy of this file

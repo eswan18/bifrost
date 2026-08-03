@@ -35,12 +35,14 @@ type NeonRef struct {
 	//
 	// It exists because one connection string used to serve both, at the
 	// APP's privilege level, and an app role is routinely not allowed to
-	// create tables: of the roles in this file, only footstrike-api's happens
-	// to own its schema. identity's `app` and forecasting's `app_user` have
-	// no CREATE on schema public, so a preview of a branch adding a table
-	// failed in the initContainer — a latent break that stayed invisible only
-	// while every preview branch was schema-identical to the staging branch
-	// it was cut from, making `migrate` a no-op.
+	// create tables: no `role:` in this file has CREATE on schema public, and
+	// every table in every one of these projects is owned by neondb_owner. So
+	// a preview of a branch adding a table failed in the initContainer — a
+	// latent break that stayed invisible only while every preview branch was
+	// schema-identical to the staging branch it was cut from, making
+	// `migrate` a no-op. (footstrike-api was the exception until 2026-08-04,
+	// when its app role was narrowed from neondb_owner to a DML-only
+	// app_user; see its entry in registry.yaml.)
 	//
 	// Why not simply run the whole preview as the owner? Because the app must
 	// keep its real, lesser privileges in a preview. A migration that creates

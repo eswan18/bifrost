@@ -181,18 +181,26 @@ func TestLoad(t *testing.T) {
 		// default (`production`). Previews are cut from it so they don't
 		// clone production data onto a schema that lags staging; see the
 		// comment on this key in registry.yaml.
-		wantNeon := NeonRef{Project: "aged-river-81935268", Database: "neondb", Role: "neondb_owner", Parent: "development"}
+		wantNeon := NeonRef{
+			Project:     "aged-river-81935268",
+			Database:    "neondb",
+			Role:        "app_user",
+			MigrateRole: "neondb_owner",
+			Parent:      "development",
+		}
 		if *svc.Preview.Neon != wantNeon {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
 		}
-		// No migrateRole, stated as its own assertion rather than left
-		// implicit in the struct compare above: footstrike-api's app role
-		// already owns every table in its project, so it is the one onboarded
-		// service that must stay on a single connection string. Adding one
-		// here would silently change the behavior of a service this feature
-		// was never for.
-		if svc.Preview.Neon.MigrateRole != "" {
-			t.Errorf("Preview.Neon.MigrateRole = %q, want empty: footstrike-api's app role owns its schema and needs no split", svc.Preview.Neon.MigrateRole)
+		// Stated separately from the struct compare above, because this is the
+		// property that matters rather than an incidental field value: the app
+		// must NOT connect as the owner. footstrike-api ran as neondb_owner
+		// until 2026-08-04 — the app held DROP rights on production, and its
+		// previews could not catch a migration that created a table without
+		// granting the app access, because the app was the owner. Reverting
+		// Role to neondb_owner would restore both problems while every other
+		// assertion here still passed.
+		if svc.Preview.Neon.Role == svc.Preview.Neon.MigrateRole {
+			t.Errorf("Preview.Neon.Role = %q, same as MigrateRole: the app must connect as a lesser role than the one migrations use", svc.Preview.Neon.Role)
 		}
 		wantEnv := map[string]string{
 			"ENV":                       "staging",

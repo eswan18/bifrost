@@ -101,13 +101,25 @@ footstrike-api:
     neon:
       project: aged-river-81935268
       database: neondb
-      role: neondb_owner
-      # No migrateRole: here, unlike identity and forecasting, because this
-      # app's own role IS the owner of every table in the project — its
-      # migrations already run with the privileges they need. Don't read the
-      # absence as "footstrike-api doesn't migrate"; read it as "its app role
-      # happens to be privileged enough", which is a fact about this project,
-      # not a policy. If that role is ever narrowed, this entry needs one.
+      role: app_user
+      # This entry used to be a bare `role: neondb_owner` with a comment
+      # explaining that footstrike-api needed no migrateRole because its app
+      # role WAS the project owner — and noting that if the role were ever
+      # narrowed, this entry would need one. It was narrowed on 2026-08-04, so
+      # here we are.
+      #
+      # `app_user` is a DML-only role (SELECT/INSERT/UPDATE/DELETE on tables,
+      # USAGE+SELECT on sequences, plus ALTER DEFAULT PRIVILEGES so future
+      # migrations' tables are covered), created on BOTH the production and
+      # development branches — Neon roles are per-branch, and a role created on
+      # one branch does not appear on an existing sibling.
+      #
+      # Keeping the app on the lesser role is the point, not an inconvenience:
+      # a migration that creates a table and forgets to grant app_user access
+      # now fails in the preview, which is the whole reason previews exist.
+      # Running both as neondb_owner would be one fewer line and would hide
+      # exactly that class of bug.
+      migrateRole: neondb_owner
       # Cut previews from staging's branch, NOT this project's Neon default.
       # Omitting parent: means "Neon's default branch", which here is
       # `production` — so every preview used to come up as a copy-on-write

@@ -244,9 +244,12 @@ ran `up` for is the symptom.
      behind it.
 
    The role check costs one extra API call, and **only for a member that
-   declares a `migrateRole:`**. A service without one (footstrike-api) makes
-   exactly the calls it always did; `role:` keeps the gate it has always had,
-   which is the connection-URI call that mints it.
+   declares a `migrateRole:`**. A service without one makes exactly the calls
+   it always did; `role:` keeps the gate it has always had, which is the
+   connection-URI call that mints it. Every onboarded service declares one
+   today — footstrike-api, the last that didn't, gained one on 2026-08-04 —
+   so the no-`migrateRole:` path is now what a newly onboarded app meets
+   first, not a path anything in the fleet exercises.
 3. **Refuse an unusable namespace**, then **ensure the namespace**. The
    refusals are a single `GetNamespace` immediately before the write below
    (`refuseUnusableNamespace` in `orchestrator.go` — one API call, two
@@ -869,10 +872,9 @@ footstrike-api:
     neon:                                 # omit for apps with no database
       project: aged-river-81935268
       database: neondb
-      role: neondb_owner                  # the role the APP connects as
+      role: app_user                      # the role the APP connects as
       parent: development                 # branch NAME to cut previews from
-      # migrateRole: neondb_owner         # optional; see below. Not set here:
-      #   footstrike-api's app role already owns its schema.
+      migrateRole: neondb_owner           # the role MIGRATIONS connect as
     migrate: ["alembic", "upgrade", "head"]  # omit for apps with no migrations
     env:
       ENV: staging
@@ -943,12 +945,12 @@ role the **`migrate` initContainer** connects as instead; omit it and both use
 `role:`, exactly as everything did before this key existed.
 
 It exists because one connection string used to serve both, at the app's
-privilege level — and an app role routinely cannot create a table. Of the
-three onboarded apps, only footstrike-api's role happens to own its schema:
+privilege level — and an app role routinely cannot create a table. All three
+onboarded apps now connect as a role that cannot:
 
 | app | `role:` | CREATE on schema public | tables owned by |
 |---|---|---|---|
-| footstrike-api | `neondb_owner` | yes | `neondb_owner` |
+| footstrike-api | `app_user` | no | `neondb_owner` |
 | identity | `app` | no | `neondb_owner` |
 | forecasting | `app_user` | no | `neondb_owner` |
 
@@ -957,6 +959,15 @@ table, and nobody had noticed: a preview branch is cut from staging and starts
 on staging's schema, which makes `migrate` a no-op on almost every branch. The
 first identity branch to add a migration would have failed in the
 initContainer.
+
+footstrike-api belongs in that table only as of 2026-08-04. Until then it
+connected as `neondb_owner` in every environment: the application itself held
+DROP rights on production, and its previews could not catch a migration that
+created a table without granting the app access — because the app *was* the
+owner. It now connects as a DML-only `app_user`, created on both the
+`production` and `development` branches (Neon roles are per-branch), with
+migrations left on `migrateRole:`. That cutover happened in Neon and in the
+deployed connection-string secrets; the registry entry only records it.
 
 **Why not just run the whole preview as the owner?** Because the app must keep
 its real, lesser privileges in a preview. A migration that creates a table and
@@ -986,8 +997,10 @@ How it reaches the pod, and what it deliberately isn't:
 `migrateRole:` without `migrate:` is **rejected at registry-load time**: with
 no initContainer, the role names nobody, and accepting it would mint a live
 credential nothing consumes while the line read as though migrations were
-wired up. The reverse (`migrate:` with no `migrateRole:`) is the common case
-and is fine.
+wired up. The reverse (`migrate:` with no `migrateRole:`) is always fine: it
+means the app's own `role:` is expected to run the migration, which is what
+everything did before this key existed. No onboarded service is in that
+position today, so check the role before assuming yours is.
 
 Three template forms (`internal/preview/template.go`'s `Eval`), each either a
 literal (no `{{`/`}}`, passed through unchanged) or exactly one
