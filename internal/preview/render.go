@@ -61,6 +61,22 @@ type RenderInput struct {
 	// initContainers at all — this is the common case (see
 	// registry.Preview.Migrate for which services set it and why).
 	Migrate []string
+
+	// MigrateSecretKey, if non-empty, is a key in SecretName holding a
+	// connection URI for a role with the privileges migrations need but the
+	// app deliberately lacks (registry NeonRef.MigrateRole). The migrate
+	// initContainer's DATABASE_URL is then read from that key instead of the
+	// one envFrom supplies, while the app container is untouched.
+	//
+	// It is the key's NAME, never the URI. A connection string must never
+	// land in a Deployment spec as a literal — the spec is readable by
+	// anything with get on Deployments in the namespace, and it is what
+	// bifrost hands to ApplyObjects. The value stays in the Secret and
+	// reaches the container through a secretKeyRef at pod-start time.
+	//
+	// Empty (the common case, and every service before this existed) renders
+	// exactly what it always did: no env: block on the initContainer at all.
+	MigrateSecretKey string
 }
 
 // Render builds a generated kustomize overlay atop the service's fetched
@@ -75,6 +91,20 @@ func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
 	}
 	if in.ShortSHA == "" {
 		return nil, errors.New("preview: render: ShortSHA is required")
+	}
+	// MigrateSecretKey is a key IN SecretName, and it is read by the migrate
+	// initContainer — so neither of the things it depends on may be missing.
+	// Both combinations are unreachable from Up (the orchestrator sets the
+	// key only for a member that has a Neon ref, hence a Secret, and
+	// parseRegistry rejects migrateRole without migrate), which is exactly
+	// why they are worth refusing here: an unreachable combination that ever
+	// became reachable would otherwise render a secretKeyRef to a Secret
+	// named "", or silently drop the override on the floor.
+	if in.MigrateSecretKey != "" && in.SecretName == "" {
+		return nil, errors.New("preview: render: MigrateSecretKey needs a SecretName to read it from")
+	}
+	if in.MigrateSecretKey != "" && len(in.Migrate) == 0 {
+		return nil, errors.New("preview: render: MigrateSecretKey is set but there is no Migrate command to apply it to")
 	}
 
 	fs := filesys.MakeFsInMemory()
@@ -446,6 +476,17 @@ func writeOverlay(fs filesys.FileSystem, in RenderInput, facts baseFacts) error 
 // alongside the app instead of to completion before it) or any
 // volumeMounts (previews strip the base's CSI volume machinery entirely;
 // see volumesDeletePatch).
+//
+// When in.MigrateSecretKey is also set, that initContainer gets one explicit
+// env: entry re-pointing DATABASE_URL at that key of the same preview Secret,
+// so migrations run as a more privileged role than the app. This works
+// because an explicit env: entry OUTRANKS an envFrom source carrying the same
+// key — Kubernetes' own API contract, not an ordering accident: core/v1's
+// Container.EnvFrom documents that "values defined by an Env with a duplicate
+// key will take precedence" (k8s.io/api, vendored here). envFrom stays
+// identical to the app container's, so the initContainer still gets
+// everything else the app gets; only this one key differs, and only for this
+// one container.
 func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
 	var envFrom []map[string]any
 	if facts.configMapName != "" {
@@ -468,14 +509,24 @@ func deploymentPatch(in RenderInput, facts baseFacts) map[string]any {
 		},
 	}
 	if len(in.Migrate) > 0 {
-		podSpec["initContainers"] = []map[string]any{
-			{
-				"name":    "migrate",
-				"image":   facts.appImage,
-				"command": []string(in.Migrate),
-				"envFrom": envFrom,
-			},
+		migrate := map[string]any{
+			"name":    "migrate",
+			"image":   facts.appImage,
+			"command": []string(in.Migrate),
+			"envFrom": envFrom,
 		}
+		if in.MigrateSecretKey != "" {
+			migrate["env"] = []map[string]any{{
+				"name": "DATABASE_URL",
+				"valueFrom": map[string]any{
+					"secretKeyRef": map[string]any{
+						"name": in.SecretName,
+						"key":  in.MigrateSecretKey,
+					},
+				},
+			}}
+		}
+		podSpec["initContainers"] = []map[string]any{migrate}
 	}
 
 	return map[string]any{

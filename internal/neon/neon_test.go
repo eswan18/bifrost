@@ -313,3 +313,79 @@ func TestPathSegmentsEscaped(t *testing.T) {
 		t.Errorf("wire path = %q, want %q", gotPath, want)
 	}
 }
+
+// TestListRoles pins the two things bifrost's role pre-flight depends on:
+// the wire path (per-BRANCH, since Neon has no project-level role listing —
+// a branch inherits its parent's roles, which is why asking the parent
+// answers "will this role exist in the preview?"), and that only names come
+// back.
+func TestListRoles(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/branches/br-parent/roles", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"roles":[{"name":"app","password":"pw1","protected":false},{"name":"neondb_owner","password":"pw2","protected":true}]}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	roles, err := c.ListRoles(context.Background(), "proj-abc", "br-parent")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"app", "neondb_owner"}
+	if len(roles) != len(want) {
+		t.Fatalf("roles = %v, want %v", roles, want)
+	}
+	for i := range want {
+		if roles[i] != want[i] {
+			t.Errorf("roles[%d] = %q, want %q", i, roles[i], want[i])
+		}
+	}
+}
+
+// TestListRolesErrorNeverIncludesBody is the second instance of the
+// exception TestConnectionURIErrorNeverIncludesBody documents, and it is not
+// a copy of that test's caution: Neon's published spec marks a Role's
+// `password` field — and the whole `roles` array — x-sensitive, so this
+// endpoint's body really can carry credentials. The planted password below
+// proves the exclusion is unconditional rather than a property of what Neon
+// happens to return on an error today.
+func TestListRolesErrorNeverIncludesBody(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/branches/br-missing/roles", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"code":"not_found","message":"branch not found","roles":[{"name":"app","password":"should_never_appear"}]}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	_, err := c.ListRoles(context.Background(), "proj-abc", "br-missing")
+	if err == nil {
+		t.Fatal("expected an error on 404")
+	}
+	const want = "neon GET /projects/proj-abc/branches/br-missing/roles returned 404"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q (no body content at all)", err.Error(), want)
+	}
+}
+
+// TestListBranchesReportsTheDefaultBranch pins that `default` is decoded.
+// It is what the migrate-role pre-flight falls back to when an entry names
+// no parent — Neon cuts a parentless branch from the default, so that is the
+// branch whose roles a preview would inherit. Two branches, only one
+// flagged, so a decoder that dropped the field (or defaulted it true) fails.
+func TestListBranchesReportsTheDefaultBranch(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/branches", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"branches":[{"id":"br-1","name":"production","default":true},{"id":"br-2","name":"development","default":false}]}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	branches, err := c.ListBranches(context.Background(), "proj-abc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(branches) != 2 {
+		t.Fatalf("branches = %v, want 2", branches)
+	}
+	if !branches[0].Default {
+		t.Errorf("branches[0] (%s) Default = false, want true", branches[0].Name)
+	}
+	if branches[1].Default {
+		t.Errorf("branches[1] (%s) Default = true, want false", branches[1].Name)
+	}
+}

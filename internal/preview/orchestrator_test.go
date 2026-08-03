@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/neon"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	sigsyaml "sigs.k8s.io/yaml"
 )
 
 // ---- fakeGitHub -------------------------------------------------------------
@@ -91,7 +93,19 @@ type fakeNeon struct {
 	deleteErrOnce map[string]error
 	connErr       map[string]error
 	connURI       map[string]string // projectID -> uri to return; default is a synthesized fake uri
-	nextBranchID  int
+	// roles is each BRANCH's role list, keyed by branch ID (not project ID —
+	// Neon's roles endpoint is per-branch, and a preview branch gets its
+	// roles by inheriting its parent's). A branch absent from this map has no
+	// roles at all, which is what makes an unseeded role name fail.
+	roles map[string][]string
+	// rolesErr fails ListRoles for a project, so a test can prove that
+	// "couldn't check" is not treated as "the role exists".
+	rolesErr map[string]error
+	// rolesCalls counts ListRoles calls per project — the witness that a ref
+	// with no migrateRole makes NO roles call at all, which no assertion on
+	// the outcome can show (a service without one succeeds either way).
+	rolesCalls   map[string]int
+	nextBranchID int
 	// listCalls counts ListBranches calls per project — how a test asserts the
 	// orphan sweep lists a project ONCE even when two registry services share
 	// it, which no assertion on the resulting deletions can distinguish (a
@@ -103,6 +117,18 @@ type fakeNeon struct {
 	// default" are indistinguishable after the fact — which is exactly the
 	// bug preview.neon.parent exists to fix.
 	createCalls []neonCreateCall
+}
+
+// overrideKeys names a CopySecret override map's keys, sorted. Keys only:
+// the values are connection strings, and a failing assertion's message is
+// exactly the wrong place for one.
+func overrideKeys(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // neonCreateCall is one recorded CreateBranch, parentID included.
@@ -197,9 +223,17 @@ const seededDefaultBranch = "production"
 // entry's preview.neon.parent names, plus the default branch it is NOT
 // supposed to use. The decoy is listed FIRST, so an implementation that took
 // the head of the branch list rather than matching by name would pick the
-// wrong one and fail.
+// wrong one and fail. It also carries Default: true, which is what the live
+// project reports and what a migrateRole check falls back to when an entry
+// names no parent.
 //
-// Without this, every Up in this file fails Up's parent pre-flight — correct
+// Each seeded branch also gets the ROLES that entry names — its role: and,
+// when set, its migrateRole: — modelling a real project, where both exist and
+// only their privileges differ. Note what this does NOT do: it never seeds a
+// role name the registry didn't ask for, so a registry naming a role that
+// isn't there fails, which is the pre-flight's whole subject.
+//
+// Without this, every Up in this file fails Up's Neon pre-flight — correct
 // behavior, but not what most of these tests are about.
 func (f *fakeNeon) seedRegistryNeonBranches(t *testing.T) {
 	t.Helper()
@@ -208,15 +242,26 @@ func (f *fakeNeon) seedRegistryNeonBranches(t *testing.T) {
 	if f.branches == nil {
 		f.branches = map[string][]neon.Branch{}
 	}
+	if f.roles == nil {
+		f.roles = map[string][]string{}
+	}
 	for _, svc := range testRegistry(t) {
 		ref := svc.Neon
 		if ref == nil || ref.Parent == "" {
 			continue
 		}
+		defaultID := seededBranchID(ref.Project, seededDefaultBranch)
+		parentID := seededBranchID(ref.Project, ref.Parent)
 		f.branches[ref.Project] = []neon.Branch{
-			{ID: seededBranchID(ref.Project, seededDefaultBranch), Name: seededDefaultBranch},
-			{ID: seededBranchID(ref.Project, ref.Parent), Name: ref.Parent},
+			{ID: defaultID, Name: seededDefaultBranch, Default: true},
+			{ID: parentID, Name: ref.Parent},
 		}
+		roles := []string{ref.Role}
+		if ref.MigrateRole != "" {
+			roles = append(roles, ref.MigrateRole)
+		}
+		f.roles[defaultID] = roles
+		f.roles[parentID] = roles
 	}
 }
 
@@ -256,7 +301,15 @@ func (f *fakeNeon) DeleteBranch(_ context.Context, projectID, branchID string) e
 	return nil
 }
 
-func (f *fakeNeon) ConnectionURI(_ context.Context, projectID, _, database, _ string) (string, error) {
+// ConnectionURI's synthesized URI embeds the ROLE it was asked for. That is
+// load-bearing, not decoration: with a migrateRole in play, two URIs are
+// minted for the same project, branch and database, differing only in role.
+// A fake that returned one string for both would make "the initContainer got
+// the migrate role's URI" indistinguishable from "the initContainer got the
+// app's" — every assertion downstream (the Secret's two keys, which key the
+// secretKeyRef points at) would pass against an implementation that minted
+// one URI and used it twice.
+func (f *fakeNeon) ConnectionURI(_ context.Context, projectID, _, database, role string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.connErr[projectID]; ok {
@@ -265,7 +318,37 @@ func (f *fakeNeon) ConnectionURI(_ context.Context, projectID, _, database, _ st
 	if uri, ok := f.connURI[projectID]; ok {
 		return uri, nil
 	}
-	return "postgres://preview:fakesecret@" + projectID + "/" + database, nil
+	return "postgres://" + role + ":fakesecret@" + projectID + "/" + database, nil
+}
+
+func (f *fakeNeon) ListRoles(_ context.Context, projectID, branchID string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rolesCalls == nil {
+		f.rolesCalls = map[string]int{}
+	}
+	f.rolesCalls[projectID]++
+	if err, ok := f.rolesErr[projectID]; ok {
+		return nil, err
+	}
+	return slices.Clone(f.roles[branchID]), nil
+}
+
+// rolesCallsFor reads the ListRoles count for a project under the lock.
+func (f *fakeNeon) rolesCallsFor(projectID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rolesCalls[projectID]
+}
+
+// setBranchRoles replaces the role list the fake reports for one branch.
+func (f *fakeNeon) setBranchRoles(branchID string, roles ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.roles == nil {
+		f.roles = map[string][]string{}
+	}
+	f.roles[branchID] = roles
 }
 
 // ---- fakeGCB --------------------------------------------------------------
@@ -945,10 +1028,24 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 		apiCall.dstNS != ns || apiCall.dstName != "footstrike-api-preview-secrets" {
 		t.Errorf("api secret copy = %+v, unexpected shape", apiCall)
 	}
-	// footstrike-api's Neon project/database in the real registry: see registry.yaml.
-	wantURI := "postgres://preview:fakesecret@aged-river-81935268/neondb"
+	// footstrike-api's Neon project/database/role in the real registry: see
+	// registry.yaml. The role is part of the fake's URI (see ConnectionURI),
+	// so this also pins WHICH role the app's connection string was minted for.
+	wantURI := "postgres://neondb_owner:fakesecret@aged-river-81935268/neondb"
 	if string(apiCall.overrides["DATABASE_URL"]) != wantURI {
 		t.Errorf("DATABASE_URL override = %q, want %q", apiCall.overrides["DATABASE_URL"], wantURI)
+	}
+	// footstrike-api declares no migrateRole, so its preview Secret must be
+	// exactly what it always was: one key. An extra key here would mean a
+	// service nobody onboarded had its behavior changed.
+	if got := overrideKeys(apiCall.overrides); !reflect.DeepEqual(got, []string{"DATABASE_URL"}) {
+		t.Errorf("override keys = %v, want exactly [DATABASE_URL]: a service with no migrateRole must get no extra Secret key", got)
+	}
+	// ...and it makes no ListRoles call at all. This is the assertion that
+	// "omitting migrateRole preserves today's behavior exactly" reaches down
+	// to the API calls, not just the outcome.
+	if got := d.neon.rolesCallsFor("aged-river-81935268"); got != 0 {
+		t.Errorf("ListRoles calls for aged-river-81935268 = %d, want 0: a ref with no migrateRole must not add an API call", got)
 	}
 	tlsCall := d.kube.copySecretCalls[1]
 	if tlsCall.srcNS != "previews" || tlsCall.srcName != previewTLSSecret ||
@@ -1677,6 +1774,265 @@ func TestUpRecordsSourceSHAsBeforeBuilding(t *testing.T) {
 	if got := ann["bifrost/source-shas"]; !strings.Contains(got, "footstrike-api=deadbeef0123456789") {
 		t.Errorf("bifrost/source-shas = %q, want the attempted SHA recorded despite the failure", got)
 	}
+}
+
+// ---- Up: the Neon migrate role -------------------------------------------------
+
+// newIdentityMemberDeps sets up a single-member preview of identity — the one
+// onboarded service whose registry entry declares a migrateRole, and the
+// reason the field exists (its `app` role cannot create a table).
+func newIdentityMemberDeps(t *testing.T) *testDeps {
+	t.Helper()
+	gh := &fakeGitHub{
+		members:  map[string]bool{"identity": true},
+		k8sFiles: map[string]map[string][]byte{"identity": loadFullK8sFixture(t, "identity")},
+	}
+	nc := &fakeNeon{}
+	nc.seedRegistryNeonBranches(t)
+	gc := &fakeGCB{}
+	kc := newFakeKube()
+	o := &Orchestrator{
+		Cfg:        &config.Config{PreviewOAuthClientID: "preview-client-id"},
+		Kube:       kc,
+		GitHub:     gh,
+		Neon:       nc,
+		Builds:     gc,
+		Registry:   testRegistry(t),
+		Fleet:      testFleet(t),
+		TriggerIDs: map[string]string{"identity-preview-build": "trig-identity"},
+	}
+	return &testDeps{orch: o, kube: kc, github: gh, neon: nc, gcb: gc}
+}
+
+// appliedDeploymentObject finds the Deployment named svc among everything Up
+// actually handed to ApplyObjects — asserting on what was applied rather than
+// re-rendering it, so the assertion covers the orchestrator's own wiring of
+// Render's inputs and not just Render.
+func appliedDeploymentObject(t *testing.T, calls [][]*unstructured.Unstructured, svc string) *unstructured.Unstructured {
+	t.Helper()
+	for _, objs := range calls {
+		for _, o := range objs {
+			if o.GetKind() == "Deployment" && o.GetName() == svc {
+				return o
+			}
+		}
+	}
+	t.Fatalf("no Deployment named %s among the applied objects", svc)
+	return nil
+}
+
+// setNeonMigrateRole replaces svc's registry Neon migrate role, copying the
+// NeonRef for the same independence reason setNeonParent does.
+func setNeonMigrateRole(t *testing.T, reg Registry, svc, role string) {
+	t.Helper()
+	entry, ok := reg[svc]
+	if !ok || entry.Neon == nil {
+		t.Fatalf("registry entry for %s has no neon block to set a migrate role on", svc)
+	}
+	ref := *entry.Neon
+	ref.MigrateRole = role
+	entry.Neon = &ref
+	reg[svc] = entry
+}
+
+// TestUpGivesTheMigrateStepItsOwnRole is the end-to-end statement of what
+// migrateRole buys, across the three layers that have to agree: Neon mints
+// TWO connection URIs for the same branch and database, copySecrets carries
+// the second as its own key in the preview Secret, and Render points only the
+// migrate initContainer's DATABASE_URL at that key.
+//
+// The fake's URIs embed the role they were minted for, so every assertion
+// below distinguishes "the migrate role's URI" from "the app's" — a fake that
+// returned one string for both would let an implementation that minted a
+// single URI and used it twice pass the entire test.
+func TestUpGivesTheMigrateStepItsOwnRole(t *testing.T) {
+	d := newIdentityMemberDeps(t)
+	ref := d.orch.Registry["identity"].Neon
+	if ref.MigrateRole == "" || ref.MigrateRole == ref.Role {
+		t.Fatalf("registry.yaml gives identity role=%q migrateRole=%q; this test exists to prove the two are honored separately", ref.Role, ref.MigrateRole)
+	}
+
+	if err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{}); err != nil {
+		t.Fatalf("Up failed: %v", err)
+	}
+
+	// One member secret copy plus the wildcard TLS copy.
+	if len(d.kube.copySecretCalls) != 2 {
+		t.Fatalf("CopySecret called %d times, want 2 (identity secret + tls): %+v", len(d.kube.copySecretCalls), d.kube.copySecretCalls)
+	}
+	idCall := d.kube.copySecretCalls[0]
+	if got := overrideKeys(idCall.overrides); !reflect.DeepEqual(got, []string{"DATABASE_URL", "MIGRATE_DATABASE_URL"}) {
+		t.Fatalf("override keys = %v, want [DATABASE_URL MIGRATE_DATABASE_URL]", got)
+	}
+	const project = "plain-heart-27630935"
+	wantApp := "postgres://app:fakesecret@" + project + "/neondb"
+	wantMigrate := "postgres://neondb_owner:fakesecret@" + project + "/neondb"
+	if got := string(idCall.overrides["DATABASE_URL"]); got != wantApp {
+		t.Errorf("DATABASE_URL override = %q, want %q (the APP's lesser role, unchanged)", got, wantApp)
+	}
+	if got := string(idCall.overrides[migrateDBURLSecretKey]); got != wantMigrate {
+		t.Errorf("%s override = %q, want %q", migrateDBURLSecretKey, got, wantMigrate)
+	}
+
+	// The applied Deployment: the migrate initContainer reads DATABASE_URL
+	// from the migrate key, by reference. The app container gets no env
+	// override at all and keeps whatever envFrom hands it — the app role.
+	dep := appliedDeploymentObject(t, d.kube.applyCalls, "identity")
+	initContainers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers")
+	if err != nil || !found || len(initContainers) != 1 {
+		t.Fatalf("initContainers = %v (found=%v, err=%v), want exactly 1", initContainers, found, err)
+	}
+	initContainer, _ := initContainers[0].(map[string]any)
+	envList, ok := initContainer["env"].([]any)
+	if !ok || len(envList) != 1 {
+		t.Fatalf("initContainer env = %v, want exactly one entry", initContainer["env"])
+	}
+	entry, _ := envList[0].(map[string]any)
+	if name, _ := entry["name"].(string); name != "DATABASE_URL" {
+		t.Errorf("initContainer env[0].name = %q, want DATABASE_URL", name)
+	}
+	gotKey, _, _ := unstructured.NestedString(entry, "valueFrom", "secretKeyRef", "key")
+	if gotKey != migrateDBURLSecretKey {
+		t.Errorf("initContainer secretKeyRef key = %q, want %q", gotKey, migrateDBURLSecretKey)
+	}
+	gotSecret, _, _ := unstructured.NestedString(entry, "valueFrom", "secretKeyRef", "name")
+	if gotSecret != previewSecretName("identity") {
+		t.Errorf("initContainer secretKeyRef name = %q, want %q", gotSecret, previewSecretName("identity"))
+	}
+	containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+	appContainer, _ := containers[0].(map[string]any)
+	if env, hasEnv := appContainer["env"]; hasEnv {
+		t.Errorf("app container has env = %v, want none: the app must keep connecting as its own role", env)
+	}
+
+	// Nothing applied carries a credential. The fake's URIs all contain
+	// "fakesecret", so this catches any path that put a minted URI into a
+	// manifest instead of into the Secret — the failure this design exists
+	// to make impossible.
+	for _, call := range d.kube.applyCalls {
+		for _, o := range call {
+			blob, err := sigsyaml.Marshal(o.Object)
+			if err != nil {
+				t.Fatalf("marshalling %s/%s: %v", o.GetKind(), o.GetName(), err)
+			}
+			if strings.Contains(string(blob), "fakesecret") {
+				t.Errorf("%s/%s applied with a connection string in its spec", o.GetKind(), o.GetName())
+			}
+		}
+	}
+}
+
+// TestUpUnknownNeonMigrateRoleFailsBeforeTheNamespaceExists is the
+// migrateRole half of the Neon pre-flight, and mirrors
+// TestUpUnknownNeonParentFailsBeforeTheNamespaceExists exactly: a role the
+// project doesn't have is a typo in a hand-edited registry, and it must be
+// caught before the namespace exists rather than at stage 5 — where it would
+// leave a zombie failed preview, a round of wasted builds, and (because the
+// connection-URI endpoint's error path never reads its response body) an
+// error saying nothing but a bare HTTP status.
+func TestUpUnknownNeonMigrateRoleFailsBeforeTheNamespaceExists(t *testing.T) {
+	d := newIdentityMemberDeps(t)
+	setNeonMigrateRole(t, d.orch.Registry, "identity", "owner-typo")
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected an error for a migrateRole naming a role that does not exist, got nil")
+	}
+	// Verbatim, like the parent's: this message IS the deliverable. It has to
+	// name the service, the project, the branch whose roles were consulted,
+	// the missing role, and the registry key to go fix.
+	const wantErr = `preview: Up: pre-flight: neon migrate role for identity: ` +
+		`neon project plain-heart-27630935 branch "development" has no role named "owner-typo" (registry preview.neon.migrateRole)`
+	if err.Error() != wantErr {
+		t.Errorf("error =\n  %q\nwant\n  %q", err.Error(), wantErr)
+	}
+	if len(d.kube.namespaces) != 0 {
+		t.Errorf("namespaces = %v, want none: an unknown migrate role must be caught before the namespace exists", d.kube.namespaces)
+	}
+	if len(d.gcb.runCalls) != 0 {
+		t.Errorf("RunTrigger calls = %v, want none: the pre-flight must run before any build minutes are spent", d.gcb.runCalls)
+	}
+	if len(d.kube.copySecretCalls) != 0 {
+		t.Errorf("CopySecret calls = %+v, want none: no URI may be minted for an unverifiable role", d.kube.copySecretCalls)
+	}
+}
+
+// TestUpFailsWhenTheRoleListCannotBeRead pins the "couldn't check is not
+// evidence" half. A ListRoles error must fail the run, not be shrugged off as
+// "assume the role is there" — the same stance verifyNeonRefs takes on a
+// ListBranches error.
+func TestUpFailsWhenTheRoleListCannotBeRead(t *testing.T) {
+	d := newIdentityMemberDeps(t)
+	d.neon.rolesErr = map[string]error{"plain-heart-27630935": errors.New("neon GET /projects/plain-heart-27630935/branches/br-x/roles returned 500")}
+
+	err := d.orch.Up(context.Background(), "hae-cadence", UpOptions{})
+	if err == nil {
+		t.Fatal("expected an error when the role list cannot be read, got nil")
+	}
+	if !strings.Contains(err.Error(), "neon migrate role for identity: listing roles:") {
+		t.Errorf("error = %q, want it to name the stage and the service", err.Error())
+	}
+	if len(d.kube.namespaces) != 0 {
+		t.Errorf("namespaces = %v, want none", d.kube.namespaces)
+	}
+}
+
+// TestVerifyNeonRefsChecksRolesOnTheBranchPreviewsAreCutFrom pins WHICH
+// branch's roles are consulted, which no end-to-end assertion can show: a
+// Neon branch inherits its parent's roles, so the question "will this role
+// exist in the preview?" is answered by the branch the preview is cut from —
+// the parent when one is declared, and the project's DEFAULT branch when none
+// is. Each case seeds the role on only one branch, so an implementation that
+// consulted the other fails.
+func TestVerifyNeonRefsChecksRolesOnTheBranchPreviewsAreCutFrom(t *testing.T) {
+	const project = "proj-x"
+	branches := []neon.Branch{
+		{ID: "br-default", Name: "production", Default: true},
+		{ID: "br-parent", Name: "development"},
+	}
+
+	t.Run("parent declared: the parent's roles decide", func(t *testing.T) {
+		nc := &fakeNeon{branches: map[string][]neon.Branch{project: branches}}
+		nc.setBranchRoles("br-parent", "app", "owner")
+		nc.setBranchRoles("br-default", "app") // no owner here: the decoy
+		o := &Orchestrator{Neon: nc, Registry: Registry{
+			"svc": {Neon: &NeonRef{Project: project, Database: "db", Role: "app", MigrateRole: "owner", Parent: "development"}},
+		}}
+		if err := o.verifyNeonRefs(context.Background(), []string{"svc"}); err != nil {
+			t.Errorf("verifyNeonRefs = %v, want nil (owner exists on the parent branch)", err)
+		}
+	})
+
+	t.Run("no parent: the project default's roles decide", func(t *testing.T) {
+		nc := &fakeNeon{branches: map[string][]neon.Branch{project: branches}}
+		nc.setBranchRoles("br-default", "app", "owner")
+		nc.setBranchRoles("br-parent", "app") // the decoy this time
+		o := &Orchestrator{Neon: nc, Registry: Registry{
+			"svc": {Neon: &NeonRef{Project: project, Database: "db", Role: "app", MigrateRole: "owner"}},
+		}}
+		if err := o.verifyNeonRefs(context.Background(), []string{"svc"}); err != nil {
+			t.Errorf("verifyNeonRefs = %v, want nil (owner exists on the default branch, which is what an absent parent cuts from)", err)
+		}
+	})
+
+	t.Run("role present on the wrong branch only", func(t *testing.T) {
+		// The discriminating case: `owner` exists in the project, just not on
+		// the branch previews of this service are cut from.
+		nc := &fakeNeon{branches: map[string][]neon.Branch{project: branches}}
+		nc.setBranchRoles("br-default", "app", "owner")
+		nc.setBranchRoles("br-parent", "app")
+		o := &Orchestrator{Neon: nc, Registry: Registry{
+			"svc": {Neon: &NeonRef{Project: project, Database: "db", Role: "app", MigrateRole: "owner", Parent: "development"}},
+		}}
+		err := o.verifyNeonRefs(context.Background(), []string{"svc"})
+		if err == nil {
+			t.Fatal("expected an error when the role is absent from the parent branch, got nil")
+		}
+		const want = `neon migrate role for svc: neon project proj-x branch "development" has no role named "owner" (registry preview.neon.migrateRole)`
+		if err.Error() != want {
+			t.Errorf("error =\n  %q\nwant\n  %q", err.Error(), want)
+		}
+	})
 }
 
 // ---- Up: the Neon parent branch ------------------------------------------------

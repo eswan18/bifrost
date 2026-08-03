@@ -214,18 +214,39 @@ ran `up` for is the symptom.
    anything else is touched. This fails fast, cleanly, if — for
    example — `PREVIEW_OAUTH_CLIENT_ID` isn't configured.
 
-   **Neon parent pre-flight**, in the same place and for the same reason: any
-   member whose `neon:` block names a `parent:` must have that branch present
-   in its Neon project, or the run aborts with e.g. `preview: Up: pre-flight:
-   neon parent branch for footstrike-api: neon project aged-river-81935268 has
-   no branch named "staging-typo" (registry preview.neon.parent)`. Step 5
-   checks the same thing again at the moment it creates the branch — that is
-   the real gate, since a branch can vanish in the minutes between — but a
-   failure *there* would leave a `failed`-phase namespace to clean up by hand
-   plus a full round of wasted build minutes, for what is almost always a typo
-   in a hand-edited registry. Neither check ever falls back to the project's
-   default branch: that default *is* production, so a silent fallback would
-   restore the very bug `parent:` exists to fix, invisibly.
+   **Neon pre-flight**, in the same place and for the same reason, covering
+   the two things a `neon:` block can name that only the live project can
+   confirm:
+
+   - **`parent:`** — the branch must be present in the member's Neon project,
+     or the run aborts with e.g. `preview: Up: pre-flight: neon parent branch
+     for footstrike-api: neon project aged-river-81935268 has no branch named
+     "staging-typo" (registry preview.neon.parent)`. Step 5 checks the same
+     thing again at the moment it creates the branch — that is the real gate,
+     since a branch can vanish in the minutes between — but a failure *there*
+     would leave a `failed`-phase namespace to clean up by hand plus a full
+     round of wasted build minutes, for what is almost always a typo in a
+     hand-edited registry. Neither check ever falls back to the project's
+     default branch: that default *is* production, so a silent fallback would
+     restore the very bug `parent:` exists to fix, invisibly.
+   - **`migrateRole:`** — when set, the role must exist on the branch previews
+     of that service are cut from (its `parent:`, or the project's default
+     branch when it names none — a Neon branch inherits its parent's roles,
+     so that is the same set the preview branch will have). A miss aborts with
+     `preview: Up: pre-flight: neon migrate role for identity: neon project
+     plain-heart-27630935 branch "development" has no role named "owner-typo"
+     (registry preview.neon.migrateRole)`. Unlike the parent's, this check has
+     no silent wrong answer to prevent: step 5's connection-URI call would
+     reject an unknown role and fail the run anyway. What it prevents is
+     failing *late* and *opaquely* — that call's error path never reads its
+     response body (it's the endpoint whose body is a credential), so all it
+     can report is a bare HTTP status, minutes in, with a zombie namespace
+     behind it.
+
+   The role check costs one extra API call, and **only for a member that
+   declares a `migrateRole:`**. A service without one (footstrike-api) makes
+   exactly the calls it always did; `role:` keeps the gate it has always had,
+   which is the connection-URI call that mints it.
 3. **Refuse an unusable namespace**, then **ensure the namespace**. The
    refusals are a single `GetNamespace` immediately before the write below
    (`refuseUnusableNamespace` in `orchestrator.go` — one API call, two
@@ -463,6 +484,18 @@ ran `up` for is the symptom.
    namespace — copied rather than reissued per preview, since Let's
    Encrypt's duplicate-certificate limit is 5/week for an identical
    `dnsNames` set).
+
+   A member whose `neon:` block declares a `migrateRole:` gets **one extra
+   key**, `MIGRATE_DATABASE_URL`, holding the same branch and database as that
+   role. It is an extra key rather than a second Secret, which has one honest
+   consequence: the preview Secret is in the app container's `envFrom` too, so
+   `MIGRATE_DATABASE_URL` is present in the app's environment as well. What
+   matters is that the app's `DATABASE_URL` — the variable its code reads — is
+   still the app role's, so the privilege check `migrateRole:` exists to
+   preserve still bites. A member without a `migrateRole:` gets exactly the
+   one key it always did. Nothing is sticky: the copy is re-made from the
+   staging source on every run, so removing `migrateRole:` from the registry
+   removes the key on the next `up`.
 7. **Render and apply** (step: `applying manifests`): for each member, fetch
    its `k8s/` tree, parse its
    `staging/configmap-env.yaml` (empty map if it has none), compute the final
@@ -832,8 +865,10 @@ footstrike-api:
     neon:                                 # omit for apps with no database
       project: aged-river-81935268
       database: neondb
-      role: neondb_owner
+      role: neondb_owner                  # the role the APP connects as
       parent: development                 # branch NAME to cut previews from
+      # migrateRole: neondb_owner         # optional; see below. Not set here:
+      #   footstrike-api's app role already owns its schema.
     migrate: ["alembic", "upgrade", "head"]  # omit for apps with no migrations
     env:
       ENV: staging
@@ -886,6 +921,59 @@ file not found in $PATH" before the `migrate` subcommand ever ran. Each
 service's entry carries a comment explaining which convention it needs and
 why — don't "simplify" one to match the other without checking that
 service's own Dockerfile first.
+
+### `migrateRole:` — running migrations as someone else
+
+`role:` is the role the **app** connects as. `migrateRole:`, when set, is the
+role the **`migrate` initContainer** connects as instead; omit it and both use
+`role:`, exactly as everything did before this key existed.
+
+It exists because one connection string used to serve both, at the app's
+privilege level — and an app role routinely cannot create a table. Of the
+three onboarded apps, only footstrike-api's role happens to own its schema:
+
+| app | `role:` | CREATE on schema public | tables owned by |
+|---|---|---|---|
+| footstrike-api | `neondb_owner` | yes | `neondb_owner` |
+| identity | `app` | no | `neondb_owner` |
+| forecasting | `app_user` | no | `neondb_owner` |
+
+So identity's previews could not have run a migration that creates or alters a
+table, and nobody had noticed: a preview branch is cut from staging and starts
+on staging's schema, which makes `migrate` a no-op on almost every branch. The
+first identity branch to add a migration would have failed in the
+initContainer.
+
+**Why not just run the whole preview as the owner?** Because the app must keep
+its real, lesser privileges in a preview. A migration that creates a table and
+forgets to `GRANT` the app role access should still **fail in the preview** —
+catching that before production is the entire point of having previews.
+Splitting the two roles fixes the migration step without weakening what a
+preview proves about the app.
+
+How it reaches the pod, and what it deliberately isn't:
+
+- bifrost mints a **second** connection URI for the same preview branch and
+  database as `migrateRole:`, and copies it into the preview Secret as
+  `MIGRATE_DATABASE_URL` (step 6).
+- the generated Deployment gives the migrate initContainer **one explicit
+  `env:` entry** re-pointing `DATABASE_URL` at that Secret key via
+  `valueFrom.secretKeyRef`. An explicit `env:` entry outranks an `envFrom`
+  source carrying the same key — Kubernetes' own API contract, stated in
+  core/v1 `Container.EnvFrom`'s godoc ("values defined by an Env with a
+  duplicate key will take precedence"). `envFrom` is otherwise still the
+  identical list the app container gets, so only this one key differs, and
+  only for this one container.
+- **the URI never appears in the Deployment.** Only the Secret *key name*
+  crosses into the renderer. A connection string in a Deployment spec would be
+  readable by anything with `get` on Deployments in the namespace; in the
+  Secret it is read at pod-start time by the kubelet.
+
+`migrateRole:` without `migrate:` is **rejected at registry-load time**: with
+no initContainer, the role names nobody, and accepting it would mint a live
+credential nothing consumes while the line read as though migrations were
+wired up. The reverse (`migrate:` with no `migrateRole:`) is the common case
+and is fine.
 
 Three template forms (`internal/preview/template.go`'s `Eval`), each either a
 literal (no `{{`/`}}`, passed through unchanged) or exactly one
@@ -956,7 +1044,11 @@ changes:
    load time). If it has a database, **set `neon.parent` to its staging
    branch** — verified by endpoint, per "The registry" above. Leaving it out
    is not a neutral default: previews will clone that project's *production*
-   branch.
+   branch. If it also declares `migrate:`, **check whether its `role:` can
+   actually run a migration** (`CREATE` on schema `public`, ownership of the
+   tables being altered) and set `neon.migrateRole` if it can't — see
+   "`migrateRole:`" above, including why promoting `role:` instead is the
+   wrong fix.
 2. **A `cloudbuild-preview.yaml` in the app's own repo** that builds and
    pushes `{image}:preview-$SHORT_SHA` (see
    `footstrike-api/cloudbuild-preview.yaml` for the working pattern — no

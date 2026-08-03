@@ -111,6 +111,15 @@ func TestLoad(t *testing.T) {
 		if *svc.Preview.Neon != wantNeon {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
 		}
+		// No migrateRole, stated as its own assertion rather than left
+		// implicit in the struct compare above: footstrike-api's app role
+		// already owns every table in its project, so it is the one onboarded
+		// service that must stay on a single connection string. Adding one
+		// here would silently change the behavior of a service this feature
+		// was never for.
+		if svc.Preview.Neon.MigrateRole != "" {
+			t.Errorf("Preview.Neon.MigrateRole = %q, want empty: footstrike-api's app role owns its schema and needs no split", svc.Preview.Neon.MigrateRole)
+		}
 		wantEnv := map[string]string{
 			"ENV":                       "staging",
 			"PUBLIC_API_BASE_URL":       "{{ url self }}",
@@ -176,9 +185,23 @@ func TestLoad(t *testing.T) {
 		}
 		// Same reasoning as footstrike-api's above: identity's staging
 		// branch, not its Neon default (`production`).
-		wantNeon := NeonRef{Project: "plain-heart-27630935", Database: "neondb", Role: "app", Parent: "development"}
+		//
+		// The two roles are the point of this one. `app` has no CREATE on
+		// schema public and owns none of the tables, so while it served both
+		// the app and the migrate initContainer, the first identity branch to
+		// add a migration would have failed in that initContainer. It never
+		// did only because a preview branch is cut from staging and starts on
+		// staging's schema, making `migrate` a no-op. Role and MigrateRole
+		// must stay DIFFERENT: collapsing them either way loses something —
+		// both `app` re-breaks migrations, both `neondb_owner` hands the app
+		// privileges it doesn't have in production, which is exactly the
+		// class of bug previews exist to surface.
+		wantNeon := NeonRef{Project: "plain-heart-27630935", Database: "neondb", Role: "app", MigrateRole: "neondb_owner", Parent: "development"}
 		if *svc.Preview.Neon != wantNeon {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
+		}
+		if svc.Preview.Neon.Role == svc.Preview.Neon.MigrateRole {
+			t.Errorf("Role and MigrateRole are both %q; the app must keep its lesser privileges in a preview", svc.Preview.Neon.Role)
 		}
 		wantEnv := map[string]string{"JWT_ISSUER": "{{ url self }}"}
 		if !reflect.DeepEqual(svc.Preview.Env, wantEnv) {
@@ -352,6 +375,86 @@ foo:
 		}
 		if got := reg["foo"].Preview.Neon.Parent; got != "" {
 			t.Errorf("Preview.Neon.Parent = %q, want \"\" when the key is omitted", got)
+		}
+	})
+
+	t.Run("neon migrateRole parses alongside a distinct role", func(t *testing.T) {
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: app
+      migrateRole: owner
+    migrate: ["migrate"]
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := NeonRef{Project: "proj-1", Database: "db", Role: "app", MigrateRole: "owner"}
+		if *reg["foo"].Preview.Neon != want {
+			t.Errorf("Preview.Neon = %+v, want %+v", *reg["foo"].Preview.Neon, want)
+		}
+	})
+
+	t.Run("neon migrateRole is empty when omitted", func(t *testing.T) {
+		// The backwards-compatibility guarantee, the same one parent: has
+		// above: an entry that doesn't ask for a split role parses to "", and
+		// "" is what makes internal/preview mint one URI, write one Secret
+		// key, and render no env: on the initContainer — byte-for-byte what
+		// it did before migrateRole existed.
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: owner
+    migrate: ["migrate"]
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := reg["foo"].Preview.Neon.MigrateRole; got != "" {
+			t.Errorf("Preview.Neon.MigrateRole = %q, want \"\" when the key is omitted", got)
+		}
+	})
+
+	t.Run("neon migrateRole without migrate errors", func(t *testing.T) {
+		// A meaningless combination, and rejected rather than ignored: with
+		// no migrate: there is no initContainer for the role to apply to, so
+		// accepting it would mint a live connection URI for a role nothing
+		// reads and copy it into the preview's Secret, while the registry
+		// line read as though migrations were configured.
+		_, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: app
+      migrateRole: owner
+`))
+		if err == nil {
+			t.Fatal("expected an error for migrateRole with no migrate:, got nil")
+		}
+	})
+
+	t.Run("migrate without migrateRole is fine", func(t *testing.T) {
+		// The other direction is the COMMON case (footstrike-api), not an
+		// error: an app whose own role can already run its migrations needs
+		// no second role. This pins that the check above is one-directional.
+		if _, err := parseRegistry([]byte(`
+foo:
+  preview:
+    neon:
+      project: proj-1
+      database: db
+      role: owner
+    migrate: ["alembic", "upgrade", "head"]
+`)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 
