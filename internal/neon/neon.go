@@ -30,9 +30,15 @@ const httpTimeout = 10 * time.Second
 // branch younger than an hour, so a silently absent timestamp would defeat
 // that floor rather than trip it. The field is required by the API, so this is
 // a note on what to watch for, not a live hazard.
+// Default reports whether this is the project's DEFAULT branch — the one
+// CreateBranch cuts from when it is passed an empty parent ID, and (in every
+// project bifrost touches) production. Like created_at it is a REQUIRED
+// property of Neon's v2 Branch schema, so a false here means "not the
+// default" rather than "the API didn't say".
 type Branch struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
+	Default   bool      `json:"default"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -43,6 +49,11 @@ type Client interface {
 	CreateBranch(ctx context.Context, projectID, name, parentID string) (Branch, error)
 	DeleteBranch(ctx context.Context, projectID, branchID string) error
 	ConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error)
+	// ListRoles returns the NAMES of the Postgres roles on a branch. A branch
+	// inherits its parent's roles, so asking the branch a preview will be cut
+	// from answers "will this role exist in the preview?" before the preview
+	// branch itself exists — see internal/preview.verifyNeonRefs.
+	ListRoles(ctx context.Context, projectID, branchID string) ([]string, error)
 }
 
 type client struct {
@@ -167,6 +178,33 @@ func (c *client) ListBranches(ctx context.Context, projectID string) ([]Branch, 
 		return nil, err
 	}
 	return body.Branches, nil
+}
+
+// ListRoles is the second endpoint (after ConnectionURI) whose error path
+// passes includeBodyInError=false, and for the same reason: its response
+// carries credentials. Neon's published spec marks the whole `roles` array
+// x-sensitive and each Role's `password` field with it, so a branch's role
+// list is not a body that may be echoed into an error that ends up in the
+// bifrost/error annotation, the JSON API, and a browser.
+//
+// Only names are decoded, and only names are returned. `password` is never
+// bound to a field here even on the success path, so nothing downstream can
+// accidentally log a role's credentials by printing this function's result.
+func (c *client) ListRoles(ctx context.Context, projectID, branchID string) ([]string, error) {
+	var body struct {
+		Roles []struct {
+			Name string `json:"name"`
+		} `json:"roles"`
+	}
+	path := "/projects/" + url.PathEscape(projectID) + "/branches/" + url.PathEscape(branchID) + "/roles"
+	if err := c.do(ctx, http.MethodGet, path, nil, &body, false, http.StatusOK); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(body.Roles))
+	for _, r := range body.Roles {
+		names = append(names, r.Name)
+	}
+	return names, nil
 }
 
 func (c *client) CreateBranch(ctx context.Context, projectID, name, parentID string) (Branch, error) {

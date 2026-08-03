@@ -29,6 +29,29 @@ type NeonRef struct {
 	Project  string `json:"project"`
 	Database string `json:"database"`
 	Role     string `json:"role"`
+	// MigrateRole, when set, is the role the `migrate` initContainer connects
+	// as — while the app container goes on connecting as Role. Empty (the
+	// default) means both connect as Role, exactly as they always have.
+	//
+	// It exists because one connection string used to serve both, at the
+	// APP's privilege level, and an app role is routinely not allowed to
+	// create tables: of the roles in this file, only footstrike-api's happens
+	// to own its schema. identity's `app` and forecasting's `app_user` have
+	// no CREATE on schema public, so a preview of a branch adding a table
+	// failed in the initContainer — a latent break that stayed invisible only
+	// while every preview branch was schema-identical to the staging branch
+	// it was cut from, making `migrate` a no-op.
+	//
+	// Why not simply run the whole preview as the owner? Because the app must
+	// keep its real, lesser privileges in a preview. A migration that creates
+	// a table and forgets to grant the app role access should still FAIL in
+	// the preview — catching that before production is the entire point of
+	// having previews. Splitting the two roles fixes the migration step
+	// without weakening what a preview proves about the app.
+	//
+	// Only meaningful alongside Preview.Migrate; parseRegistry rejects it
+	// without one rather than minting a credential nothing consumes.
+	MigrateRole string `json:"migrateRole,omitempty"`
 	// Parent is the NAME of the branch a preview's branch is cut from —
 	// "development", not "br-solitary-sun-ad74wwhf". This file is hand-edited
 	// and reviewed in a diff, where an opaque branch ID would be
@@ -56,6 +79,10 @@ type Preview struct {
 	// pointing at this preview's fresh Neon branch. Empty = no migration
 	// step. Kept beside Neon deliberately: branch the database, then bring
 	// it up to the branch's schema.
+	//
+	// The one env key that can differ from the app's is DATABASE_URL, and
+	// only when the Neon ref sets MigrateRole — see there for why migrations
+	// may need a role the app deliberately doesn't have.
 	Migrate []string `json:"migrate,omitempty"`
 }
 
@@ -94,6 +121,16 @@ func Load() (Registry, error) {
 // preview block's required key must also appear in that same block's env —
 // a required key with no template to resolve is a registry bug, not a
 // runtime error to discover later.
+//
+// neon.migrateRole without migrate is rejected on the same principle. The
+// combination has no meaning: migrateRole exists solely to say which role the
+// migrate initContainer connects as, and with no migrate: there is no
+// initContainer. Accepting it would mint a second connection URI for a role
+// nothing ever uses and copy it into the preview's Secret — a live credential
+// with no consumer — while the key itself read as though migrations were
+// wired up. Rejecting is also the fail-safe direction of the likelier typo:
+// somebody adding migrateRole and forgetting migrate wants to be told, and
+// nobody is served by a registry that quietly half-configures.
 func parseRegistry(data []byte) (Registry, error) {
 	var reg Registry
 	if err := sigsyaml.UnmarshalStrict(data, &reg); err != nil {
@@ -107,6 +144,9 @@ func parseRegistry(data []byte) (Registry, error) {
 			if _, ok := svc.Preview.Env[key]; !ok {
 				return nil, fmt.Errorf("registry: %s: required key %q has no matching env template", name, key)
 			}
+		}
+		if svc.Preview.Neon != nil && svc.Preview.Neon.MigrateRole != "" && len(svc.Preview.Migrate) == 0 {
+			return nil, fmt.Errorf("registry: %s: preview.neon.migrateRole is set but preview.migrate is not: the role only names who runs the migrate initContainer, and there is none", name)
 		}
 	}
 	return reg, nil

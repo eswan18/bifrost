@@ -53,9 +53,10 @@ types:
   service should be part of `bif preview up`. See
   [`docs/preview-environments.md`](preview-environments.md) for its
   `neon` (including `neon.parent`, which decides where a preview's data comes
-  from)/`env`/`required`/`migrate` fields and the env-template resolution
-  cascade; a service with no `preview:` block simply isn't a preview
-  candidate, and everything above still works without it.
+  from, and `neon.migrateRole`, which decides who runs the
+  migrations)/`env`/`required`/`migrate` fields and the env-template
+  resolution cascade; a service with no `preview:` block simply isn't a
+  preview candidate, and everything above still works without it.
 
 That's it on bifrost's side. Once a new image carrying this entry is
 running — staging automatically, prod after `bif promote bifrost` — the
@@ -142,6 +143,18 @@ preview of a branch with a new migration crash-loops. An app that runs its own
 migrations at startup doesn't need the key. An app that neither runs nor
 verifies them will start happily against the wrong schema, which is worse than
 crash-looping — set `migrate:` for that case too.
+
+**And if you set `migrate:`, check what the app's Neon role can actually do.**
+The migration runs as `neon.role` unless you also set `neon.migrateRole`, and
+an app role that can't `CREATE` in schema `public` can't run a migration that
+adds a table — the failure lands in the initContainer, and it stays hidden
+until the first branch that carries a real migration. Two of the three apps
+onboarded today needed `migrateRole:`; only footstrike-api's role happened to
+own its own schema. Do **not** solve it by promoting `role:` to the owner:
+previews are supposed to catch a migration that creates a table and forgets to
+grant the app access, and they can only do that if the app connects with the
+privileges it really has. See "`migrateRole:`" in
+[`docs/preview-environments.md`](preview-environments.md).
 
 ## Gotcha: the CLI has its own copy of this file
 

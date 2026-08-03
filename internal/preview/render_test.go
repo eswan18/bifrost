@@ -369,6 +369,18 @@ func TestRenderMigrateInitContainer(t *testing.T) {
 		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
 	}
 
+	// No env: at all. This input sets no MigrateSecretKey -- footstrike-api's
+	// registry entry declares no migrateRole, because its app role already
+	// owns its schema -- and such a service's rendered output must be exactly
+	// what it was before migrateRole existed: envFrom alone, with nothing
+	// overriding DATABASE_URL for the migrate step. An env: block appearing
+	// here would mean the feature leaked into a service that never asked for
+	// it. See TestRenderMigrateInitContainerUsesMigrateSecretKey for the
+	// other half.
+	if _, hasEnv := initContainer["env"]; hasEnv {
+		t.Errorf("initContainer has env = %v, want none when MigrateSecretKey is unset", initContainer["env"])
+	}
+
 	// No volumeMounts: previews strip the base's CSI secrets-store volume
 	// machinery entirely (volumesDeletePatch), and the initContainer is
 	// generated fresh with none to begin with.
@@ -466,6 +478,152 @@ func TestRenderIdentityMigrateInitContainer(t *testing.T) {
 	if !reflect.DeepEqual(initContainer["envFrom"], appContainer["envFrom"]) {
 		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
 	}
+}
+
+// TestRenderMigrateInitContainerUsesMigrateSecretKey is the discriminating
+// test for migrateRole's render half: with MigrateSecretKey set, the migrate
+// initContainer must carry an explicit env: entry sourcing DATABASE_URL from
+// that key of the preview Secret, while the APP container carries no such
+// entry and goes on reading whatever envFrom gives it.
+//
+// Three separate properties, each of which a plausible wrong implementation
+// would satisfy alone:
+//
+//   - the override is on the initContainer only (a patch that added it to
+//     both would hand the app the migration role's privileges, destroying the
+//     property migrateRole exists to preserve);
+//   - it is a secretKeyRef, not a literal (an implementation that passed the
+//     URI itself into Render would put a live credential in a Deployment spec
+//     — see the no-credential assertion below, which reads the whole rendered
+//     output, not just this container);
+//   - envFrom is still byte-identical to the app's, so the initContainer
+//     keeps getting every other value the app gets and only this one key
+//     differs.
+//
+// What this test does NOT prove, because no unit test can, is that
+// Kubernetes really lets env: win over an envFrom source carrying the same
+// key. That is a documented API contract rather than an observation: core/v1
+// Container.EnvFrom's own godoc, in the k8s.io/api module this repo already
+// depends on, states "values defined by an Env with a duplicate key will take
+// precedence" (k8s.io/api@v0.36.2 core/v1/types.go). The rendered shape
+// asserted here is what that contract applies to.
+func TestRenderMigrateInitContainerUsesMigrateSecretKey(t *testing.T) {
+	in := RenderInput{
+		Service:          "identity",
+		Tag:              "hae-cadence",
+		ShortSHA:         "abc1234",
+		K8sFiles:         loadK8sFixture(t, "identity"),
+		EnvConfig:        loadEnvConfigFixture(t, "identity"),
+		SecretName:       "identity-preview-secrets",
+		Migrate:          []string{"/app/auth-service", "migrate"},
+		MigrateSecretKey: "MIGRATE_DATABASE_URL",
+	}
+
+	objs, err := Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	dep := findObject(t, objs, "Deployment", "identity")
+	initContainers, found, err := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "initContainers")
+	if err != nil || !found || len(initContainers) != 1 {
+		t.Fatalf("initContainers = %v (found=%v, err=%v), want exactly 1", initContainers, found, err)
+	}
+	initContainer, ok := initContainers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("initContainers[0] is not a map: %T", initContainers[0])
+	}
+
+	wantEnv := []any{
+		map[string]any{
+			"name": "DATABASE_URL",
+			"valueFrom": map[string]any{
+				"secretKeyRef": map[string]any{
+					"name": "identity-preview-secrets",
+					"key":  "MIGRATE_DATABASE_URL",
+				},
+			},
+		},
+	}
+	if !reflect.DeepEqual(initContainer["env"], wantEnv) {
+		t.Errorf("initContainer env =\n  %#v\nwant\n  %#v", initContainer["env"], wantEnv)
+	}
+
+	containers, _, _ := unstructured.NestedSlice(dep.Object, "spec", "template", "spec", "containers")
+	if len(containers) != 1 {
+		t.Fatalf("containers = %v, want exactly 1", containers)
+	}
+	appContainer, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("containers[0] is not a map: %T", containers[0])
+	}
+	// The load-bearing half: the APP keeps the app role. If this ever gains a
+	// DATABASE_URL entry, a preview stops proving anything about whether the
+	// app can reach the tables its migrations create.
+	if env, hasEnv := appContainer["env"]; hasEnv {
+		t.Errorf("app container has env = %v, want none: only the migrate step may have its DATABASE_URL re-pointed", env)
+	}
+	if !reflect.DeepEqual(initContainer["envFrom"], appContainer["envFrom"]) {
+		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
+	}
+
+	// No credential anywhere in what gets applied. Render is never given a
+	// connection URI, so it cannot leak one -- but this asserts the outcome
+	// over every rendered object rather than the input, so an implementation
+	// that grew a way to pass one in (a "MigrateDatabaseURL string" field, a
+	// helpfully inlined value) fails here rather than shipping a Deployment
+	// spec that anything with get on Deployments can read.
+	for _, o := range objs {
+		blob, err := sigsyaml.Marshal(o.Object)
+		if err != nil {
+			t.Fatalf("marshalling %s/%s: %v", o.GetKind(), o.GetName(), err)
+		}
+		if strings.Contains(string(blob), "postgres://") {
+			t.Errorf("%s/%s contains a postgres:// connection string; credentials belong in the Secret, never in an applied spec", o.GetKind(), o.GetName())
+		}
+	}
+}
+
+// TestRenderRejectsAnUnusableMigrateSecretKey covers the two combinations
+// that would render something broken or silently do nothing. Neither is
+// reachable from Up today -- the orchestrator only sets the key for a member
+// that has a Secret, and parseRegistry rejects migrateRole without migrate --
+// which is precisely why they are refused here: this is the layer that would
+// have to keep holding if either upstream guard were ever relaxed.
+func TestRenderRejectsAnUnusableMigrateSecretKey(t *testing.T) {
+	base := func() RenderInput {
+		return RenderInput{
+			Service:          "identity",
+			Tag:              "hae-cadence",
+			ShortSHA:         "abc1234",
+			K8sFiles:         loadK8sFixture(t, "identity"),
+			EnvConfig:        loadEnvConfigFixture(t, "identity"),
+			SecretName:       "identity-preview-secrets",
+			Migrate:          []string{"/app/auth-service", "migrate"},
+			MigrateSecretKey: "MIGRATE_DATABASE_URL",
+		}
+	}
+
+	t.Run("no SecretName to read the key from", func(t *testing.T) {
+		// Would render secretKeyRef{name: ""} -- a reference to a Secret that
+		// cannot exist, failing at pod start rather than here.
+		in := base()
+		in.SecretName = ""
+		if _, err := Render(in); err == nil {
+			t.Fatal("expected an error for MigrateSecretKey with no SecretName, got nil")
+		}
+	})
+
+	t.Run("no Migrate command to apply it to", func(t *testing.T) {
+		// Renders no initContainers at all, so the key would be accepted and
+		// then quietly dropped -- the failure mode this repo's registry
+		// loader already refuses one layer up.
+		in := base()
+		in.Migrate = nil
+		if _, err := Render(in); err == nil {
+			t.Fatal("expected an error for MigrateSecretKey with no Migrate, got nil")
+		}
+	})
 }
 
 func TestRenderDashboard(t *testing.T) {
@@ -912,5 +1070,67 @@ patchesStrategicMerge:
 	}
 	if !strings.Contains(err.Error(), ref) {
 		t.Errorf("error = %q, want it to name the offending ref %q", err.Error(), ref)
+	}
+}
+
+// TestRenderKeepsAnEmptyEnvValue is the render-layer half of forecasting's
+// SENTRY_DSN: "" (internal/preview's TestEnvConfigEmptyOverrideBeatsThe
+// StagingBaseline is the env-computation half): an empty value must survive
+// the whole generated overlay -- the ConfigMap this package writes, the YAML
+// round-trip through the in-memory filesystem, and kustomize's own build --
+// and come out as a key that is PRESENT with an empty value.
+//
+// Present-and-empty is the distinction that matters and the one a naive
+// implementation loses. forecasting's Sentry configs read
+// `process.env.SENTRY_DSN || undefined`, so an empty string disables the SDK
+// -- but a DROPPED key would fall back to whatever the container's other env
+// sources supply, which for a preview is staging's ConfigMap, i.e. staging's
+// real DSN. Any layer here that treated "" as "unset" (a YAML marshaller
+// with omitempty, a kustomize transformer pruning empty scalars) would send
+// every preview's errors into the Sentry project someone actually watches,
+// and would do it silently.
+func TestRenderKeepsAnEmptyEnvValue(t *testing.T) {
+	envConfig := map[string]string{
+		"SENTRY_DSN":      "",
+		"PUBSUB_TOPIC":    "forecasting-staging-notifications",
+		"APP_BASE_URL":    "https://footstrike-api-hae-cadence.preview.footstrike.run",
+		"EMPTY_LOOKALIKE": `""`,
+	}
+	objs, err := Render(RenderInput{
+		Service:   "footstrike-api",
+		Tag:       "hae-cadence",
+		ShortSHA:  "abc1234",
+		K8sFiles:  loadK8sFixture(t, "footstrike-api"),
+		EnvConfig: envConfig,
+	})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	cm := findObject(t, objs, "ConfigMap", "footstrike-api-preview-env")
+	data, found, err := unstructured.NestedStringMap(cm.Object, "data")
+	if err != nil || !found {
+		t.Fatalf("preview-env ConfigMap data missing (found=%v, err=%v)", found, err)
+	}
+	got, present := data["SENTRY_DSN"]
+	if !present {
+		t.Fatalf("SENTRY_DSN was dropped from the rendered ConfigMap (data = %v); an absent key falls through to staging's value, an empty one disables the SDK", data)
+	}
+	if got != "" {
+		t.Errorf("SENTRY_DSN = %q, want the empty string", got)
+	}
+	// The non-empty siblings are still intact, so a passing empty-key
+	// assertion can't be an artifact of the whole map being mangled.
+	if data["PUBSUB_TOPIC"] != envConfig["PUBSUB_TOPIC"] {
+		t.Errorf("PUBSUB_TOPIC = %q, want %q", data["PUBSUB_TOPIC"], envConfig["PUBSUB_TOPIC"])
+	}
+	// A value that merely LOOKS empty must not be confused with one that is:
+	// this one is two literal quote characters, and it has to survive as
+	// such rather than being re-parsed into "".
+	if data["EMPTY_LOOKALIKE"] != `""` {
+		t.Errorf("EMPTY_LOOKALIKE = %q, want the two-character string %q", data["EMPTY_LOOKALIKE"], `""`)
+	}
+	if len(data) != len(envConfig) {
+		t.Errorf("ConfigMap data has %d entries, want %d: %v", len(data), len(envConfig), data)
 	}
 }

@@ -24,6 +24,58 @@ forecasting:
   urls:
     staging: https://forecasting-staging.tailc06f30.ts.net
     prod: https://forecasting.ethanswan.com
+  preview:
+    neon:
+      project: blue-term-48495338
+      database: neondb
+      role: app_user
+      # app_user has NO CREATE on the database and none on schema public
+      # either; every table here is owned by neondb_owner. Without this split
+      # the migrate initContainer below could not create or alter a single
+      # table -- see identity's entry above for the full story, including why
+      # the app deliberately keeps the lesser role.
+      migrateRole: neondb_owner
+      # forecasting's STAGING branch. Note the names: this project's pair is
+      # `dev`/`main`, not the `development`/`production` both other projects
+      # use -- `main` is this project's Neon default and is what prod runs on,
+      # so omitting parent: here would clone PROD, exactly as it would there.
+      # That the three projects disagree is the reason the rule is "check the
+      # endpoint, never the name": confirmed by matching the endpoint ID
+      # inside the `forecasting_staging_database_url` secret against this
+      # project's Neon endpoints. Do the same for the next one.
+      parent: dev
+    # A bundled JS entry point, not a CLI -- the same "what does THIS image
+    # actually have" question footstrike-api's bare `alembic` and identity's
+    # absolute `/app/auth-service` each answer differently. forecasting's
+    # runner image carries neither kysely-ctl nor tsx, so there is no
+    # migration CLI to invoke; forecasting#168 added an esbuild bundle at
+    # /app/migrate/index.js precisely so the initContainer has something
+    # `node` can run with no dev dependencies present. Check the image before
+    # "simplifying" this into a package script.
+    migrate: ["node", "/app/migrate/index.js"]
+    env:
+      APP_BASE_URL: "{{ url self }}"
+      IDP_BASE_URL: "{{ internalUrl identity }}"
+      IDP_PUBLIC_URL: "{{ url identity }}"
+      # Deliberately empty, and deliberately NOT in required: (which rejects
+      # an empty value by design). All three of forecasting's Sentry configs
+      # read `dsn: process.env.SENTRY_DSN || undefined`, so an empty string
+      # disables the SDK. Without this override the key would fall through to
+      # forecasting's own staging ConfigMap and every preview would report its
+      # errors into STAGING's Sentry project, mixing throwaway branch noise
+      # into the signal someone actually watches.
+      SENTRY_DSN: ""
+    # Two keys are deliberately absent:
+    #
+    # PUBSUB_TOPIC -- previews inherit staging's topic and therefore fire
+    # REAL notifications. That is a decision, not an oversight: the owner
+    # accepted it rather than hold up onboarding, and comms#6 tracks giving
+    # previews their own topic. If you are here because a preview sent
+    # somebody a message, that issue is the fix.
+    #
+    # ENV -- needs no override. forecasting's staging value is already what a
+    # preview wants, and the cascade keeps an app's own staging ConfigMap
+    # value untouched when this registry says nothing about the key.
 
 # Previewable services. Adding one here + a cloudbuild-preview.yaml and
 # {service}-preview-build trigger in its repo is the whole onboarding path —
@@ -50,6 +102,12 @@ footstrike-api:
       project: aged-river-81935268
       database: neondb
       role: neondb_owner
+      # No migrateRole: here, unlike identity and forecasting, because this
+      # app's own role IS the owner of every table in the project — its
+      # migrations already run with the privileges they need. Don't read the
+      # absence as "footstrike-api doesn't migrate"; read it as "its app role
+      # happens to be privileged enough", which is a fact about this project,
+      # not a policy. If that role is ever narrowed, this entry needs one.
       # Cut previews from staging's branch, NOT this project's Neon default.
       # Omitting parent: means "Neon's default branch", which here is
       # `production` — so every preview used to come up as a copy-on-write
@@ -105,6 +163,27 @@ identity:
       project: plain-heart-27630935
       database: neondb
       role: app
+      # `app` cannot create or alter a table. It has CREATE on the database
+      # but NOT on schema public, and every table in this project is owned by
+      # neondb_owner — so the migrate initContainer below, which used to share
+      # the app's one connection string, could only ever have run migrations
+      # that touch nothing. This was already broken when identity's migrate:
+      # was added; it stayed invisible because a preview branch is cut from
+      # staging and therefore starts on staging's schema, which makes
+      # `migrate` a no-op on almost every branch. The FIRST identity branch to
+      # add a migration would have failed in the initContainer.
+      #
+      # migrateRole is the fix, and note what it deliberately does NOT do:
+      # the app keeps connecting as `app`. Running the whole preview as
+      # neondb_owner would have been one fewer line and would have hidden the
+      # class of bug previews exist to catch — a migration that creates a
+      # table and forgets to GRANT the app role access must still fail here,
+      # loudly, rather than in production.
+      #
+      # neondb_owner is Neon's project owner role, present on every branch of
+      # this project (branches inherit their parent's roles). Verified against
+      # the parent branch below, which is also what Up's pre-flight checks.
+      migrateRole: neondb_owner
       # Staging's branch, for the same reason footstrike-api's parent: exists
       # above (read that comment first — it explains why the Neon default is
       # the wrong parent). identity's default branch is `production` too, so

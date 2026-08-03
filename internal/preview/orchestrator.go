@@ -282,11 +282,11 @@ func (o *Orchestrator) Up(ctx context.Context, branch string, opts UpOptions) er
 		}
 	}
 	// Second pre-flight, same rationale and same "before the cluster is
-	// touched" placement: a registry-declared Neon parent branch that doesn't
-	// exist is a static config error, and finding it at stage 5 would cost a
-	// zombie failed namespace and a full round of builds. See
-	// verifyNeonParents.
-	if err := o.verifyNeonParents(ctx, members); err != nil {
+	// touched" placement: a registry-declared Neon parent branch or migrate
+	// role that doesn't exist is a static config error, and finding it at
+	// stage 5 would cost a zombie failed namespace and a full round of
+	// builds. See verifyNeonRefs.
+	if err := o.verifyNeonRefs(ctx, members); err != nil {
 		return fmt.Errorf("preview: Up: pre-flight: %w", err)
 	}
 
@@ -1115,23 +1115,40 @@ func buildFailure(buildID string, status gcb.BuildStatus) error {
 	}
 }
 
+// previewDBURIs is what one member's preview Neon branch hands back: the
+// connection URI its app connects with, and — only when the registry declares
+// a migrateRole — a second URI for the same branch and database as a
+// different role, which the migrate initContainer connects with instead.
+//
+// Migrate is "" for every service that declares no migrateRole, which is the
+// signal (all the way down to copySecrets and Render) to behave exactly as
+// bifrost did before this field existed: one URI, one Secret key, no env
+// override on the initContainer.
+//
+// Both fields are credentials. Neither may appear in an error, a log line, or
+// an annotation — see branchNeonDatabases and fail.
+type previewDBURIs struct {
+	App     string
+	Migrate string
+}
+
 // branchNeonDatabases ensures a preview-<tag> Neon branch exists for every
 // member with a registry-declared Neon reference, returning each one's
-// connection URI. Errors are wrapped without ever including the URI itself
-// (it's a secret) — only service/project identifiers appear in the returned
+// connection URIs. Errors are wrapped without ever including a URI itself
+// (they're secrets) — only service/project identifiers appear in the returned
 // error.
-func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, members []string) (map[string]string, error) {
-	dbURIs := make(map[string]string, len(members))
+func (o *Orchestrator) branchNeonDatabases(ctx context.Context, tag string, members []string) (map[string]previewDBURIs, error) {
+	dbURIs := make(map[string]previewDBURIs, len(members))
 	for _, svc := range members {
 		ref := o.Registry[svc].Neon
 		if ref == nil {
 			continue
 		}
-		uri, err := o.ensureNeonBranch(ctx, *ref, tag)
+		uris, err := o.ensureNeonBranch(ctx, *ref, tag)
 		if err != nil {
 			return nil, fmt.Errorf("neon branch for %s: %w", svc, err)
 		}
-		dbURIs[svc] = uri
+		dbURIs[svc] = uris
 	}
 	return dbURIs, nil
 }
@@ -1142,6 +1159,18 @@ func branchIDByName(branches []neon.Branch, name string) string {
 	for _, b := range branches {
 		if b.Name == name {
 			return b.ID
+		}
+	}
+	return ""
+}
+
+// branchNameByID is branchIDByName's inverse, used only to put a readable
+// branch name in an error about a branch that was found by flag rather than
+// by name (the project default). "" if no branch carries that ID.
+func branchNameByID(branches []neon.Branch, id string) string {
+	for _, b := range branches {
+		if b.ID == id {
+			return b.Name
 		}
 	}
 	return ""
@@ -1160,6 +1189,23 @@ func errMissingNeonParent(ref NeonRef) error {
 	return fmt.Errorf("neon project %s has no branch named %q (registry preview.neon.parent)", ref.Project, ref.Parent)
 }
 
+// errMissingNeonMigrateRole is the one error text for "the registry names a
+// migrate role this project's branch doesn't have". Like errMissingNeonParent
+// it names everything needed to fix the line — project, the branch whose
+// roles were consulted, the role, and the registry key — because none of
+// those is recoverable from the others when staring at a failed run.
+//
+// Unlike the parent's, this text has a single caller (verifyNeonRefs): the
+// runtime gate on a bad migrate role is Neon's own rejection of the
+// connection-URI request in ensureNeonBranch, which fails the run loudly.
+// That is the difference in kind from a bad parent, where the wrong answer
+// was SILENT (branch from the default = production) and so had to be refused
+// in two places. Here the pre-flight exists to make an already-loud failure
+// early and legible, not to prevent a quiet one.
+func errMissingNeonMigrateRole(ref NeonRef, branchName string) error {
+	return fmt.Errorf("neon project %s branch %q has no role named %q (registry preview.neon.migrateRole)", ref.Project, branchName, ref.MigrateRole)
+}
+
 // resolveNeonParentID maps ref's configured parent branch NAME to its Neon
 // branch ID against an already-fetched branch list. A ref with no parent
 // resolves to "" — the empty parentID CreateBranch treats as "use the
@@ -1175,81 +1221,192 @@ func resolveNeonParentID(branches []neon.Branch, ref NeonRef) (string, error) {
 	return id, nil
 }
 
-// verifyNeonParents is Up's pre-flight for registry-declared Neon parent
-// branches: every member whose neon: block names a parent must have that
-// branch present in its project before the run touches the cluster.
+// defaultBranchID returns the ID of the project's default branch, or "" if
+// the list names none. Neon's v2 Branch schema makes `default` a required
+// property, so "none" means the list itself was empty or unexpected — never
+// "the API omitted the flag".
+func defaultBranchID(branches []neon.Branch) string {
+	for _, b := range branches {
+		if b.Default {
+			return b.ID
+		}
+	}
+	return ""
+}
+
+// verifyNeonRefs is Up's pre-flight for the two things a member's neon: block
+// can name that only the live Neon project can confirm: its parent: branch,
+// and its migrateRole:. Both must check out before the run touches the
+// cluster.
 //
-// It is deliberately redundant with the check ensureNeonBranch does at
-// creation time. That one is the real gate — it runs against the branch list
-// the create is actually based on — but it fires at stage 5, minutes into a
-// run, AFTER EnsureNamespace and after every member has been built. A typo in
-// registry.yaml's parent: would fail there as a `failed`-phase namespace,
-// i.e. a zombie preview to clean up by hand, plus wasted build minutes, for
-// what is purely a static config error knowable up front. So it is also
-// checked here, alongside the required-key pre-flight, where a failure
-// returns before the namespace is ever created.
+// The parent half is deliberately redundant with the check ensureNeonBranch
+// does at creation time. That one is the real gate — it runs against the
+// branch list the create is actually based on — but it fires at stage 5,
+// minutes into a run, AFTER EnsureNamespace and after every member has been
+// built. A typo in registry.yaml's parent: would fail there as a
+// `failed`-phase namespace, i.e. a zombie preview to clean up by hand, plus
+// wasted build minutes, for what is purely a static config error knowable up
+// front. So it is also checked here, alongside the required-key pre-flight,
+// where a failure returns before the namespace is ever created.
 //
-// A ListBranches error is fatal rather than skipped: "couldn't check" is not
-// evidence the parent exists, and letting the run continue would land it on
-// Neon's default (production) branch if the parent really was missing.
-func (o *Orchestrator) verifyNeonParents(ctx context.Context, members []string) error {
+// The migrateRole half is here for the timing half of that same argument. Its
+// runtime gate is Neon's own rejection of the connection-URI request for a
+// role that doesn't exist, which does fail the run — but at stage 5, with the
+// same zombie namespace and the same wasted builds, and behind an error that
+// can only be a bare HTTP status (ConnectionURI's error path never reads the
+// response body; it's the endpoint whose body IS a credential). This check
+// turns that into a message naming the project, the branch, the role and the
+// registry key, before anything is created.
+//
+// Roles are asked of the branch the preview will be CUT FROM — the parent, or
+// the project's default branch when no parent is named — because a Neon
+// branch inherits its parent's roles, so that is the same set the preview
+// branch will have. The preview branch itself does not exist yet; that is the
+// whole point of a pre-flight.
+//
+// ListRoles is called ONLY for a ref that declares a migrateRole. A service
+// that doesn't (footstrike-api today) must make exactly the API calls it
+// always did, so this cannot become a general "verify role:" pre-flight
+// without changing the behavior of previews this feature is supposed to leave
+// alone. role: keeps the gate it has always had: the ConnectionURI call that
+// mints the app's own URI.
+//
+// Both list errors are fatal rather than skipped: "couldn't check" is not
+// evidence. For the parent that reasoning is load-bearing — letting the run
+// continue would land it on Neon's default (production) branch if the parent
+// really was missing — and for roles it is merely consistent: there is
+// nothing to be gained by proceeding to a stage that would fail anyway.
+func (o *Orchestrator) verifyNeonRefs(ctx context.Context, members []string) error {
 	for _, svc := range members {
 		ref := o.Registry[svc].Neon
-		if ref == nil || ref.Parent == "" {
+		if ref == nil || (ref.Parent == "" && ref.MigrateRole == "") {
 			continue
 		}
 		branches, err := o.Neon.ListBranches(ctx, ref.Project)
 		if err != nil {
 			return fmt.Errorf("neon parent branch for %s: listing branches: %w", svc, err)
 		}
-		if _, err := resolveNeonParentID(branches, *ref); err != nil {
+		parentID, err := resolveNeonParentID(branches, *ref)
+		if err != nil {
 			return fmt.Errorf("neon parent branch for %s: %w", svc, err)
+		}
+		if err := o.verifyNeonMigrateRole(ctx, branches, parentID, *ref); err != nil {
+			return fmt.Errorf("neon migrate role for %s: %w", svc, err)
 		}
 	}
 	return nil
 }
 
+// verifyNeonMigrateRole checks that ref's migrateRole exists on the branch
+// previews of this service are cut from. parentID is what resolveNeonParentID
+// already returned for ref against branches, so no branch lookup is repeated;
+// "" means "no parent declared", and the project's default branch — the one
+// CreateBranch would then use — is consulted instead.
+//
+// A ref with no migrateRole returns immediately, having made no API call.
+func (o *Orchestrator) verifyNeonMigrateRole(ctx context.Context, branches []neon.Branch, parentID string, ref NeonRef) error {
+	if ref.MigrateRole == "" {
+		return nil
+	}
+	branchID, branchName := parentID, ref.Parent
+	if branchID == "" {
+		branchID = defaultBranchID(branches)
+		branchName = branchNameByID(branches, branchID)
+	}
+	if branchID == "" {
+		// No parent named and no branch flagged default: there is no branch
+		// to ask, so there is no answer — and an unanswerable check must not
+		// read as a pass. The stage-5 ConnectionURI would fail this run
+		// anyway; failing here just does it before the namespace exists.
+		return fmt.Errorf("neon project %s names no default branch to resolve %q against (registry preview.neon.migrateRole)", ref.Project, ref.MigrateRole)
+	}
+	roles, err := o.Neon.ListRoles(ctx, ref.Project, branchID)
+	if err != nil {
+		return fmt.Errorf("listing roles: %w", err)
+	}
+	if !slices.Contains(roles, ref.MigrateRole) {
+		return errMissingNeonMigrateRole(ref, branchName)
+	}
+	return nil
+}
+
 // ensureNeonBranch finds (or creates) ref's project's preview-<tag> branch
-// and returns its connection URI for ref's database/role.
+// and returns its connection URIs: one for ref's database/role, plus — only
+// when ref declares a migrateRole — a second for that same branch and
+// database as the migrate role.
 //
 // A created branch is cut from ref's registry-declared parent (resolved from
 // name to ID against the same ListBranches result used to find an existing
 // preview branch — no extra API call), or from the project's default branch
 // when the registry declares none.
-func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (string, error) {
+//
+// The second URI is a second API call, made only for a ref that asks for it:
+// a service with no migrateRole makes exactly the calls it always did. Both
+// URIs are for the SAME branch — the split is about privilege, not about
+// which database gets migrated, and pointing them at different branches would
+// migrate one database while the app read another.
+func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag string) (previewDBURIs, error) {
 	branchName := previewBranchName(tag)
 	branches, err := o.Neon.ListBranches(ctx, ref.Project)
 	if err != nil {
-		return "", fmt.Errorf("listing branches: %w", err)
+		return previewDBURIs{}, fmt.Errorf("listing branches: %w", err)
 	}
 	branchID := branchIDByName(branches, branchName)
 	if branchID == "" {
 		parentID, err := resolveNeonParentID(branches, ref)
 		if err != nil {
-			return "", err
+			return previewDBURIs{}, err
 		}
 		created, err := o.Neon.CreateBranch(ctx, ref.Project, branchName, parentID)
 		if err != nil {
-			return "", fmt.Errorf("creating branch: %w", err)
+			return previewDBURIs{}, fmt.Errorf("creating branch: %w", err)
 		}
 		branchID = created.ID
 	}
 	uri, err := o.Neon.ConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.Role)
 	if err != nil {
-		return "", fmt.Errorf("fetching connection uri: %w", err)
+		return previewDBURIs{}, fmt.Errorf("fetching connection uri: %w", err)
 	}
-	return uri, nil
+	uris := previewDBURIs{App: uri}
+	if ref.MigrateRole != "" {
+		migrateURI, err := o.Neon.ConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.MigrateRole)
+		if err != nil {
+			// Named distinctly from the app's: with two URIs minted per
+			// member, "fetching connection uri" alone would leave an
+			// operator unable to tell which role Neon refused.
+			return previewDBURIs{}, fmt.Errorf("fetching migrate connection uri: %w", err)
+		}
+		uris.Migrate = migrateURI
+	}
+	return uris, nil
 }
 
 // copySecrets copies each Neon-backed member's staging secret into the
 // preview namespace (overriding DATABASE_URL with its preview branch's URI),
 // plus the shared wildcard TLS cert every preview namespace needs.
-func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []string, dbURIs map[string]string) error {
+//
+// A member whose registry entry declares a migrateRole gets one ADDITIONAL
+// key, migrateDBURLSecretKey, holding the same branch's URI for that role.
+// The Secret is where a connection string belongs — it is deliberately not
+// passed to Render, which would put it in a Deployment spec, i.e. in an
+// object every cluster reader can get and in whatever the apply is logged
+// into. Render is told the key NAME and reads the value at pod-start time
+// through a secretKeyRef.
+//
+// The extra key is absent, not empty, for every member without a migrateRole
+// — that is what keeps an unchanged service's preview Secret byte-identical
+// to what it was. CopySecret re-copies from the staging source every run, so
+// removing migrateRole from the registry removes the key on the next up
+// rather than stranding a stale credential.
+func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []string, dbURIs map[string]previewDBURIs) error {
 	for _, svc := range members {
 		if o.Registry[svc].Neon == nil {
 			continue
 		}
-		overrides := map[string][]byte{"DATABASE_URL": []byte(dbURIs[svc])}
+		overrides := map[string][]byte{"DATABASE_URL": []byte(dbURIs[svc].App)}
+		if uri := dbURIs[svc].Migrate; uri != "" {
+			overrides[migrateDBURLSecretKey] = []byte(uri)
+		}
 		if err := o.Kube.CopySecret(ctx, svc+"-staging", svc+"-staging-secrets", ns, previewSecretName(svc), overrides); err != nil {
 			return fmt.Errorf("copy secret for %s: %w", svc, err)
 		}
@@ -1289,17 +1446,24 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 			return nil, err
 		}
 		secretName := ""
-		if o.Registry[svc].Neon != nil {
+		migrateSecretKey := ""
+		if ref := o.Registry[svc].Neon; ref != nil {
 			secretName = previewSecretName(svc)
+			// Only the key NAME crosses into Render — never the URI itself.
+			// See migrateDBURLSecretKey.
+			if ref.MigrateRole != "" {
+				migrateSecretKey = migrateDBURLSecretKey
+			}
 		}
 		objs, err := Render(RenderInput{
-			Service:    svc,
-			Tag:        tag,
-			ShortSHA:   built[svc].ShortSHA,
-			K8sFiles:   k8sFiles,
-			EnvConfig:  envConfig,
-			SecretName: secretName,
-			Migrate:    o.Registry[svc].Migrate,
+			Service:          svc,
+			Tag:              tag,
+			ShortSHA:         built[svc].ShortSHA,
+			K8sFiles:         k8sFiles,
+			EnvConfig:        envConfig,
+			SecretName:       secretName,
+			Migrate:          o.Registry[svc].Migrate,
+			MigrateSecretKey: migrateSecretKey,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("render %s: %w", svc, err)
@@ -1338,6 +1502,26 @@ func appliedAppImage(objs []*unstructured.Unstructured, svc string) string {
 }
 
 func previewSecretName(svc string) string { return svc + "-preview-secrets" }
+
+// migrateDBURLSecretKey is the extra key a preview Secret carries when the
+// member's registry entry declares a migrateRole: the same preview branch's
+// connection URI, minted for that role. copySecrets writes it; Render points
+// the migrate initContainer's DATABASE_URL at it with a secretKeyRef.
+//
+// It is an extra key in the existing preview Secret rather than a Secret of
+// its own, which has one honest consequence worth stating: the preview Secret
+// is in the APP container's envFrom too, so the app's environment also
+// contains MIGRATE_DATABASE_URL. That does not weaken what a preview proves.
+// The property being preserved is that the app connects with its real, lesser
+// role — its code reads DATABASE_URL, which is still the app role's URI — so
+// a migration that creates a table and forgets to grant the app access still
+// breaks the preview. An app deliberately reading a variable it has no
+// production equivalent of is not a failure mode previews were ever
+// protecting against. Isolating it would take a second Secret object, which
+// bifrost has no primitive to create (Kube.CopySecret copies an existing one)
+// and which would stop the app and its migration provably sharing one
+// environment.
+const migrateDBURLSecretKey = "MIGRATE_DATABASE_URL"
 
 // waitForPods polls ns until every member has at least one Deployment-managed
 // pod and all of those pods report ready, or until podReadyTimeout expires.
