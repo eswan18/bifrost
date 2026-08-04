@@ -115,15 +115,19 @@ var (
 // the entire budget is time the operator spends staring at an unresponsive
 // Tab. Past roughly half a second that reads as a hang rather than as latency.
 // 400ms leaves room for a warm round trip to bifrost and stops well short of
-// the point where the shell feels stuck.
+// the point where the shell feels stuck. Measured end to end against prod,
+// that round trip is 90-140ms including process start.
 //
-// Note what this means in practice: previewclient reads its bearer token by
-// shelling out to gcloud, which costs several hundred milliseconds of Python
-// startup on its own, so a cold token fetch will often lose this race and the
-// completion will come back empty. That is the intended failure — no value in
-// the range a Tab press can afford would cover gcloud, so the deadline is set
-// to protect the keypress rather than to guarantee the fetch, and `bif preview
-// list` remains the way to see tags when the answer matters.
+// It fits only because previewclient caches its bearer token on disk. Reading
+// the token means shelling out to gcloud, which costs 450-780ms of Python
+// startup before a single byte goes to bifrost — no deadline a Tab press can
+// afford would ever have covered it, and this completion returned empty every
+// single time until the cache existed. The cache is filled by the `bif preview`
+// commands an operator runs anyway, which have no deadline; a Tab press reads
+// it and never pays to fill it. So the one case that still completes to
+// nothing is a machine that has not run a preview command in 12 hours, which
+// is the case where `bif preview list` was going to be the next thing typed
+// regardless. See internal/previewclient/tokencache.go.
 var previewTagTimeout = 400 * time.Millisecond
 
 // completions turns the words typed so far into the candidates for the last

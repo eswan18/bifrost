@@ -192,10 +192,26 @@ it would keep offering a service that had since been renamed.
 tags are branch-derived and not worth typing from memory. It is bounded at
 400ms and fails to **nothing**: a slow bifrost, an expired `gcloud` login or no
 network at all give you an empty completion, never an error where a candidate
-should be. Since reading the token costs a `gcloud` subprocess, that budget is
-genuinely tight and a cold Tab often comes back empty — `bif preview list` is
-still the way to see what exists. No other position makes any call at all: the
-fleet comes from the registry compiled into the binary.
+should be. Warm, it measures 90-140ms end to end. No other position makes any
+call at all: the fleet comes from the registry compiled into the binary.
+
+### The preview API token cache
+
+Reading the preview API token means shelling out to `gcloud`, which costs
+450-780ms of Python startup before a single byte reaches bifrost. Every `bif
+preview` command used to pay that, and it made completing `bif preview down`
+impossible inside a budget a keypress can afford.
+
+So the token is cached in `$XDG_CACHE_HOME/bif/preview-token` (falling back to
+`~/.cache/bif/`), mode **0600** inside a **0700** directory, written atomically
+and discarded unread if it is ever found wider than that. It is shared by every
+`bif preview` invocation on the machine, not just completion.
+
+Rotating `bifrost_prod_preview_api_token` needs no action from you and no file
+to delete: a 401 or 403 on a cached token purges it, re-reads the secret once,
+and retries the request. That is what makes correctness independent of the
+12-hour TTL, which only bounds how long a stale copy can sit on disk. To clear
+it by hand anyway: `rm ~/.cache/bif/preview-token`.
 
 ### `bif promote` with several services
 
