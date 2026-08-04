@@ -369,13 +369,16 @@ func TestRenderMigrateInitContainer(t *testing.T) {
 		t.Errorf("initContainer envFrom = %v, want identical to app container's envFrom %v", initContainer["envFrom"], appContainer["envFrom"])
 	}
 
-	// No env: at all. This input sets no MigrateSecretKey -- footstrike-api's
-	// registry entry declares no migrateRole, because its app role already
-	// owns its schema -- and such a service's rendered output must be exactly
-	// what it was before migrateRole existed: envFrom alone, with nothing
-	// overriding DATABASE_URL for the migrate step. An env: block appearing
-	// here would mean the feature leaked into a service that never asked for
-	// it. See TestRenderMigrateInitContainerUsesMigrateSecretKey for the
+	// No env: at all. The input above sets no MigrateSecretKey -- the case of
+	// a service whose registry entry declares no migrateRole -- and that
+	// rendered output must be exactly what it was before migrateRole existed:
+	// envFrom alone, with nothing overriding DATABASE_URL for the migrate
+	// step. An env: block appearing here would mean the feature leaked into a
+	// service that never asked for it. The input is built here rather than
+	// read from the registry, so this holds whatever registry.yaml says on
+	// any given day -- footstrike-api's own entry declared no migrateRole
+	// until 2026-08-04 and does now, and neither changes what this test
+	// covers. See TestRenderMigrateInitContainerUsesMigrateSecretKey for the
 	// other half.
 	if _, hasEnv := initContainer["env"]; hasEnv {
 		t.Errorf("initContainer has env = %v, want none when MigrateSecretKey is unset", initContainer["env"])

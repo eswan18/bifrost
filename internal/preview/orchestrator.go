@@ -1265,11 +1265,15 @@ func defaultBranchID(branches []neon.Branch) string {
 // whole point of a pre-flight.
 //
 // ListRoles is called ONLY for a ref that declares a migrateRole. A service
-// that doesn't (footstrike-api today) must make exactly the API calls it
-// always did, so this cannot become a general "verify role:" pre-flight
-// without changing the behavior of previews this feature is supposed to leave
-// alone. role: keeps the gate it has always had: the ConnectionURI call that
-// mints the app's own URI.
+// that doesn't must make exactly the API calls it always did, so this cannot
+// become a general "verify role:" pre-flight without changing the behavior of
+// previews this feature is supposed to leave alone. Every onboarded service
+// declares one today, which is not a licence to drop the distinction: the
+// no-migrateRole path is still what an app onboarded tomorrow gets, and it is
+// covered by a fixture ref rather than by whichever service happens to lack
+// the key (see TestUpWithoutAMigrateRoleAddsNoSecretKeyAndNoRolesCall). role:
+// keeps the gate it has always had: the ConnectionURI call that mints the
+// app's own URI.
 //
 // Both list errors are fatal rather than skipped: "couldn't check" is not
 // evidence. For the parent that reasoning is load-bearing — letting the run
