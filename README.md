@@ -278,7 +278,7 @@ service so it stands alone under `grep`:
 Four conditions qualify: **staging and prod differ** (something to promote);
 **two or more distinct images inside one environment** (a deploy in progress —
 what `-q` marks with `*`); **a build running right now** (`QUEUED`/`PENDING`/
-`WORKING`); and **the newest successful build's SHA is not what staging is
+`WORKING`); and **the newest successful build's image is not what staging is
 running**.
 
 That last one is the point of the mode. The other three are already visible
@@ -292,6 +292,47 @@ two environments to each other, this compares CI to staging, and they fail
 independently. When both fire, the stalled sync is listed first — it explains
 why the promote suggested under it would appear to do nothing.
 
+**A new tag is not a new image, and this check knows the difference.** When the
+build's tag and staging's tag differ, both are resolved against Artifact
+Registry to the digest of their **image manifest**, and only a real difference
+is reported. Same image, different tag, is not drift — and rather than going
+silent, which would leave you wondering why a build never appeared to deploy, it
+says so:
+
+    bifrost   staging matches the latest build's content (running eb12dfa, built 0cbfc9f)
+
+That line is **informational**: it prints and greps like any other, and it does
+not qualify the service, so the exit code goes on meaning "something needs a
+human". Both SHAs stay on screen, because the tag is your link back to GitHub;
+a digest is an input to this verdict and never a replacement for the commit.
+
+This is not a rare case. Every image built with buildx is pushed as an OCI
+*index* holding the image manifest plus that build's own provenance
+attestation, so the index digest changes on every build even when the image
+does not — which is why the comparison is on the image manifest and why
+attestation entries (`platform: unknown/unknown`, or a
+`vnd.docker.reference.type=attestation-manifest` annotation) are excluded when
+picking it. bifrost's own image builds `./cmd/bifrost`; a commit touching only
+`./cmd/bif` produces a new tag over a byte-identical image, image-updater
+correctly does nothing, and this used to be reported as a stalled deploy.
+
+**A registry that cannot be read never suppresses a finding.** Anything that
+stops the lookup from answering — no credentials, a missing tag, a 401, a
+timeout — falls back to comparing tags and **warns**, exactly as before this
+existed. The reads use the same Application Default Credentials as the Cloud
+Build lookup (one token per invocation, not one per service), run concurrently
+across services, and are bounded by their own short timeout. Nothing is dialled
+at all unless some service's build tag and staging tag actually differ, and
+`-q` is untouched: no Cloud Build call, no registry call.
+
+The **staging-versus-prod** verdict stays a tag comparison, deliberately.
+`footstrike-dashboard` builds `{sha}-staging` and `{sha}-prod` as genuinely
+separate images — its Vite API/identity/client-id values are baked in at build
+time — so their manifests are never equal and a digest-based verdict would mark
+it permanently out of sync. For the same reason, the tag this check asks the
+registry for follows the scheme staging is running (`{sha}-staging` for that
+service, a bare `{sha}` for everything else).
+
 There is **no grace period** on it. Right after a push there is a brief window
 where the build is green and staging has not moved yet, and that state is
 worth being able to see rather than something to suppress — so it is reported,
@@ -303,8 +344,10 @@ mutable tag, or any staging image already on the build's commit (a half-finished
 rollout is a rollout, and reports itself as one).
 
 Exit **0** only when all four checks ran and nothing qualified — and it says so,
-`Nothing needs attention.`, rather than printing nothing. Exit **1** when
-something qualified, which makes it usable from cron (`bif status -a || notify`).
+`Nothing needs attention.`, rather than printing nothing (an informational line
+may stand above it, having explained an absence rather than reported a
+finding). Exit **1** when something qualified, which makes it usable from cron
+(`bif status -a || notify`).
 
 **If the Cloud Build read fails, it does not claim an all-clear.** Two of the
 four checks are unknowable without build data, so the run says on *stdout* that

@@ -7,10 +7,12 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/oci"
 	"github.com/eswan18/bifrost/internal/promote"
 	"github.com/eswan18/bifrost/internal/registry"
 )
@@ -38,6 +40,24 @@ type buildLister interface {
 // gcb.Client has to satisfy buildLister, for the same reason kube.Client has
 // to satisfy podLister.
 var _ buildLister = (gcb.Client)(nil)
+
+// digestResolver is the slice of the registry `bif status --attention` needs:
+// one image reference in, the digest of the IMAGE MANIFEST behind it out. It is
+// a read of a third party, like Cloud Build, and narrower than either of the
+// two above — there is exactly one question to ask and no way to write.
+//
+// The unit is the image manifest and never the index that may contain it. See
+// internal/oci: every buildx-built tag in this fleet is an index holding the
+// image plus a per-build provenance attestation, so index digests differ on
+// every build for byte-identical images, and comparing them would reproduce the
+// false alarm this exists to remove.
+type digestResolver interface {
+	ManifestDigest(ctx context.Context, image string) (string, error)
+}
+
+// oci.Resolver has to satisfy digestResolver, or the fake the tests drive would
+// be shaped like an interface the real resolver doesn't implement.
+var _ digestResolver = (*oci.Resolver)(nil)
 
 // buildLookupTimeout bounds the Cloud Build read, and is deliberately much
 // tighter than the command's own context, which it does not replace. `bif
@@ -139,7 +159,12 @@ func exitCode(verdicts []verdict) int {
 }
 
 // statusCmd implements every form of `bif status`.
-func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error)) int {
+//
+// dialDigests is reached by --attention alone, and only when a service's build
+// tag and staging tag differ — see resolveSameContent, which does not so much
+// as dial when nothing qualifies. -q makes no build lookup and no registry
+// lookup: its offline guarantee is unchanged.
+func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error), dialDigests func(context.Context) (digestResolver, error)) int {
 	args, quiet := takeFlag(args, "-q", "--quiet")
 	args, attention := takeFlag(args, "-a", "--attention")
 
@@ -207,7 +232,7 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 	}
 
 	if attention {
-		return attentionReport(ctx, stdout, stderr, cluster, reg, apps, set, time.Now())
+		return attentionReport(ctx, stdout, stderr, cluster, reg, apps, set, dialDigests, time.Now())
 	}
 
 	verdicts := make([]verdict, 0, len(apps))
@@ -477,16 +502,49 @@ const attentionAllClear = "Nothing needs attention."
 // -q` does, it costs the same single LatestBuilds call (that call answers for
 // the whole fleet regardless), and refusing it would make one flag combination
 // an error for no reason a user could predict.
-func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podLister, reg registry.Registry, apps []string, set buildSet, now time.Time) int {
-	type line struct{ app, reason string }
+func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podLister, reg registry.Registry, apps []string, set buildSet, dialDigests func(context.Context) (digestResolver, error), now time.Time) int {
+	// The cluster is read for every service FIRST, and the registry afterwards,
+	// because the second read's size depends on the first: only a service whose
+	// build tag and staging tag differ has anything to resolve, and on a fleet
+	// where none do this phase costs no dial, no token and no request at all.
+	type appState struct {
+		staging, prod []string
+		build         buildCell
+	}
+	states := make(map[string]appState, len(apps))
+	candidates := make(map[string]stalledSync, len(apps))
+	for _, app := range apps {
+		st := appState{
+			staging: normalize(deployedImages(ctx, cluster, stderr, app+"-staging")),
+			prod:    normalize(deployedImages(ctx, cluster, stderr, app+"-prod")),
+			build:   set.cellFor(reg.RepoFor(app)),
+		}
+		states[app] = st
+		if c, ok := stalledSyncCandidate(st.staging, st.build); ok {
+			candidates[app] = c
+		}
+	}
+	sameContent := resolveSameContent(ctx, dialDigests, candidates)
+
+	type line struct {
+		app string
+		attentionLine
+	}
 	var lines []line
+	attentionCount := 0
 	width := 0
 	for _, app := range apps {
-		staging := normalize(deployedImages(ctx, cluster, stderr, app+"-staging"))
-		prod := normalize(deployedImages(ctx, cluster, stderr, app+"-prod"))
-		for _, reason := range attentionFor(app, staging, prod, set.cellFor(reg.RepoFor(app)), now) {
-			lines = append(lines, line{app: app, reason: reason})
+		st := states[app]
+		finding := syncFinding{}
+		if c, ok := candidates[app]; ok {
+			finding = syncFinding{stalled: &c, sameContent: sameContent[app]}
+		}
+		for _, l := range attentionFor(app, st.staging, st.prod, st.build, finding, now) {
+			lines = append(lines, line{app: app, attentionLine: l})
 			width = max(width, len(app))
+			if !l.informational {
+				attentionCount++
+			}
 		}
 	}
 
@@ -496,18 +554,38 @@ func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podL
 	// fleet. Continuation lines under a single service name would read more
 	// tidily and grep worse, and this output's job is to be acted on.
 	for _, l := range lines {
-		outf(stdout, "%-*s  %s\n", width, l.app, l.reason)
+		outf(stdout, "%-*s  %s\n", width, l.app, l.text)
 	}
 
 	if !set.known {
 		outln(stdout, attentionSkippedNote)
 		return 1
 	}
-	if len(lines) == 0 {
+	// Informational lines are printed and then not counted. The exit code is a
+	// contract about ATTENTION — `bif status -a || notify` — and "staging is
+	// running the latest build's content under an older tag" is the absence of
+	// a finding, explained out loud rather than left as an unexplained silence.
+	if attentionCount == 0 {
 		outln(stdout, attentionAllClear)
 		return 0
 	}
 	return 1
+}
+
+// attentionLine is one line of the report: what it says, and whether it is
+// something to act on. See attentionReport for why the two are not the same
+// thing.
+type attentionLine struct {
+	text          string
+	informational bool
+}
+
+// syncFinding is the CI-versus-staging conclusion for one service, already
+// resolved: whether the tags differ, and — when they do — whether the registry
+// says the two tags are nevertheless the same image.
+type syncFinding struct {
+	stalled     *stalledSync // nil when the tags say there is nothing to report
+	sameContent bool         // ...but both tags resolve to one image manifest
 }
 
 // attentionFor returns every reason app is worth a human's attention right
@@ -518,8 +596,8 @@ func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podL
 // wants them — a stalled sync explains why the promote listed under it will
 // appear to do nothing:
 //
-//   - STALLED SYNC — the newest build succeeded, and staging is not running it.
-//     This is the reason this mode exists; see stalledSyncReason.
+//   - STALLED SYNC — the newest build succeeded, and staging is not running its
+//     CONTENT. This is the reason this mode exists; see stalledSyncCandidate.
 //   - Staging and prod differ: there is something to promote.
 //   - Two or more distinct images inside one environment: a deploy in progress.
 //     `bif status -q` already marks this with "*".
@@ -530,19 +608,39 @@ func attentionReport(ctx context.Context, stdout, stderr io.Writer, cluster podL
 // and it is not a duplicate of "staging and prod differ" however much it may
 // look like one: that compares two environments to each other, this compares CI
 // to staging. They answer different questions and they fail independently.
-func attentionFor(app string, staging, prod []string, build buildCell, now time.Time) []string {
-	var reasons []string
+//
+// One line this returns is not a condition at all: when the build's tag and
+// staging's tag turn out to name the same image, that is said out loud as an
+// INFORMATIONAL line (see stalledSync.sameContentNote). It prints like the
+// others so it can be read and grepped alongside them, and it does not qualify
+// the service — the exit code goes on meaning "something needs a human".
+func attentionFor(app string, staging, prod []string, build buildCell, finding syncFinding, now time.Time) []attentionLine {
+	var reasons []attentionLine
+	warn := func(text string) { reasons = append(reasons, attentionLine{text: text}) }
 
-	if reason, ok := stalledSyncReason(staging, build, now); ok {
-		reasons = append(reasons, reason)
+	// The CI-versus-staging comparison arrives already made, because settling
+	// it needs the registry (see resolveSameContent) and this function is pure.
+	if finding.stalled != nil {
+		if finding.sameContent {
+			reasons = append(reasons, attentionLine{text: finding.stalled.sameContentNote(), informational: true})
+		} else {
+			warn(finding.stalled.warning(now))
+		}
 	}
 
 	// promote.StatusOf is the same decision `bif status` and the server make,
 	// reused rather than re-derived: "staging and prod differ" has to mean here
 	// exactly what it means everywhere else, including the unpinned-prod case
 	// (bifrost#30) that reads as out of sync.
+	//
+	// It stays a TAG comparison, deliberately, where the check above no longer
+	// is: footstrike-dashboard builds {sha}-staging and {sha}-prod as genuinely
+	// separate images — its Vite API/identity/client-id values are baked in at
+	// build time from per-environment --build-arg values, verified in that
+	// repo's cloudbuild.yaml and Dockerfile — so their manifests are never
+	// equal and a digest-based verdict would mark it permanently out of sync.
 	if status := promote.StatusOf(staging, prod); status.State == promote.OutOfSync {
-		reasons = append(reasons, fmt.Sprintf("staging and prod differ: staging %s, prod %s (bif promote %s)",
+		warn(fmt.Sprintf("staging and prod differ: staging %s, prod %s (bif promote %s)",
 			status.StagingTag, status.ProdTag, app))
 	}
 
@@ -554,19 +652,53 @@ func attentionFor(app string, staging, prod []string, build buildCell, now time.
 		images []string
 	}{{"staging", staging}, {"prod", prod}} {
 		if len(env.images) > 1 {
-			reasons = append(reasons, fmt.Sprintf("deploy in progress: %s is running %d images (%s)",
+			warn(fmt.Sprintf("deploy in progress: %s is running %d images (%s)",
 				env.name, len(env.images), strings.Join(tagsOf(env.images), ", ")))
 		}
 	}
 
 	if build.known && build.status.InProgress() {
-		reasons = append(reasons, inFlightBuildReason(build.status, now))
+		warn(inFlightBuildReason(build.status, now))
 	}
 	return reasons
 }
 
-// stalledSyncReason implements the condition this whole mode was built for: the
-// most recent build SUCCEEDED, and staging is not running its SHA.
+// stalledSync is the condition this whole mode was built for, as far as TAGS
+// can carry it: the most recent build SUCCEEDED, and staging is not running its
+// SHA. Whether that is drift or merely a new tag over the same image is settled
+// by the registry — see resolveSameContent — so this carries the image
+// references that settle it as well as the text that reports it.
+type stalledSync struct {
+	buildSHA    string
+	finish      time.Time
+	stagingTags []string // every tag staging runs, for the message
+	// buildImage is the image reference the newest build pushed FOR STAGING,
+	// and stagingImages are the staging images that carry a commit. These two
+	// are what get resolved to manifest digests; both are derived from an
+	// image staging is actually running, never from the app's name — the same
+	// rule promote.ReplaceTag exists to keep (see its comment).
+	buildImage    string
+	stagingImages []string
+}
+
+// stalledSyncCandidate implements the tag half of that condition.
+//
+// DO NOT "simplify" this away as redundant with "staging and prod differ". It
+// is not. It detects a failure mode this fleet has actually hit and that
+// nothing else surfaces: when ArgoCD's github-eswan18-repocreds PAT expires,
+// the Applications go to ComparisonError and syncs SILENTLY STOP. Builds keep
+// going green, staging quietly stays on last week's image, and `bif promote`
+// reports success while prod never moves — because the write lands in the
+// Application and nothing ever reconciles it. A successful build whose SHA
+// never reached staging is the signature of that state, and it is the only
+// signal in this tool that points at it.
+//
+// It is a CANDIDATE and not a verdict, because a tag difference is not by
+// itself a content difference. bifrost's image builds ./cmd/bifrost; a commit
+// touching only ./cmd/bif produces a new tag over a byte-identical image, and
+// image-updater correctly does not move staging. That is the false alarm that
+// sent an owner chasing a deploy which had already happened, and it is why the
+// answer here is handed to the registry before it is printed.
 //
 // DO NOT "simplify" this away as redundant with "staging and prod differ". It
 // is not. It detects a failure mode this fleet has actually hit and that
@@ -599,13 +731,13 @@ func attentionFor(app string, staging, prod []string, build buildCell, now time.
 // recent build, a build that is running or failed rather than succeeded, a
 // staging with no pods, and a staging whose tags carry no parseable SHA (an
 // unpinned `latest`, whose content genuinely cannot be compared to a commit).
-func stalledSyncReason(staging []string, build buildCell, now time.Time) (string, bool) {
+func stalledSyncCandidate(staging []string, build buildCell) (stalledSync, bool) {
 	if !build.known {
-		return "", false
+		return stalledSync{}, false
 	}
 	b := build.status
 	if b.Status != "SUCCESS" || b.SHA == "" {
-		return "", false
+		return stalledSync{}, false
 	}
 
 	// comparable is the single "could we even tell?" guard, and it covers both
@@ -614,33 +746,170 @@ func stalledSyncReason(staging []string, build buildCell, now time.Time) (string
 	// them. An explicit len(staging) == 0 above would be a second spelling of
 	// the first case and dead by the time it was read.
 	tags := tagsOf(staging)
-	comparable := false
-	for _, tag := range tags {
+	out := stalledSync{buildSHA: b.SHA, finish: b.FinishTime, stagingTags: tags}
+	for i, tag := range tags {
 		sha := promote.ExtractSHA(tag)
 		if sha == "" {
 			continue
 		}
-		comparable = true
 		// Any staging image on the build's commit means staging picked it up.
 		// Checking every image rather than requiring a single one is what keeps
 		// a rollout that is halfway to the new SHA from reading as stalled — it
 		// is mid-deploy, which is its own condition and says so itself.
 		if shaMatches(sha, b.SHA) {
-			return "", false
+			return stalledSync{}, false
+		}
+		out.stagingImages = append(out.stagingImages, staging[i])
+		if out.buildImage == "" {
+			out.buildImage = promote.ReplaceTag(staging[i], buildTagFor(tag, b.SHA))
 		}
 	}
-	if !comparable {
-		return "", false
+	if len(out.stagingImages) == 0 {
+		return stalledSync{}, false
 	}
+	return out, true
+}
 
-	when := ago(b.FinishTime, now)
+// warning is what this has always printed, unchanged: a green build whose SHA
+// staging is not running.
+//
+// There is deliberately NO grace period and no threshold. The window between a
+// build going green and image-updater moving staging is short and it is a state
+// worth being able to SEE — running this seconds after a push and being told
+// "nothing to see" would defeat the point. So the transient case is reported,
+// not suppressed, and made legible instead: the reason carries how long ago the
+// build finished, rendered by the same `ago` the build column uses, so
+//
+//	build abc1234 succeeded just now, staging still on def5678
+//
+// and
+//
+//	build abc1234 succeeded 3d ago, staging still on def5678
+//
+// look nothing alike at a glance. The reader draws the conclusion; the command
+// does not decide for them by hiding one of the two.
+func (s stalledSync) warning(now time.Time) string {
+	when := ago(s.finish, now)
 	if when == "" {
 		// SUCCESS with no finish time is not a state Cloud Build produces, but
 		// the field is parsed from a string and a zero here must not render as
 		// "succeeded , staging still on ...".
 		when = "at an unknown time"
 	}
-	return fmt.Sprintf("build %s succeeded %s, staging still on %s", b.SHA, when, strings.Join(tags, ", ")), true
+	return fmt.Sprintf("build %s succeeded %s, staging still on %s", s.buildSHA, when, strings.Join(s.stagingTags, ", "))
+}
+
+// sameContentNote is the answer when the two tags turn out to be one image.
+//
+// It is a printed line rather than silence on purpose. The operator can see
+// that a build went green and that staging's tag is an older commit; saying
+// nothing would leave them exactly where the false alarm did — wondering why a
+// build never appeared to deploy — with the difference that now the tool is
+// silently sure. So it says which two things it compared, and BOTH SHAs stay
+// on screen: the tag is the link back to GitHub, and a digest is an input to
+// this verdict, never a replacement for the commit in the display.
+func (s stalledSync) sameContentNote() string {
+	return fmt.Sprintf("staging matches the latest build's content (running %s, built %s)",
+		strings.Join(s.stagingTags, ", "), s.buildSHA)
+}
+
+// buildTagFor returns the tag the newest build pushed FOR STAGING, in the tag
+// scheme staging is already running.
+//
+// Most services build one environment-agnostic {sha}. footstrike-dashboard
+// builds {sha}-staging and {sha}-prod as separate images — its Vite API,
+// identity and client-id values are baked in at build time from per-environment
+// --build-arg values (verified in that repo's cloudbuild.yaml and Dockerfile) —
+// so a bare {sha} names an image that was never pushed for it, and asking the
+// registry for one would 404 into a needless fallback. It follows the STAGING
+// tag for the same reason promote.NewProdTag follows it: the scheme belongs to
+// the artifact, not to the app's name.
+func buildTagFor(stagingTag, buildSHA string) string {
+	if strings.Contains(stagingTag, "-staging") {
+		return buildSHA + "-staging"
+	}
+	return buildSHA
+}
+
+// digestLookupTimeout bounds the whole Artifact Registry phase of --attention,
+// in the spirit of buildLookupTimeout and for the same reason: this is a
+// command reached for during an incident, the registry is a third party, and an
+// answer that has not arrived in a few seconds is not worth waiting for when
+// the fallback is the warning this command has always printed. It bounds the
+// PHASE rather than each request because the requests run concurrently. A var
+// so the tests can prove the bound is applied without waiting for it.
+var digestLookupTimeout = 3 * time.Second
+
+// resolveSameContent asks the registry, for each candidate stalled sync,
+// whether the build's tag and staging's tag are the same image after all.
+//
+// Three properties are deliberate:
+//
+//   - NOTHING happens when there are no candidates. No dial, no token, no
+//     request. A healthy fleet's `bif status -a` costs exactly what it did
+//     before this existed.
+//   - One dial, therefore one credential, for the whole invocation — the
+//     resolver fetches its token in its constructor (internal/oci.New) — and
+//     the services resolve CONCURRENTLY, the way fetchBuilds already overlaps
+//     the build read with the cluster read.
+//   - Every failure answers "not the same": a dial that fails, a request that
+//     fails, a tag that isn't there, a timeout. That direction is the whole
+//     safety argument. A registry problem must never be able to SUPPRESS a real
+//     stalled sync — the mode exists to catch a failure whose signature is
+//     silence, so the fallback is the warning, never the quiet.
+func resolveSameContent(ctx context.Context, dial func(context.Context) (digestResolver, error), candidates map[string]stalledSync) map[string]bool {
+	if len(candidates) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, digestLookupTimeout)
+	defer cancel()
+
+	resolver, err := dial(ctx)
+	if err != nil {
+		return nil
+	}
+
+	var mu sync.Mutex
+	same := make(map[string]bool, len(candidates))
+	var wg sync.WaitGroup
+	for app, candidate := range candidates {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !sameImageManifest(ctx, resolver, candidate) {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			same[app] = true
+		}()
+	}
+	wg.Wait()
+	return same
+}
+
+// sameImageManifest reports whether the build's image and one staging is
+// running resolve to the same image manifest.
+//
+// ANY staging image matching is enough, for the same reason the tag comparison
+// accepts any: a rollout that is halfway onto the content is not stalled. A
+// lookup that fails is skipped rather than fatal — with two staging images, one
+// unreadable tag must not decide the other.
+func sameImageManifest(ctx context.Context, resolver digestResolver, s stalledSync) bool {
+	built, err := resolver.ManifestDigest(ctx, s.buildImage)
+	if err != nil || built == "" {
+		return false
+	}
+	for _, img := range s.stagingImages {
+		running, err := resolver.ManifestDigest(ctx, img)
+		if err != nil {
+			continue
+		}
+		if running == built {
+			return true
+		}
+	}
+	return false
 }
 
 // inFlightBuildReason renders a build that is running right now. A queued build

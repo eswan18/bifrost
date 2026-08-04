@@ -33,6 +33,18 @@ func unreachableBuilds(context.Context) (buildLister, error) {
 	return nil, errors.New("no credentials")
 }
 
+// unreachableDigests is the Artifact Registry connection every test that isn't
+// about the content comparison runs with, and it fails for the same reason
+// unreachableBuilds does — with one extra thing to prove. A registry this tool
+// cannot read must never SUPPRESS a finding: every stalled-sync assertion in
+// this package is recorded against a registry that is not there, so they are
+// all also evidence that the fallback is the warning `bif status -a` has always
+// printed. The content comparison's own tests supply a working one (see
+// fakeDigests).
+func unreachableDigests(context.Context) (digestResolver, error) {
+	return nil, errors.New("no credentials")
+}
+
 func TestDispatch(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -91,7 +103,7 @@ func TestDispatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
