@@ -65,7 +65,8 @@ Usage:
     bif preview up <branch> --ttl 8h      # Same, but auto-expire after 8h
     bif preview up <branch> --no-wait     # Fire and return the tag
     bif preview up <branch> --auto-update # Same, but redeploy when the branch moves
-    bif preview down <tag>                # Tear down (confirm unless -y/--yes)`
+    bif preview down <tag>                # Tear down (confirm unless -y/--yes)
+    bif completion zsh|bash               # Print the tab-completion shim (see README)`
 
 // argoNamespace is where the ArgoCD Applications live. `bif status` never
 // touches them — it reads pods — but kube.New wants it, and `bif promote` will.
@@ -103,9 +104,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
 	case "preview":
 		return previewCmd(ctx, args[1:], stdin, stdout, stderr, connectPreview)
+	case "completion":
+		return completionCmd(args[1:], stdout)
+	case "__complete":
+		// The hidden half of tab-completion: the shims `bif completion`
+		// prints call this, nothing else does, and so it is absent from the
+		// usage above and from the listing below. It gets the preview
+		// connection because `bif preview down <TAB>` completes live tags;
+		// see previewTags for the deadline and the silence that keeps that
+		// from ever costing the shell anything.
+		return completeCmd(ctx, args[1:], stdout, connectPreview)
 	default:
 		outf(stdout, "Unknown command: %s\n", cmd)
-		outln(stdout, "Available commands: status, promote, preview")
+		outln(stdout, "Available commands: status, promote, preview, completion")
 		return 1
 	}
 }

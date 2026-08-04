@@ -233,7 +233,11 @@ func TestNoBifrostServerDependency(t *testing.T) {
 	// Without these the test would pass against an empty directory, or against
 	// a status.go renamed out of the scan, which is exactly the failure mode a
 	// guard like this dies of.
-	for _, required := range []string{"main.go", "status.go", "promote.go", bifrostClientExempt} {
+	// complete.go is named because it is the one other file that touches the
+	// preview seam: `bif preview down <TAB>` completes live tags. It does so
+	// through the previewAPI value run() threads in, never by importing the
+	// client, and this is what keeps that true.
+	for _, required := range []string{"main.go", "status.go", "promote.go", "complete.go", bifrostClientExempt} {
 		if !scanned[required] {
 			t.Fatalf("%s was not scanned; cmd/bif's files are %v", required, sortedKeys(scanned))
 		}
