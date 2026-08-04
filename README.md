@@ -134,6 +134,7 @@ longer exists in any repo — remove it.
     bif preview list         # table of preview environments
     bif preview up <branch>  # create/update, show progress, print URLs
     bif preview down <tag>   # tear down (confirms unless -y/--yes)
+    bif completion zsh|bash  # print the tab-completion shim (see below)
 
 Both `status` and `promote` take **one or more** service names. Names are
 deduped and acted on in the order given (with no names, `status` uses registry
@@ -153,6 +154,64 @@ yet. (`--attention` asks a broader question and has its own rules; see below.)
 `promote` exits **1** when it refuses (no deployment on either side, a
 staging rollout in flight) or when the patch fails; declining the prompt exits
 **0**, because nothing went wrong.
+
+### Tab completion
+
+`bif completion` prints a shim for your shell. One line in your shell's rc file
+is the whole install — there is no directory to pick and nothing to keep in
+sync, so no `make` target would save a step:
+
+    # ~/.zshrc — after compinit, which is what defines compdef
+    source <(bif completion zsh)
+
+    # ~/.bashrc
+    source <(bif completion bash)
+
+If you would rather not run `bif` at every shell start, drop the shim in the
+directory your shell already looks in:
+
+    # zsh: any directory on your fpath, named _bif
+    mkdir -p ~/.zsh/completions && bif completion zsh > ~/.zsh/completions/_bif
+    # ...and, in ~/.zshrc BEFORE compinit:  fpath=(~/.zsh/completions $fpath)
+
+    # bash (with bash-completion installed)
+    mkdir -p ~/.local/share/bash-completion/completions
+    bif completion bash > ~/.local/share/bash-completion/completions/bif
+
+What completes: the commands, service names for `status` and `promote` — minus
+the ones already on the line, since both commands dedupe what you give them —
+`preview`'s subcommands, each command's flags, and the live preview tags for
+`bif preview down`.
+
+The shims themselves know nothing: they hand the words you have typed to a
+hidden `bif __complete` and print what comes back, so the candidates are always
+the installed binary's own answer. A generated script with the fleet baked into
+it would keep offering a service that had since been renamed.
+
+`bif preview down <tag>` is the one completion that reaches the network — those
+tags are branch-derived and not worth typing from memory. It is bounded at
+400ms and fails to **nothing**: a slow bifrost, an expired `gcloud` login or no
+network at all give you an empty completion, never an error where a candidate
+should be. Warm, it measures 90-140ms end to end. No other position makes any
+call at all: the fleet comes from the registry compiled into the binary.
+
+### The preview API token cache
+
+Reading the preview API token means shelling out to `gcloud`, which costs
+450-780ms of Python startup before a single byte reaches bifrost. Every `bif
+preview` command used to pay that, and it made completing `bif preview down`
+impossible inside a budget a keypress can afford.
+
+So the token is cached in `$XDG_CACHE_HOME/bif/preview-token` (falling back to
+`~/.cache/bif/`), mode **0600** inside a **0700** directory, written atomically
+and discarded unread if it is ever found wider than that. It is shared by every
+`bif preview` invocation on the machine, not just completion.
+
+Rotating `bifrost_prod_preview_api_token` needs no action from you and no file
+to delete: a 401 or 403 on a cached token purges it, re-reads the secret once,
+and retries the request. That is what makes correctness independent of the
+12-hour TTL, which only bounds how long a stale copy can sit on disk. To clear
+it by hand anyway: `rm ~/.cache/bif/preview-token`.
 
 ### `bif promote` with several services
 

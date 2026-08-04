@@ -13,6 +13,12 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go mod download
+      # TestShimsAreValidShell parses the emitted completion shims with the
+      # shells that will run them (`zsh -n`, `bash -n`), and a shell that is
+      # not installed would take half that gate with it — so it refuses to skip
+      # under CI. zsh is on the runner image today; the fallback turns a future
+      # image change into a slower job rather than a red one.
+      - run: zsh --version || sudo apt-get install -y zsh
       - run: go vet ./...
       - run: go test ./...
 

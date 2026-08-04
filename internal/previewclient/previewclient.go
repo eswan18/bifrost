@@ -14,11 +14,13 @@
 // the orchestration, the busy set, the cluster write credentials and the Neon
 // and Cloud Build tokens, so there is nothing here for the CLI to do locally.
 //
-// This package's tests live in cmd/bif/preview_test.go, driving the real
-// Client against an httptest server through the commands that use it — the
-// headers, the status-code mapping and the token are asserted there, on the
-// path an operator actually runs. Nothing in the test suite shells out to
-// gcloud or talks to a live bifrost.
+// Most of this package's tests live in cmd/bif/preview_test.go, driving the
+// real Client against an httptest server through the commands that use it —
+// the headers, the status-code mapping and the token are asserted there, on
+// the path an operator actually runs. The on-disk token cache (tokencache.go)
+// is tested here instead, in tokencache_test.go: file modes, expiry and the
+// rotation retry are properties of this package rather than of any command.
+// Nothing in the test suite shells out to gcloud or talks to a live bifrost.
 package previewclient
 
 import (
@@ -75,14 +77,29 @@ type Client struct {
 	// buried in the request path.
 	Token func(ctx context.Context) (string, error)
 
-	// once memoizes the token for the life of the process. ib.py re-runs
-	// gcloud on every single request, which is invisible for `list` and
-	// `down` (one call each) but is a subprocess every 3 seconds for `up`'s
-	// poll loop. Caching cannot change an outcome: a run is short, and a
-	// token rotated mid-run would fail the same way whichever copy was used.
-	once   sync.Once
-	cached string
-	tokErr error
+	// cache is the on-disk token cache (see tokencache.go), shared by every
+	// bif invocation on the machine. New sets it; a hand-built Client leaves
+	// it nil, which disables caching entirely — that is what every test with
+	// an injected Token wants, since a unit test must neither read nor write
+	// the developer's real token file.
+	cache *tokenCache
+
+	// The token, memoized for the life of the process. ib.py re-runs gcloud
+	// on every single request, which is invisible for `list` and `down` (one
+	// call each) but is a subprocess every 3 seconds for `up`'s poll loop.
+	//
+	// fromCache records that the memoized value came off disk rather than
+	// from gcloud, and refreshed that the one permitted rotation retry has
+	// been spent. Both belong to discardStaleToken; see there.
+	//
+	// A mutex rather than the sync.Once this used to be, because the value is
+	// no longer write-once: a 401 can replace it mid-run.
+	mu        sync.Mutex
+	haveToken bool
+	cached    string
+	tokErr    error
+	fromCache bool
+	refreshed bool
 }
 
 // New builds a Client against BIFROST_URL (or DefaultBaseURL), reading the
@@ -96,6 +113,7 @@ func New() *Client {
 		BaseURL: strings.TrimSuffix(base, "/"),
 		HTTP:    &http.Client{Timeout: requestTimeout},
 		Token:   GcloudToken,
+		cache:   &tokenCache{},
 	}
 }
 
@@ -122,10 +140,79 @@ func GcloudToken(ctx context.Context) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// token returns the memoized bearer token.
+// token returns the bearer token: the process memo, then the on-disk cache,
+// then gcloud — and a gcloud read is written back so the next bif on this
+// machine does not pay for it either.
+//
+// The cache write is best-effort and its error is dropped. A read-only HOME,
+// a full disk or a cache directory somebody has chmodded shut costs latency,
+// not a command — and there is no stream here to report it on that is not
+// somebody's stdout. See tokencache.go.
 func (c *Client) token(ctx context.Context) (string, error) {
-	c.once.Do(func() { c.cached, c.tokErr = c.Token(ctx) })
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.haveToken {
+		return c.cached, c.tokErr
+	}
+	if c.cache != nil {
+		if token, ok := c.cache.read(); ok {
+			c.cached, c.tokErr, c.fromCache, c.haveToken = token, nil, true, true
+			return c.cached, c.tokErr
+		}
+	}
+	c.cached, c.tokErr = c.Token(ctx)
+	c.haveToken = true
+	if c.tokErr == nil && c.cache != nil {
+		_ = c.cache.write(c.cached)
+	}
 	return c.cached, c.tokErr
+}
+
+// discardStaleToken answers the one failure the cache introduces that shelling
+// out every time could not: bifrost_prod_preview_api_token was rotated while a
+// copy of the old value sat on this machine's disk. Without this, rotating the
+// secret would silently break `bif preview` for everyone until they deleted a
+// file they did not know existed — a far worse problem than the half-second
+// the cache saves.
+//
+// It purges the file, reads the secret again, and reports whether the caller
+// should retry. Three conditions, each doing real work:
+//
+//   - there IS a cache. A hand-built Client without one is unchanged.
+//   - the rejected token came OFF that cache. A token gcloud handed over
+//     moments ago is not stale; a 401 on it means the token is genuinely
+//     refused, and re-asking gcloud for the same string to send it again would
+//     be a wasted round trip on every 401 the CLI has ever reported.
+//   - the retry has not already been spent. One per client, so a bifrost that
+//     401s everything answers in two requests rather than forever.
+func (c *Client) discardStaleToken(ctx context.Context) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cache == nil || !c.fromCache || c.refreshed {
+		return false
+	}
+	c.refreshed = true
+	c.cache.purge()
+
+	token, err := c.Token(ctx)
+	if err != nil {
+		// Keep the original 401 as the error the operator sees: "check the
+		// preview API token" is closer to the truth than whatever gcloud says
+		// about a login, and the request has already failed either way.
+		return false
+	}
+	c.cached, c.tokErr, c.fromCache = token, nil, false
+	_ = c.cache.write(token)
+	return true
+}
+
+// staleTokenRejected reports whether err is the shape a rotated token takes:
+// bifrost refusing the credential. 403 as well as 401 because which of the two
+// a rejected bearer token produces is the server's choice, not this client's.
+func staleTokenRejected(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) &&
+		(apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusForbidden)
 }
 
 // NotFoundError is a 404 from the preview API, carrying the server's own
@@ -192,9 +279,24 @@ func (e *TransportError) Error() string {
 
 func (e *TransportError) Unwrap() error { return e.Err }
 
-// do performs one API call, decoding a 2xx body into out (which may be nil to
-// discard it) and mapping every failure onto the error types above.
+// do performs one API call, retrying exactly once if the failure was bifrost
+// refusing a token that had been sitting in the on-disk cache since before a
+// rotation. See discardStaleToken for why that is the only case retried, and
+// why one is the count.
+//
+// The body is re-encoded by attempt on each try rather than shared, so the
+// retry sends a fresh reader rather than one that has already been drained.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	err := c.attempt(ctx, method, path, body, out)
+	if staleTokenRejected(err) && c.discardStaleToken(ctx) {
+		return c.attempt(ctx, method, path, body, out)
+	}
+	return err
+}
+
+// attempt performs one API call, decoding a 2xx body into out (which may be
+// nil to discard it) and mapping every failure onto the error types above.
+func (c *Client) attempt(ctx context.Context, method, path string, body, out any) error {
 	var payload io.Reader
 	var encoded []byte
 	if body != nil {
