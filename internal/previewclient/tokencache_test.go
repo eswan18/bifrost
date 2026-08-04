@@ -24,11 +24,17 @@ import (
 // cacheIn points the token cache at a scratch directory and returns the file
 // it will use. Every test in this file runs against XDG_CACHE_HOME, which is
 // also the lookup an operator gets — so the path resolution is exercised
-// rather than bypassed, and no test can touch a real ~/.cache/bif.
+// rather than bypassed.
+//
+// HOME is redirected too, and not for tidiness: it is the fallback. A test
+// that set only XDG_CACHE_HOME would, the moment the XDG lookup broke, quietly
+// start writing tokens into the developer's real ~/.cache — passing all the
+// while, since read and write would agree on the wrong place.
 func cacheIn(t *testing.T) (tokenCache, string) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", dir)
+	t.Setenv("HOME", t.TempDir())
 	return tokenCache{}, filepath.Join(dir, cacheDirName, cacheFileName)
 }
 
@@ -461,6 +467,39 @@ func TestNoRetryWhenTheTokenIsAlreadyFresh(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("gcloud calls = %d, want 1", got)
+	}
+}
+
+// TestAFailedRefreshIsNotRetriedEither covers the case the fromCache flag
+// alone does not: gcloud itself is broken — an expired login — so the refresh
+// never produces a token to mark as fresh, and the stale one stays memoized.
+// Without the spent-retry flag, every subsequent request would shell out to
+// gcloud again, turning one broken login into a subprocess per API call in
+// `preview up`'s poll loop.
+func TestAFailedRefreshIsNotRetriedEither(t *testing.T) {
+	c, _ := cacheIn(t)
+	if err := c.write("stale-token"); err != nil {
+		t.Fatalf("seed the cache: %v", err)
+	}
+	srv := newTokenServer(t, "") // refuses everything
+	var calls atomic.Int64
+	client := &Client{
+		BaseURL: srv.srv.URL,
+		HTTP:    srv.srv.Client(),
+		Token: func(context.Context) (string, error) {
+			calls.Add(1)
+			return "", errors.New("ERROR: (gcloud.secrets.versions.access) reauthentication required")
+		},
+		cache: &tokenCache{},
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := client.List(context.Background()); err == nil {
+			t.Fatalf("List %d succeeded against a server that refuses every token", i)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("gcloud calls across three commands with a broken login = %d, want 1", got)
 	}
 }
 
