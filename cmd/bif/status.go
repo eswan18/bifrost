@@ -165,12 +165,17 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 	}
 	apps := reg.Names()
 
+	// Any number of names narrows the fleet list to those names, in the order
+	// given. Every form below — the table, -q, --attention — already loops over
+	// `apps`, so several names cost this one line and nothing else: the
+	// single-name case is just the list of length one it always was, and the
+	// build lookup stays the single fleet-wide call it is for every other form.
 	if len(args) > 0 {
-		app := args[0]
-		if !validateApp(stdout, apps, app) {
+		named, ok := resolveApps(stdout, apps, args)
+		if !ok {
 			return 1
 		}
-		apps = []string{app}
+		apps = named
 	}
 
 	// -q gets no build lookup at all. Its output is a scriptable contract —

@@ -58,7 +58,7 @@ func TestDispatch(t *testing.T) {
 			// Rejected on argv alone, so the cluster is never dialled — the
 			// same shape ib.py has, and the reason noCluster can be used here.
 			wantCode: 1,
-			wantOut:  []string{"Usage: bif promote <app> [-y/--yes]"},
+			wantOut:  []string{"Usage: bif promote <app> [<app> ...] [-y/--yes]"},
 		},
 		{
 			name:     "preview with no subcommand prints its usage without connecting",
