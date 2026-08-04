@@ -52,11 +52,13 @@ const usage = `Deployment status and promotion helper for GKE services.
 Usage:
     bif status               # Show status for all services
     bif status <app>         # Show current images for staging and prod
+    bif status <app> <app>   # Same, for several services (order given)
     bif status -q            # List out-of-sync services (* = mid-deploy)
     bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
     bif status -a            # List everything noteworthy, and why (--attention)
     bif status <app> -a      # Same, for one service
     bif promote <app>        # Compare staging vs prod, offer to promote
+    bif promote <app> <app>  # Same, for several services: one plan, one prompt
     bif promote <app> -y     # Promote without confirmation
     bif preview list                      # Table of preview environments, TTL remaining
     bif preview up <branch>               # Create/update, show live progress, print URLs
@@ -185,6 +187,45 @@ func validateApp(stdout io.Writer, apps []string, app string) bool {
 	outf(stdout, "Unknown service: %s\n", app)
 	outf(stdout, "Known services: %s\n", strings.Join(apps, ", "))
 	return false
+}
+
+// resolveApps turns the positional arguments of `bif status` and `bif promote`
+// into the list of services to act on. Both commands take one or more names.
+//
+// EVERY name is validated before ANY of them is returned, and both callers run
+// this before dialling the cluster. So a typo in the third argument fails
+// before the first cluster read, and — for promote — before anything could
+// possibly be written. Validating lazily, service by service, would have
+// `bif promote bifrost comsm` promote bifrost first and complain afterwards,
+// which is the shape of mistake this command must not make. Only the first bad
+// name is reported: the second one's message would repeat the same
+// known-services list, and the operator is going to re-read their argv either
+// way.
+//
+// Names are DEDUPED, keeping the first occurrence, and the order is the ORDER
+// GIVEN rather than registry order. Both follow from what the argument list is:
+// the operator typed a sequence, so the output reads back in the sequence they
+// typed, and `bif promote bifrost bifrost` names one service twice rather than
+// asking for two promotions of it. Deduping here also means neither command has
+// to be re-checked for what a repeated name would do to it — promote would
+// otherwise plan the same write twice and report the second one against a prod
+// tag the first had already moved.
+func resolveApps(stdout io.Writer, known, args []string) ([]string, bool) {
+	for _, app := range args {
+		if !validateApp(stdout, known, app) {
+			return nil, false
+		}
+	}
+	seen := make(map[string]struct{}, len(args))
+	out := make([]string, 0, len(args))
+	for _, app := range args {
+		if _, dup := seen[app]; dup {
+			continue
+		}
+		seen[app] = struct{}{}
+		out = append(out, app)
+	}
+	return out, true
 }
 
 // outf and outln write to a command's output stream and deliberately discard

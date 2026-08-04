@@ -123,15 +123,24 @@ longer exists in any repo — remove it.
 
     bif status               # every service
     bif status <app>         # one service's staging and prod images
+    bif status <app> <app>   # several services, in the order given
     bif status -q            # list out-of-sync services (* = mid-deploy)
     bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
     bif status -a            # what needs attention, and why (--attention)
     bif status <app> -a      # the same four checks, for one service
     bif promote <app>        # compare staging vs prod, then ask before promoting
+    bif promote <app> <app>  # several services: one combined plan, one prompt
     bif promote <app> -y     # promote without the prompt
     bif preview list         # table of preview environments
     bif preview up <branch>  # create/update, show progress, print URLs
     bif preview down <tag>   # tear down (confirms unless -y/--yes)
+
+Both `status` and `promote` take **one or more** service names. Names are
+deduped and acted on in the order given (with no names, `status` uses registry
+order and `promote` is a usage error — there is no form of `promote` that
+promotes everything). Every name is validated up front, so a typo in the third
+argument fails before the first cluster read, and — for `promote` — before
+anything could have been written.
 
 `preview` takes `--ttl <duration>`, `--auto-update` and `--no-wait`; see
 `docs/preview-environments.md`.
@@ -144,6 +153,39 @@ yet. (`--attention` asks a broader question and has its own rules; see below.)
 `promote` exits **1** when it refuses (no deployment on either side, a
 staging rollout in flight) or when the patch fails; declining the prompt exits
 **0**, because nothing went wrong.
+
+### `bif promote` with several services
+
+Several names produce **one combined plan and one prompt**, not a prompt each:
+
+    $ bif promote bifrost footstrike-api identity
+
+    bifrost         eb12dfa -> prod  (prod: 5ea4c5a)
+    footstrike-api  89aed5a -> prod  (prod: 8ccc788)
+    identity        already in sync, skipping
+
+    Proceed with 2 promotions? [y/N]
+
+Nothing is written before the whole plan has been shown, so the answer is given
+once, about everything. If nothing needs promoting there is no prompt at all.
+
+The **asymmetry survives**, per service: a *staging* mismatch refuses that
+service and a *prod* mismatch warns and promotes it anyway (staging mid-deploy
+means the artifact is not settled; prod mid-deploy just means the last rollout
+is still landing, and re-pinning it is how a bad one gets corrected). In a
+several-service run a refusing service is reported and **skipped**, not allowed
+to abort the others — and neither is a failed write, so a failure on the second
+service still leaves the third attempted. The run ends with a summary naming
+every service in each group:
+
+    Summary: 2 promoted (bifrost, identity), 1 failed (comms)
+
+Exit **0** only if everything attempted worked and nothing was refused. A
+service skipped because it is already in sync is not a failure; a service that
+refused is, because the operator asked for a promotion that did not happen.
+
+A single name keeps the original per-service output and its `Proceed? [y/N]`
+prompt, unchanged.
 
 `bif status` and `bif status <app>` also show each service's most recent Cloud
 Build, under its prod tag:

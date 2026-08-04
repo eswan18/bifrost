@@ -35,6 +35,10 @@ type fakeCluster struct {
 
 	patches  []patchCall
 	patchErr error
+	// patchErrs fails the patch for named apps only. A several-service promote
+	// has to keep going after one service's write fails, and a single
+	// all-or-nothing patchErr cannot express the cluster state that proves it.
+	patchErrs map[string]error
 }
 
 // patchCall is one write to an ArgoCD Application, as promote asked for it.
@@ -65,7 +69,33 @@ func (f *fakeCluster) ListPods(_ context.Context, ns string) ([]kube.PodInfo, er
 
 func (f *fakeCluster) PatchAppImage(_ context.Context, app, env, image string) error {
 	f.patches = append(f.patches, patchCall{app: app, env: env, image: image})
+	if err := f.patchErrs[app]; err != nil {
+		return err
+	}
 	return f.patchErr
+}
+
+// promotedApps is the apps this cluster actually had prod moved for, in the
+// order the writes arrived. Assertions about which services were acted on read
+// this rather than scanning stdout: two services' output lines differ only by
+// name, and strings.Contains over the whole run will happily match the wrong
+// one.
+func (f *fakeCluster) promotedApps() []string {
+	out := make([]string, 0, len(f.patches))
+	for _, p := range f.patches {
+		out = append(out, p.app)
+	}
+	return out
+}
+
+// patchedImage is what prod was pinned to for one app, or "" if it never was.
+func (f *fakeCluster) patchedImage(app string) string {
+	for _, p := range f.patches {
+		if p.app == app {
+			return p.image
+		}
+	}
+	return ""
 }
 
 func (f *fakeCluster) connect() (promoter, error) { return f, nil }
@@ -1575,5 +1605,175 @@ func TestAttentionAndQuietAreRefusedTogether(t *testing.T) {
 				t.Errorf("read %v before rejecting the invocation; want nothing", c.calls)
 			}
 		})
+	}
+}
+
+// ---- `bif status <app> <app> ...` ---------------------------------------
+
+// distinctFleet is fleet(t) with the named services made out of sync on tags
+// that are unique to each of them.
+//
+// The distinctness is the point, and it is this package's recurring trap: a
+// fixture where two services carry the same tags cannot tell "both were
+// rendered" from "one was rendered twice", and it cannot tell which one a
+// `strings.Contains` over the whole output matched. Every service here gets its
+// own staging SHA and its own prod SHA, so every assertion below names a string
+// that can only have come from the service it is about.
+func distinctFleet(t *testing.T, staging, prod map[string]string) *fakeCluster {
+	t.Helper()
+	c := fleet(t)
+	for app, tag := range staging {
+		c.images[app+"-staging"] = []string{image(app, tag)}
+	}
+	for app, tag := range prod {
+		c.images[app+"-prod"] = []string{image(app, tag)}
+	}
+	return c
+}
+
+// sectionOrder returns the services whose `bif status` table appeared in out,
+// in the order they appeared. It matches the header line specifically rather
+// than searching for the name anywhere, because a service's name also shows up
+// in another service's output — the promote hint under a neighbouring "Out of
+// sync" says `bif promote <name>` — and a whole-output scan would count that.
+func sectionOrder(out string) []string {
+	var apps []string
+	for _, line := range strings.Split(out, "\n") {
+		if app, ok := strings.CutSuffix(line, " deployment status:"); ok {
+			apps = append(apps, app)
+		}
+	}
+	return apps
+}
+
+// TestStatusAcceptsSeveralServices is the bug this fixes, stated as the
+// behaviour that replaces it: before, `bif status bifrost comms` printed
+// bifrost and SILENTLY DROPPED comms. Every named service must be rendered,
+// with its own images.
+func TestStatusAcceptsSeveralServices(t *testing.T) {
+	c := distinctFleet(t,
+		map[string]string{"bifrost": "aaa1111", "comms": "bbb2222", "identity": "ccc3333"},
+		map[string]string{"bifrost": "ddd4444", "comms": "eee5555", "identity": "ccc3333"})
+
+	out, code := exec(t, c, "status", "bifrost", "comms", "identity")
+
+	if got := sectionOrder(out); !slices.Equal(got, []string{"bifrost", "comms", "identity"}) {
+		t.Errorf("rendered %v, want all three named services", got)
+	}
+	// Each service's own tags, not just "three sections appeared".
+	for _, want := range []string{
+		"  staging: aaa1111", "  prod:    ddd4444", // bifrost
+		"  staging: bbb2222", "  prod:    eee5555", // comms
+		"  staging: ccc3333", // identity, in sync
+	} {
+		if !slices.Contains(strings.Split(out, "\n"), want) {
+			t.Errorf("output is missing %q:\n%s", want, out)
+		}
+	}
+	// One out-of-sync service anywhere in the list is enough to exit 1.
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	// Services that were not named must not be read at all — narrowing has to
+	// still narrow.
+	for _, ns := range c.calls {
+		if strings.HasPrefix(ns, "forecasting-") || strings.HasPrefix(ns, "asset-manager-") {
+			t.Errorf("read %s, which was not named", ns)
+		}
+	}
+}
+
+// TestStatusFollowsTheOrderGiven: the operator typed a sequence and reads the
+// output back in it. Registry order is what `bif status` with NO names uses,
+// and this is the case that tells the two apart — the names here are in reverse
+// registry order, so an implementation that sorted or re-registry-ordered them
+// fails.
+func TestStatusFollowsTheOrderGiven(t *testing.T) {
+	c := fleet(t)
+	out, code := exec(t, c, "status", "identity", "comms", "bifrost")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	want := []string{"identity", "comms", "bifrost"}
+	if got := sectionOrder(out); !slices.Equal(got, want) {
+		t.Errorf("rendered %v, want %v (the order given, not registry order)", got, want)
+	}
+}
+
+// TestStatusDedupesRepeatedNames: a name given twice is one service. Rendering
+// it twice would be noise, and reading its namespaces twice would be two
+// cluster round-trips for one answer.
+func TestStatusDedupesRepeatedNames(t *testing.T) {
+	c := fleet(t)
+	out, code := exec(t, c, "status", "bifrost", "comms", "bifrost")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	want := []string{"bifrost", "comms"}
+	if got := sectionOrder(out); !slices.Equal(got, want) {
+		t.Errorf("rendered %v, want %v (the repeat collapses onto its first position)", got, want)
+	}
+	if got := len(c.calls); got != 4 {
+		t.Errorf("read %d namespaces (%v), want 4: two services, two namespaces each", got, c.calls)
+	}
+}
+
+// TestStatusValidatesEveryNameBeforeReadingTheCluster: a typo in the THIRD
+// argument must fail before the FIRST cluster read. Otherwise `bif status`
+// spends two round-trips on bifrost and comms before telling the operator their
+// argv was wrong — and, on the promote side, the same shape of mistake would
+// have written to prod first.
+func TestStatusValidatesEveryNameBeforeReadingTheCluster(t *testing.T) {
+	c := fleet(t)
+	out, code := exec(t, c, "status", "bifrost", "comms", "identtiy")
+
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if len(c.calls) != 0 {
+		t.Errorf("read %v before rejecting the bad name; want nothing", c.calls)
+	}
+	if !strings.HasPrefix(out, "Unknown service: identtiy\n") {
+		t.Errorf("stdout = %q, want it to name the bad argument first", out)
+	}
+	if strings.Contains(out, "deployment status:") {
+		t.Errorf("rendered a service despite the bad name:\n%s", out)
+	}
+}
+
+// TestStatusQuietListsEveryNamedService: -q needed no change, and this is what
+// "no change" has to mean — it narrows to the names given and lists exactly the
+// out-of-sync ones among them, in the order given.
+func TestStatusQuietListsEveryNamedService(t *testing.T) {
+	c := distinctFleet(t,
+		map[string]string{"comms": "bbb2222", "identity": "ccc3333"},
+		map[string]string{"comms": "eee5555", "identity": "fff6666"})
+
+	out, code := exec(t, c, "status", "identity", "bifrost", "comms", "-q")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	// bifrost is in sync, so it prints nothing; the other two print in the
+	// order given, which is not registry order.
+	if want := "identity\ncomms\n"; out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+}
+
+// TestStatusAttentionCoversEveryNamedService: --attention needed no change
+// either. Both named services qualify, for reasons unique to each.
+func TestStatusAttentionCoversEveryNamedService(t *testing.T) {
+	c, builds := attentionFleet(t, nil)
+	c.images["bifrost-prod"] = []string{image("bifrost", "ddd4444")}
+	c.images["comms-prod"] = []string{image("comms", "eee5555")}
+
+	out, _, code := execBuilds(t, c, builds, "status", "bifrost", "comms", "-a")
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	want := "bifrost  staging and prod differ: staging abc1234, prod ddd4444 (bif promote bifrost)\n" +
+		"comms    staging and prod differ: staging abc1234, prod eee5555 (bif promote comms)\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
 	}
 }

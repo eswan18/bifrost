@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -511,5 +512,313 @@ func TestPromoteUsageRequiresAnApp(t *testing.T) {
 				t.Fatalf("patched %+v with no app named", cluster.patches)
 			}
 		})
+	}
+}
+
+// ---- `bif promote <app> <app> ...` --------------------------------------
+
+// promoteFleet builds a cluster in which each named service has its OWN
+// staging and prod tag.
+//
+// Distinctness is not cosmetic here. Two services promoted from the same tag
+// produce two output blocks that differ only by name and two patches that
+// differ only by name, so no assertion could tell "both were promoted" from
+// "one was promoted twice", and the whole point of these tests is that the
+// second name is no longer dropped. Every tag below appears exactly once in the
+// whole run.
+func promoteFleet(t *testing.T, tags map[string][2]string) *fakeCluster {
+	t.Helper()
+	c := fleet(t)
+	for app, pair := range tags {
+		c.images[app+"-staging"] = []string{image(app, pair[0])}
+		c.images[app+"-prod"] = []string{image(app, pair[1])}
+	}
+	return c
+}
+
+// TestPromoteSeveralServicesIsOnePlanAndOnePrompt is the shape the owner chose,
+// pinned whole: a combined plan naming every service, ONE question, then the
+// writes, then a summary. The whole of stdout is compared because the ordering
+// of those four parts is the contract — a prompt that appeared before the plan
+// finished rendering would be a promote asked for on incomplete information.
+func TestPromoteSeveralServicesIsOnePlanAndOnePrompt(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost":        {"aaa1111", "ddd4444"},
+		"footstrike-api": {"bbb2222", "eee5555"},
+		"identity":       {"ccc3333", "ccc3333"}, // in sync
+	})
+
+	out, code := execStdin(t, c, "y\n", "promote", "bifrost", "footstrike-api", "identity")
+
+	want := "\n" +
+		"bifrost         aaa1111 -> prod  (prod: ddd4444)\n" +
+		"footstrike-api  bbb2222 -> prod  (prod: eee5555)\n" +
+		"identity        already in sync, skipping\n" +
+		"\nProceed with 2 promotions? [y/N] " +
+		"\nRunning: kubectl patch application bifrost-prod -n argocd\n" +
+		"\n✓ Promoted bifrost prod to aaa1111\n  (ArgoCD will sync automatically)\n" +
+		"\nRunning: kubectl patch application footstrike-api-prod -n argocd\n" +
+		"\n✓ Promoted footstrike-api prod to bbb2222\n  (ArgoCD will sync automatically)\n" +
+		"\nSummary: 2 promoted (bifrost, footstrike-api), 1 skipped (identity)\n"
+	if out != want {
+		t.Errorf("stdout mismatch\n got %q\nwant %q", out, want)
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+
+	// Exactly one question, however many services.
+	if n := strings.Count(out, "[y/N]"); n != 1 {
+		t.Errorf("asked %d times, want exactly 1", n)
+	}
+	// Both services were written, each with its OWN staging image — the
+	// assertion the shared-tag fixture could not make.
+	if got := c.promotedApps(); !slices.Equal(got, []string{"bifrost", "footstrike-api"}) {
+		t.Fatalf("patched %v, want bifrost and footstrike-api", got)
+	}
+	if got, want := c.patchedImage("bifrost"), image("bifrost", "aaa1111"); got != want {
+		t.Errorf("bifrost patched to %q, want %q", got, want)
+	}
+	if got, want := c.patchedImage("footstrike-api"), image("footstrike-api", "bbb2222"); got != want {
+		t.Errorf("footstrike-api patched to %q, want %q", got, want)
+	}
+	if c.patchedImage("identity") != "" {
+		t.Errorf("identity was in sync but was patched to %q", c.patchedImage("identity"))
+	}
+}
+
+// TestPromoteSeveralServicesDeclinedWritesNothing: one "no" declines the whole
+// plan. The prompt is the last thing between the operator and production, and
+// declining it must leave the cluster untouched — not "leave the first one
+// untouched".
+func TestPromoteSeveralServicesDeclinedWritesNothing(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost": {"aaa1111", "ddd4444"},
+		"comms":   {"bbb2222", "eee5555"},
+	})
+
+	out, code := execStdin(t, c, "n\n", "promote", "bifrost", "comms")
+	if code != 0 {
+		t.Errorf("exit = %d, want 0 — declining is not a failure", code)
+	}
+	if len(c.patches) != 0 {
+		t.Fatalf("declined, but bif patched %+v", c.patches)
+	}
+	if !strings.HasSuffix(out, "\nProceed with 2 promotions? [y/N] Aborted.\n") {
+		t.Errorf("output does not end with the declined prompt:\n%s", out)
+	}
+	if strings.Contains(out, "Running: kubectl patch") {
+		t.Errorf("declined, but bif announced a patch:\n%s", out)
+	}
+}
+
+// TestPromoteSeveralServicesStagingMismatchSkipsThatOneOnly is the asymmetry
+// carried into the several-name form. A staging mismatch REFUSES — but in a
+// run of three it must refuse ONE service, not abort the other two: the
+// artifact that is not settled is comms's, and bifrost's and identity's have
+// nothing to do with it.
+//
+// It still exits 1. The operator named comms expecting prod to move and it did
+// not, and an exit 0 here would let a scripted promote report success for a
+// service it never touched.
+func TestPromoteSeveralServicesStagingMismatchSkipsThatOneOnly(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost":  {"aaa1111", "ddd4444"},
+		"identity": {"ccc3333", "fff6666"},
+	})
+	c.images["comms-staging"] = []string{image("comms", "bbb2222"), image("comms", "999zzzz")}
+	c.images["comms-prod"] = []string{image("comms", "eee5555")}
+
+	out, code := exec(t, c, "promote", "bifrost", "comms", "identity", "-y")
+
+	if code != 1 {
+		t.Errorf("exit = %d, want 1 — a refused promotion is one the operator asked for and did not get", code)
+	}
+	if !strings.Contains(out, "comms     staging has an image mismatch (deployment in progress?), skipping\n") {
+		t.Errorf("the plan does not name comms's refusal:\n%s", out)
+	}
+	// The other two ran, and comms did not.
+	if got := c.promotedApps(); !slices.Equal(got, []string{"bifrost", "identity"}) {
+		t.Fatalf("patched %v, want bifrost and identity — the refusal must not abort the others", got)
+	}
+	if got, want := c.patchedImage("identity"), image("identity", "ccc3333"); got != want {
+		t.Errorf("identity patched to %q, want %q", got, want)
+	}
+	want := "\nSummary: 2 promoted (bifrost, identity), 1 refused (comms)\n"
+	if !strings.HasSuffix(out, want) {
+		t.Errorf("output does not end with %q:\n%s", want, out)
+	}
+}
+
+// TestPromoteSeveralServicesProdMismatchStillPromotes is the other half of the
+// asymmetry, in the several-name form: prod mid-rollout WARNS and continues,
+// because re-pinning prod is how a bad rollout gets corrected.
+func TestPromoteSeveralServicesProdMismatchStillPromotes(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost": {"aaa1111", "ddd4444"},
+		"comms":   {"bbb2222", "eee5555"},
+	})
+	c.images["comms-prod"] = []string{image("comms", "eee5555"), image("comms", "111zzzz")}
+
+	out, code := exec(t, c, "promote", "bifrost", "comms", "-y")
+	if code != 0 {
+		t.Errorf("exit = %d, want 0 — a prod mismatch warns, it does not refuse\n%s", code, out)
+	}
+	if got := c.promotedApps(); !slices.Equal(got, []string{"bifrost", "comms"}) {
+		t.Fatalf("patched %v, want both", got)
+	}
+	// The warning names the service it is about and lists its images, above the
+	// plan line it qualifies.
+	warning := "\nWarning: Prod has an image mismatch for comms (deployment in progress?)\n" +
+		"  Images found:\n    - 111zzzz\n    - eee5555\n"
+	if !strings.HasPrefix(out, warning) {
+		t.Errorf("output does not open with the warning\n got %q\nwant prefix %q", out, warning)
+	}
+	if !strings.Contains(out, "comms    bbb2222 -> prod  (prod: 111zzzz)\n") {
+		t.Errorf("comms is not in the plan as a promotion:\n%s", out)
+	}
+}
+
+// TestPromoteSeveralServicesContinuesPastAFailure: the write is the one thing
+// that can fail after the decision, and a failure on the SECOND service must
+// not stop the THIRD. The operator gets every service they asked for attempted,
+// a report of which ones did not land, and an exit 1.
+func TestPromoteSeveralServicesContinuesPastAFailure(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost":  {"aaa1111", "ddd4444"},
+		"comms":    {"bbb2222", "eee5555"},
+		"identity": {"ccc3333", "fff6666"},
+	})
+	c.patchErrs = map[string]error{
+		"comms": errors.New("applications.argoproj.io \"comms-prod\" not found\n"),
+	}
+
+	out, code := exec(t, c, "promote", "bifrost", "comms", "identity", "-y")
+
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	// All three were ATTEMPTED — identity's write comes after comms's failure,
+	// which is the property this test exists for.
+	if got := c.promotedApps(); !slices.Equal(got, []string{"bifrost", "comms", "identity"}) {
+		t.Fatalf("attempted %v, want all three in order", got)
+	}
+	if got, want := c.patchedImage("identity"), image("identity", "ccc3333"); got != want {
+		t.Errorf("identity patched to %q, want %q — the third service must still have been written", got, want)
+	}
+	if !strings.Contains(out, "\n✗ Promotion failed\n  applications.argoproj.io \"comms-prod\" not found\n") {
+		t.Errorf("the cluster's own message is missing:\n%s", out)
+	}
+	// The summary is what makes a scrolled-past failure findable, so it has to
+	// NAME the failure rather than count it.
+	want := "\nSummary: 2 promoted (bifrost, identity), 1 failed (comms)\n"
+	if !strings.HasSuffix(out, want) {
+		t.Errorf("output does not end with %q:\n%s", want, out)
+	}
+}
+
+// TestPromoteSeveralServicesWithNothingToPromote: every named service is
+// already in sync, so there is no question to ask. Prompting anyway would train
+// the operator to answer a prompt that never means anything.
+func TestPromoteSeveralServicesWithNothingToPromote(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{
+		"bifrost": {"aaa1111", "aaa1111"},
+		"comms":   {"bbb2222", "bbb2222"},
+	})
+
+	out, code := execStdin(t, c, "y\n", "promote", "bifrost", "comms")
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if len(c.patches) != 0 {
+		t.Fatalf("nothing to promote, but bif patched %+v", c.patches)
+	}
+	want := "\n" +
+		"bifrost  already in sync, skipping\n" +
+		"comms    already in sync, skipping\n" +
+		"\nNothing to promote.\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if strings.Contains(out, "[y/N]") {
+		t.Errorf("prompted with nothing to promote:\n%s", out)
+	}
+}
+
+// TestPromoteValidatesEveryNameBeforeConnecting is the one that matters most
+// for this command: a typo in the THIRD argument must be caught before the
+// cluster is dialled, which is before anything could have been written. The
+// alternative — validate-as-you-go — would promote bifrost and comms and then
+// report the typo, having already changed production.
+func TestPromoteValidatesEveryNameBeforeConnecting(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	connected := false
+	code := run(context.Background(), []string{"promote", "bifrost", "comms", "identtiy", "-y"},
+		strings.NewReader(""), &stdout, &stderr, func() (promoter, error) {
+			connected = true
+			return nil, errors.New("should not have been called")
+		}, unreachableBuilds, noPreview)
+
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if connected {
+		t.Error("connected to the cluster before validating every service name")
+	}
+	want := "Unknown service: identtiy\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, forecasting, identity\n"
+	if stdout.String() != want {
+		t.Errorf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+// TestPromoteDedupesRepeatedNames doubles as the single-service regression
+// guard: `bif promote bifrost bifrost` names one service, so it must take the
+// one-service path and print BYTE FOR BYTE what `bif promote bifrost` prints —
+// no plan table, no summary, no "Proceed with 1 promotion?" — and write once.
+//
+// The comparison is against the real single-name run rather than against a
+// literal, so this keeps holding whatever the single-name output is; the
+// literal it must equal is pinned separately, against ib.py, by
+// TestPromoteMatchesOracle.
+func TestPromoteDedupesRepeatedNames(t *testing.T) {
+	one := promoteFleet(t, map[string][2]string{"bifrost": {"aaa1111", "ddd4444"}})
+	wantOut, wantCode := exec(t, one, "promote", "bifrost", "-y")
+
+	twice := promoteFleet(t, map[string][2]string{"bifrost": {"aaa1111", "ddd4444"}})
+	out, code := exec(t, twice, "promote", "bifrost", "bifrost", "-y")
+
+	if out != wantOut {
+		t.Errorf("a repeated name changed the output\n got %q\nwant %q", out, wantOut)
+	}
+	if code != wantCode {
+		t.Errorf("exit = %d, want %d", code, wantCode)
+	}
+	if got := twice.promotedApps(); !slices.Equal(got, []string{"bifrost"}) {
+		t.Errorf("patched %v, want exactly one write", got)
+	}
+	if strings.Contains(out, "Summary:") || strings.Contains(out, "-> prod  (prod:") {
+		t.Errorf("one service rendered as a several-service plan:\n%s", out)
+	}
+}
+
+// TestPromoteSingleServiceKeepsItsOwnRendering states the constraint directly:
+// the several-name form got a NEW rendering so that the one-name form did not
+// have to change. Nothing from the new one may leak into the old one.
+func TestPromoteSingleServiceKeepsItsOwnRendering(t *testing.T) {
+	c := promoteFleet(t, map[string][2]string{"bifrost": {"aaa1111", "ddd4444"}})
+	out, code := execStdin(t, c, "y\n", "promote", "bifrost")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	if !strings.Contains(out, "\nbifrost promotion check:\n") {
+		t.Errorf("the single-service check header is gone:\n%s", out)
+	}
+	if !strings.Contains(out, "\nProceed? [y/N] ") {
+		t.Errorf("the single-service prompt changed:\n%s", out)
+	}
+	for _, leaked := range []string{"Proceed with", "Summary:", "skipping", "-> prod  (prod:"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("several-service output %q leaked into the single-service form:\n%s", leaked, out)
+		}
 	}
 }
