@@ -65,7 +65,7 @@ func noNetwork(t *testing.T) func() previewAPI {
 func complete(t *testing.T, dial func() previewAPI, words ...string) []string {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), append([]string{"__complete"}, words...), strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, dial)
+	code := run(context.Background(), append([]string{"__complete"}, words...), strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, dial)
 	if code != 0 {
 		t.Errorf("__complete %q exited %d, want 0", words, code)
 	}
@@ -411,7 +411,7 @@ func TestCompletePreviewDownSwallowsFailures(t *testing.T) {
 func TestCompleteIsHidden(t *testing.T) {
 	for _, args := range [][]string{nil, {"stauts"}} {
 		var stdout, stderr bytes.Buffer
-		run(context.Background(), args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview)
+		run(context.Background(), args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
 		if strings.Contains(stdout.String(), "__complete") {
 			t.Errorf("`bif %s` advertises __complete:\n%s", strings.Join(args, " "), stdout.String())
 		}
@@ -420,7 +420,7 @@ func TestCompleteIsHidden(t *testing.T) {
 	// completion, by contrast, is a command an operator runs, so it joins the
 	// listing the unknown-command path prints.
 	var stdout, stderr bytes.Buffer
-	run(context.Background(), []string{"stauts"}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview)
+	run(context.Background(), []string{"stauts"}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
 	if !strings.Contains(stdout.String(), "Available commands: status, promote, preview, completion") {
 		t.Errorf("completion is missing from the command listing:\n%s", stdout.String())
 	}
@@ -467,7 +467,7 @@ func TestCompletionCmd(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
@@ -511,7 +511,7 @@ func TestShimsAreValidShell(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			if code := run(context.Background(), []string{"completion", tc.arg}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, noPreview); code != 0 {
+			if code := run(context.Background(), []string{"completion", tc.arg}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview); code != 0 {
 				t.Fatalf("bif completion %s exited %d", tc.arg, code)
 			}
 

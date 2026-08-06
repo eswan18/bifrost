@@ -116,7 +116,7 @@ func jsonHandler(status int, body string) http.HandlerFunc {
 // execPreview runs a whole `bif preview ...` invocation against the fake.
 func execPreview(f *fakeBifrost, stdin string, args ...string) (stdout, stderr string, code int) {
 	var out, errb bytes.Buffer
-	code = run(context.Background(), append([]string{"preview"}, args...), strings.NewReader(stdin), &out, &errb, noCluster, unreachableBuilds, f.dial())
+	code = run(context.Background(), append([]string{"preview"}, args...), strings.NewReader(stdin), &out, &errb, noCluster, unreachableBuilds, unreachableDigests, f.dial())
 	return out.String(), errb.String(), code
 }
 

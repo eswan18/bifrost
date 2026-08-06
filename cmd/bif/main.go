@@ -10,11 +10,13 @@
 // bifrost's HTTP API, its bearer token, or its availability.
 //
 // The property is about that one server, not about the network. `bif status`
-// has always spoken HTTPS to the Kubernetes API, and it now also reads Cloud
-// Build through internal/gcb for the build column. Both are third parties
-// rather than the service being managed, and the build read is best-effort on
-// top of that: a bounded timeout, a column that degrades to "unavailable", and
-// no effect on the exit code. See main_test.go's
+// has always spoken HTTPS to the Kubernetes API; it also reads Cloud Build
+// through internal/gcb for the build column, and Artifact Registry through
+// internal/oci for --attention's one content comparison. All three are third
+// parties rather than the service being managed, and both extra reads are
+// best-effort on top of that: a bounded timeout, a degraded answer (an
+// "unavailable" column, a fall back to comparing tags), and no dependency of
+// `bif promote bifrost` on any of it. See main_test.go's
 // TestNoBifrostServerDependency.
 //
 // `bif preview` is the one exception, and is an HTTP client by design: the
@@ -42,6 +44,7 @@ import (
 
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
+	"github.com/eswan18/bifrost/internal/oci"
 	"github.com/eswan18/bifrost/internal/registry"
 )
 
@@ -73,21 +76,24 @@ Usage:
 const argoNamespace = "argocd"
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialBuilds, dialPreview))
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialBuilds, dialDigests, dialPreview))
 }
 
 // run is main with the process edges passed in — argv, the input and output
-// streams, the exit status as a return value, and the three connections as
+// streams, the exit status as a return value, and the four connections as
 // functions — so tests can drive whole commands end to end, including
 // promote's confirmation prompt, without any of them reaching a real service.
 //
-// The three are separate parameters rather than one bundle because they are
-// three different relationships. `connect` is the cluster, and everything
+// The four are separate parameters rather than one bundle because they are
+// four different relationships. `connect` is the cluster, and everything
 // reachable through it works with bifrost down. `connectBuilds` is Cloud
 // Build: a third party `bif status` reads for information, whose failure
-// degrades one column and nothing else (see fetchBuilds). `connectPreview` is
+// degrades one column and nothing else (see fetchBuilds). `connectDigests` is
+// Artifact Registry, read by `bif status --attention` alone and only when a
+// build tag and a staging tag differ, to tell a new tag apart from new content;
+// its failure falls back to comparing tags and warning. `connectPreview` is
 // bifrost itself, which nothing but the preview branch below is handed.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectBuilds func(context.Context) (buildLister, error), connectPreview func() previewAPI) int {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectBuilds func(context.Context) (buildLister, error), connectDigests func(context.Context) (digestResolver, error), connectPreview func() previewAPI) int {
 	if len(args) == 0 {
 		outln(stdout, usage)
 		return 1
@@ -99,7 +105,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		// promote uses. See readOnly. It is also the only command handed the
 		// Cloud Build connection: promote must not so much as be able to
 		// stall on a third party.
-		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect), connectBuilds)
+		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect), connectBuilds, connectDigests)
 	case "promote":
 		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
 	case "preview":
@@ -163,6 +169,23 @@ func dialBuilds(ctx context.Context) (buildLister, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// dialDigests opens the Artifact Registry reader `bif status --attention` uses
+// to tell a new TAG apart from new CONTENT, on the same Application Default
+// Credentials dialBuilds reads Cloud Build with — no shelling out to gcloud,
+// and one token per invocation rather than one per service (internal/oci.New).
+//
+// Its failure is not the command's failure, and it is not an all-clear either:
+// the attention check falls back to comparing tags and warns, which is exactly
+// what it did before this existed. A registry that cannot be read must never be
+// able to make a real stalled sync disappear.
+func dialDigests(ctx context.Context) (digestResolver, error) {
+	r, err := oci.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // loadRegistry returns the embedded fleet registry, reporting a load failure

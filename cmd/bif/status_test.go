@@ -116,7 +116,7 @@ func exec(t *testing.T, cluster *fakeCluster, args ...string) (string, int) {
 func execStdin(t *testing.T, cluster *fakeCluster, stdin string, args ...string) (string, int) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, unreachableBuilds, noPreview)
+	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, unreachableBuilds, unreachableDigests, noPreview)
 	return stdout.String(), code
 }
 
@@ -174,7 +174,7 @@ func (f *fakeBuilds) counts() (dials, calls int) {
 func execBuilds(t *testing.T, cluster *fakeCluster, builds *fakeBuilds, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, noPreview)
+	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, unreachableDigests, noPreview)
 	return out.String(), errb.String(), code
 }
 
@@ -730,7 +730,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, unreachableBuilds, noPreview)
+		}, unreachableBuilds, unreachableDigests, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -753,7 +753,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, noPreview)
+	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, unreachableDigests, noPreview)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
@@ -770,7 +770,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 func TestConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"status"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, noPreview)
+		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, unreachableDigests, noPreview)
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
@@ -786,7 +786,7 @@ func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
 	code := run(context.Background(), []string{"status", "bifrost", "-q"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return cluster, nil }, unreachableBuilds, noPreview)
+		func() (promoter, error) { return cluster, nil }, unreachableBuilds, unreachableDigests, noPreview)
 	if stdout.String() != "" || code != 0 {
 		t.Errorf("stdout = %q, exit = %d; want in-sync (no output, 0) with the job pod ignored", stdout.String(), code)
 	}
@@ -1775,5 +1775,420 @@ func TestStatusAttentionCoversEveryNamedService(t *testing.T) {
 		"comms    staging and prod differ: staging abc1234, prod eee5555 (bif promote comms)\n"
 	if out != want {
 		t.Errorf("stdout = %q, want %q", out, want)
+	}
+}
+
+// ---- --attention's content comparison -----------------------------------
+
+// The real digests behind the false alarm this fixes. Three consecutive
+// bifrost tags, three different OCI INDEXES — each holding the same image
+// manifest plus that build's own provenance attestation:
+//
+//	eb12dfa  index: [61acb248b85e (image), d5d58103a519 (attestation)]
+//	0cbfc9f  index: [61acb248b85e (image), 59b130d8de1f (attestation)]
+//
+// The commits between them touched cmd/bif only, and the image builds
+// ./cmd/bifrost, so the server image was byte-identical and image-updater
+// correctly did not move staging. `bif status -a` called that a stalled deploy.
+const (
+	sharedManifest = "sha256:61acb248b85e"
+	otherManifest  = "sha256:aa11bb22cc33"
+)
+
+// fakeDigests serves ManifestDigest from an image ref -> digest map, and counts
+// what a run cost: the dials (one credential per invocation, not one per
+// service) and every reference asked for (which tag was resolved, in a fleet
+// where the tag scheme is not the same for every service).
+type fakeDigests struct {
+	byImage map[string]string
+	dialErr error
+	errFor  map[string]error // this reference cannot be read
+	hang    bool             // never answer; wait for the context instead
+
+	// concurrent, when non-zero, makes every call block until that many are in
+	// flight at once. A resolver that runs the fleet one service at a time
+	// never reaches the count and every lookup dies on the context instead —
+	// which shows up as the warnings coming back.
+	concurrent int
+	reached    chan struct{}
+
+	mu       sync.Mutex
+	dials    int
+	asked    []string
+	inFlight int
+}
+
+func (f *fakeDigests) dial(context.Context) (digestResolver, error) {
+	f.mu.Lock()
+	f.dials++
+	f.mu.Unlock()
+	if f.dialErr != nil {
+		return nil, f.dialErr
+	}
+	return f, nil
+}
+
+func (f *fakeDigests) ManifestDigest(ctx context.Context, image string) (string, error) {
+	f.mu.Lock()
+	f.asked = append(f.asked, image)
+	if f.concurrent > 0 {
+		f.inFlight++
+		if f.inFlight == f.concurrent {
+			close(f.reached)
+		}
+	}
+	gate := f.reached
+	f.mu.Unlock()
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if f.hang {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	if err := f.errFor[image]; err != nil {
+		return "", err
+	}
+	digest, ok := f.byImage[image]
+	if !ok {
+		return "", fmt.Errorf("manifest unknown for %s", image)
+	}
+	return digest, nil
+}
+
+func (f *fakeDigests) counts() (dials int, asked []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dials, append([]string(nil), f.asked...)
+}
+
+// newDigests is a resolver that knows the given refs, with the concurrency
+// plumbing off.
+func newDigests(byImage map[string]string) *fakeDigests {
+	return &fakeDigests{byImage: byImage}
+}
+
+// execAttention is execBuilds with a registry to talk to as well.
+func execAttention(t *testing.T, cluster *fakeCluster, builds *fakeBuilds, digests *fakeDigests, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, digests.dial, noPreview)
+	return out.String(), errb.String(), code
+}
+
+// stalledFleet is attentionFleet with bifrost set up as the false alarm:
+// staging running an older TAG than the newest successful build, which is the
+// only state that reaches the registry at all.
+func stalledFleet(t *testing.T, stagingTag, buildSHA string, finished time.Duration) (*fakeCluster, *fakeBuilds) {
+	t.Helper()
+	c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+		"bifrost": {Status: "SUCCESS", SHA: buildSHA, FinishTime: time.Now().Add(-finished)},
+	})
+	c.images["bifrost-staging"] = []string{image("bifrost", stagingTag)}
+	c.images["bifrost-prod"] = []string{image("bifrost", stagingTag)}
+	return c, builds
+}
+
+// TestAttentionSameContentIsNotDrift is the false alarm itself, end to end.
+// Staging's tag is an older commit than the newest successful build, and both
+// tags resolve to ONE image manifest — so nothing is stalled, and the run says
+// so instead of sending its reader after a deploy that already happened.
+//
+// The line names BOTH SHAs on purpose: the tag is the link back to GitHub, and
+// the digest that settled the question is an input to the verdict, never a
+// replacement for the commit on screen.
+func TestAttentionSameContentIsNotDrift(t *testing.T) {
+	c, builds := stalledFleet(t, "eb12dfa", "0cbfc9f", 26*time.Minute)
+	digests := newDigests(map[string]string{
+		image("bifrost", "eb12dfa"): sharedManifest,
+		image("bifrost", "0cbfc9f"): sharedManifest,
+	})
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "--attention")
+	want := "bifrost  staging matches the latest build's content (running eb12dfa, built 0cbfc9f)\n" +
+		attentionAllClear + "\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0: two tags over one image manifest are not a stalled sync", code)
+	}
+	if strings.Contains(out, "still on") {
+		t.Errorf("the stalled-sync warning was printed for identical content:\n%s", out)
+	}
+}
+
+// TestAttentionDifferentContentWarnsExactlyAsToday is the other side, and the
+// one that keeps the fix from being "stop reporting stalled syncs": when the
+// two tags are different images, the line is the one this mode has always
+// printed, byte for byte, and the exit code is still 1.
+func TestAttentionDifferentContentWarnsExactlyAsToday(t *testing.T) {
+	c, builds := stalledFleet(t, "eb12dfa", "0cbfc9f", 22*time.Minute)
+	digests := newDigests(map[string]string{
+		image("bifrost", "eb12dfa"): sharedManifest,
+		image("bifrost", "0cbfc9f"): otherManifest,
+	})
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "--attention")
+	want := "bifrost  build 0cbfc9f succeeded 22m ago, staging still on eb12dfa\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1: staging really is behind", code)
+	}
+}
+
+// TestAttentionRegistryFailuresWarnAnyway is the safety property, and it is not
+// negotiable: a registry problem must never be able to SUPPRESS a real stalled
+// sync. Every way the lookup can fail to answer falls back to the tag
+// comparison and warns — which is what this command did before the comparison
+// existed.
+//
+// The stalled sync is the signature of a failure mode whose own symptom is
+// silence (an expired ArgoCD PAT, syncs stopped, builds still green). A
+// fallback that went quiet would make this command lie in exactly the state it
+// was written for.
+func TestAttentionRegistryFailuresWarnAnyway(t *testing.T) {
+	const want = "bifrost  build 0cbfc9f succeeded 22m ago, staging still on eb12dfa\n"
+
+	tests := []struct {
+		name    string
+		digests *fakeDigests
+		why     string
+	}{
+		{
+			name:    "no credentials, so the resolver never dials",
+			digests: &fakeDigests{dialErr: errors.New("no credentials")},
+			why:     "an unauthenticated operator gets the warning, not silence",
+		},
+		{
+			name: "the build's tag is not in the registry",
+			digests: newDigests(map[string]string{
+				image("bifrost", "eb12dfa"): sharedManifest,
+			}),
+			why: "a missing tag is 'could not tell', and could-not-tell warns",
+		},
+		{
+			name: "the staging tag cannot be read",
+			digests: &fakeDigests{
+				byImage: map[string]string{image("bifrost", "0cbfc9f"): sharedManifest},
+				errFor:  map[string]error{image("bifrost", "eb12dfa"): errors.New("500 from the registry")},
+			},
+			why: "half an answer is no answer",
+		},
+		{
+			name:    "the registry never answers",
+			digests: &fakeDigests{hang: true},
+			why:     "the phase is bounded; a hung registry falls back like any other failure",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.digests.hang {
+				restore := digestLookupTimeout
+				digestLookupTimeout = 50 * time.Millisecond
+				t.Cleanup(func() { digestLookupTimeout = restore })
+			}
+			c, builds := stalledFleet(t, "eb12dfa", "0cbfc9f", 22*time.Minute)
+
+			out, _, code := execAttention(t, c, builds, tc.digests, "status", "--attention")
+			if out != want {
+				t.Errorf("stdout = %q, want %q (%s)", out, want, tc.why)
+			}
+			if code != 1 {
+				t.Errorf("exit = %d, want 1 (%s)", code, tc.why)
+			}
+		})
+	}
+}
+
+// TestAttentionResolvesTheStagingTagScheme: the reference handed to the
+// registry follows the tag scheme STAGING is running, not the bare build SHA.
+//
+// footstrike-dashboard builds {sha}-staging and {sha}-prod as separate images
+// (its Vite values are baked in at build time), so the bare {sha} names an
+// image that was never pushed for it — asking for one would 404 into a
+// needless fallback and this service would never get a content comparison at
+// all. It is the same rule promote.NewProdTag follows: the scheme belongs to
+// the artifact, not to the app's name.
+func TestAttentionResolvesTheStagingTagScheme(t *testing.T) {
+	c, builds := attentionFleet(t, map[string]gcb.BuildStatus{
+		"footstrike-dashboard": {Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-time.Hour)},
+	})
+	c.images["footstrike-dashboard-staging"] = []string{image("footstrike-dashboard", "abc1234-staging")}
+	c.images["footstrike-dashboard-prod"] = []string{image("footstrike-dashboard", "abc1234-prod")}
+
+	digests := newDigests(map[string]string{
+		image("footstrike-dashboard", "abc1234-staging"): sharedManifest,
+		image("footstrike-dashboard", "0ab11f2-staging"): sharedManifest,
+		// The bare-SHA tag exists for no service that tags by environment; if
+		// it is ever asked for, this map does not have it and the run warns.
+	})
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "--attention")
+	_, asked := digests.counts()
+	if !slices.Contains(asked, image("footstrike-dashboard", "0ab11f2-staging")) {
+		t.Errorf("resolved %v; want the build's STAGING tag %s", asked, image("footstrike-dashboard", "0ab11f2-staging"))
+	}
+	if slices.Contains(asked, image("footstrike-dashboard", "0ab11f2")) {
+		t.Errorf("resolved the bare build SHA %s, which this service never pushes", image("footstrike-dashboard", "0ab11f2"))
+	}
+	want := "footstrike-dashboard  staging matches the latest build's content (running abc1234-staging, built 0ab11f2)\n" +
+		attentionAllClear + "\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+// TestAttentionTouchesTheRegistryOnlyWhenTagsDiffer: the content comparison is
+// the answer to one question, and a fleet that is not asking it must not pay
+// for it. No candidate, no dial, no credential, no request — `bif status -a` on
+// a healthy fleet costs exactly what it did before this existed.
+func TestAttentionTouchesTheRegistryOnlyWhenTagsDiffer(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*fakeCluster)
+		build gcb.BuildStatus
+		why   string
+	}{
+		{
+			name:  "nothing is noteworthy at all",
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "abc1234", FinishTime: time.Now().Add(-time.Hour)},
+			why:   "staging is already on the build's commit",
+		},
+		{
+			name:  "only staging and prod differ",
+			setup: func(c *fakeCluster) { c.images["bifrost-prod"] = []string{image("bifrost", "def5678")} },
+			build: gcb.BuildStatus{Status: "SUCCESS", SHA: "abc1234", FinishTime: time.Now().Add(-time.Hour)},
+			why:   "the staging-versus-prod verdict is tag-based and asks the registry nothing",
+		},
+		{
+			name:  "the newest build failed",
+			build: gcb.BuildStatus{Status: "FAILURE", SHA: "0ab11f2", FinishTime: time.Now().Add(-time.Hour)},
+			why:   "a failed build was never going to reach staging; there is nothing to compare",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, builds := attentionFleet(t, map[string]gcb.BuildStatus{"bifrost": tc.build})
+			if tc.setup != nil {
+				tc.setup(c)
+			}
+			digests := newDigests(nil)
+
+			execAttention(t, c, builds, digests, "status", "--attention")
+			if dials, asked := digests.counts(); dials != 0 || len(asked) != 0 {
+				t.Errorf("dialled the registry %d times and made %d lookups (%v); want none (%s)", dials, len(asked), asked, tc.why)
+			}
+		})
+	}
+}
+
+// TestAttentionResolvesServicesConcurrentlyOnOneCredential: two round trips per
+// stalled service, several services, one command an operator is waiting on. The
+// services resolve at the same time — the way fetchBuilds already overlaps the
+// build read with the cluster read — and the credential is fetched once for the
+// whole run rather than once per service.
+//
+// The concurrency half is not an output assertion: the fake blocks every lookup
+// until three are in flight at once, so a sequential resolver never gets past
+// the first, dies on the bounded context, and comes back with warnings instead
+// of the three informational lines below.
+func TestAttentionResolvesServicesConcurrentlyOnOneCredential(t *testing.T) {
+	restore := digestLookupTimeout
+	digestLookupTimeout = 2 * time.Second
+	t.Cleanup(func() { digestLookupTimeout = restore })
+
+	apps := []string{"bifrost", "comms", "identity"}
+	byRepo := map[string]gcb.BuildStatus{}
+	byImage := map[string]string{}
+	c := fleet(t)
+	for _, app := range apps {
+		byRepo[app] = gcb.BuildStatus{Status: "SUCCESS", SHA: "0cbfc9f", FinishTime: time.Now().Add(-time.Hour)}
+		c.images[app+"-staging"] = []string{image(app, "eb12dfa")}
+		c.images[app+"-prod"] = []string{image(app, "eb12dfa")}
+		byImage[image(app, "eb12dfa")] = sharedManifest
+		byImage[image(app, "0cbfc9f")] = sharedManifest
+	}
+	builds := &fakeBuilds{byRepo: byRepo}
+	digests := &fakeDigests{byImage: byImage, concurrent: len(apps), reached: make(chan struct{})}
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "--attention")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stdout:\n%s", code, out)
+	}
+	width := 0
+	for _, app := range apps {
+		width = max(width, len(app))
+	}
+	for _, app := range apps {
+		line := fmt.Sprintf("%-*s  staging matches the latest build's content (running eb12dfa, built 0cbfc9f)", width, app)
+		if !strings.Contains(out, line) {
+			t.Errorf("%s did not resolve concurrently; stdout:\n%s", app, out)
+		}
+	}
+	if dials, asked := digests.counts(); dials != 1 || len(asked) != 2*len(apps) {
+		t.Errorf("dialled %d times for %d lookups across %d services; want 1 dial and %d lookups",
+			dials, len(asked), len(apps), 2*len(apps))
+	}
+}
+
+// TestAttentionInformationalLineDoesNotSuppressTheRest: the content comparison
+// answers ONE question, and a service can be noteworthy for other reasons at
+// the same time. The informational line prints alongside them and does not
+// qualify the service by itself — the exit code goes on meaning "something
+// needs a human".
+func TestAttentionInformationalLineDoesNotSuppressTheRest(t *testing.T) {
+	c, builds := stalledFleet(t, "eb12dfa", "0cbfc9f", 22*time.Minute)
+	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+	digests := newDigests(map[string]string{
+		image("bifrost", "eb12dfa"): sharedManifest,
+		image("bifrost", "0cbfc9f"): sharedManifest,
+	})
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "--attention")
+	want := "bifrost  staging matches the latest build's content (running eb12dfa, built 0cbfc9f)\n" +
+		"bifrost  staging and prod differ: staging eb12dfa, prod def5678 (bif promote bifrost)\n"
+	if out != want {
+		t.Errorf("stdout = %q, want %q", out, want)
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1: there is still something to promote", code)
+	}
+}
+
+// TestQuietMakesNoRegistryLookup is -q's offline guarantee, restated for the
+// third party this change added. Its output is a scriptable contract and it
+// makes no network call beyond the cluster: no Cloud Build read (see
+// TestQuietModeMakesNoBuildLookup) and no registry read either.
+func TestQuietMakesNoRegistryLookup(t *testing.T) {
+	c := fleet(t)
+	c.images["bifrost-staging"] = []string{image("bifrost", "eb12dfa")}
+	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{
+		"bifrost": {Status: "SUCCESS", SHA: "0cbfc9f", FinishTime: time.Now().Add(-time.Hour)},
+	}}
+	digests := newDigests(map[string]string{
+		image("bifrost", "eb12dfa"): sharedManifest,
+		image("bifrost", "0cbfc9f"): sharedManifest,
+	})
+
+	out, _, code := execAttention(t, c, builds, digests, "status", "-q")
+	if out != "bifrost\n" {
+		t.Errorf("stdout = %q, want %q: -q's output is a contract and this change is not part of it", out, "bifrost\n")
+	}
+	if code != 1 {
+		t.Errorf("exit = %d, want 1", code)
+	}
+	if dials, asked := digests.counts(); dials != 0 || len(asked) != 0 {
+		t.Errorf("-q dialled the registry %d times and made %d lookups (%v); want none", dials, len(asked), asked)
 	}
 }
