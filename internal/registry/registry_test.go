@@ -82,7 +82,7 @@ func TestLoad(t *testing.T) {
 		if !ok {
 			t.Fatal("forecasting missing from registry")
 		}
-		wantURLs := URLs{Staging: "https://forecasting-staging.tailc06f30.ts.net", Prod: "https://forecasting.ethanswan.com"}
+		wantURLs := URLs{Staging: "https://staging.haruspex.fyi", Prod: "https://haruspex.fyi"}
 		if svc.URLs != wantURLs {
 			t.Errorf("URLs = %+v, want %+v", svc.URLs, wantURLs)
 		}
