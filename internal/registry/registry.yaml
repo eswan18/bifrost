@@ -22,8 +22,8 @@ comms: {}
 
 forecasting:
   urls:
-    staging: https://forecasting-staging.tailc06f30.ts.net
-    prod: https://forecasting.ethanswan.com
+    staging: https://staging.haruspex.fyi
+    prod: https://haruspex.fyi
   preview:
     neon:
       project: blue-term-48495338

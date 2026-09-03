@@ -117,8 +117,8 @@ func goldenFleetRegistry() registry.Registry {
 		},
 		"forecasting": {
 			URLs: registry.URLs{
-				Staging: "https://forecasting-staging.tailc06f30.ts.net",
-				Prod:    "https://forecasting.ethanswan.com",
+				Staging: "https://staging.haruspex.fyi",
+				Prod:    "https://haruspex.fyi",
 			},
 		},
 		"identity": {
@@ -182,7 +182,7 @@ func wantGoldenFleetApps() []appView {
 		healthy("footstrike-dashboard", "footstrike-dashboard",
 			"https://staging.footstrike.run", "https://footstrike.run"),
 		healthy("forecasting", "forecasting",
-			"https://forecasting-staging.tailc06f30.ts.net", "https://forecasting.ethanswan.com"),
+			"https://staging.haruspex.fyi", "https://haruspex.fyi"),
 		healthy("identity", "identity",
 			"https://identity-staging.tailc06f30.ts.net", "https://identity.ethanswan.com"),
 	}
