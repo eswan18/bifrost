@@ -21,6 +21,11 @@ bifrost:
 comms: {}
 
 forecasting:
+  # The service keeps the name `forecasting` everywhere in the cluster, but its
+  # GitHub repo was renamed to haruspex -- and Cloud Build attributes builds by
+  # repo name, so without this override the build column silently reports the
+  # last build made under the old name instead of the newest one.
+  repo: haruspex
   urls:
     staging: https://staging.haruspex.fyi
     prod: https://haruspex.fyi

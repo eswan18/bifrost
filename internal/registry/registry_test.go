@@ -86,6 +86,12 @@ func TestLoad(t *testing.T) {
 		if svc.URLs != wantURLs {
 			t.Errorf("URLs = %+v, want %+v", svc.URLs, wantURLs)
 		}
+		// The GitHub repo was renamed to haruspex while the service kept its
+		// name. Cloud Build attributes builds by repo, so dropping this
+		// override does not fail loudly -- the build column just goes stale.
+		if svc.Repo != "haruspex" {
+			t.Errorf("Repo = %q, want haruspex", svc.Repo)
+		}
 		if svc.Preview == nil {
 			t.Fatal("Preview = nil, want non-nil")
 		}
