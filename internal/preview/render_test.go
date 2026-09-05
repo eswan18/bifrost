@@ -1076,7 +1076,7 @@ patchesStrategicMerge:
 	}
 }
 
-// TestRenderKeepsAnEmptyEnvValue is the render-layer half of forecasting's
+// TestRenderKeepsAnEmptyEnvValue is the render-layer half of haruspex's
 // SENTRY_DSN: "" (internal/preview's TestEnvConfigEmptyOverrideBeatsThe
 // StagingBaseline is the env-computation half): an empty value must survive
 // the whole generated overlay -- the ConfigMap this package writes, the YAML
@@ -1084,7 +1084,7 @@ patchesStrategicMerge:
 // and come out as a key that is PRESENT with an empty value.
 //
 // Present-and-empty is the distinction that matters and the one a naive
-// implementation loses. forecasting's Sentry configs read
+// implementation loses. haruspex's Sentry configs read
 // `process.env.SENTRY_DSN || undefined`, so an empty string disables the SDK
 // -- but a DROPPED key would fall back to whatever the container's other env
 // sources supply, which for a preview is staging's ConfigMap, i.e. staging's
@@ -1095,7 +1095,7 @@ patchesStrategicMerge:
 func TestRenderKeepsAnEmptyEnvValue(t *testing.T) {
 	envConfig := map[string]string{
 		"SENTRY_DSN":      "",
-		"PUBSUB_TOPIC":    "forecasting-staging-notifications",
+		"PUBSUB_TOPIC":    "haruspex-staging-notifications",
 		"APP_BASE_URL":    "https://footstrike-api-hae-cadence.preview.footstrike.run",
 		"EMPTY_LOOKALIKE": `""`,
 	}

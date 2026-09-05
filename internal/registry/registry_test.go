@@ -13,16 +13,15 @@ func TestLoad(t *testing.T) {
 
 	wantNames := []string{
 		"asset-manager", "bifrost", "comms", "footstrike-api",
-		"footstrike-dashboard", "forecasting", "identity",
+		"footstrike-dashboard", "haruspex", "identity",
 	}
 	if got := reg.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Errorf("Names() = %v, want %v", got, wantNames)
 	}
 
-	// Sorted, and note the order: "footstrike-" sorts BEFORE "forecasting"
-	// ('o' < 'r' at the third character), which is not the order the fleet's
-	// Names() list above reads in at a glance.
-	wantPreviewNames := []string{"footstrike-api", "footstrike-dashboard", "forecasting", "identity"}
+	// Sorted. The previewable subset is not the whole fleet, so this list is
+	// deliberately spelled out rather than derived from wantNames.
+	wantPreviewNames := []string{"footstrike-api", "footstrike-dashboard", "haruspex", "identity"}
 	if got := reg.PreviewNames(); !reflect.DeepEqual(got, wantPreviewNames) {
 		t.Errorf("PreviewNames() = %v, want %v", got, wantPreviewNames)
 	}
@@ -77,10 +76,10 @@ func TestLoad(t *testing.T) {
 		}
 	})
 
-	t.Run("forecasting: urls and preview (neon + migrate + env)", func(t *testing.T) {
-		svc, ok := reg["forecasting"]
+	t.Run("haruspex: urls and preview (neon + migrate + env)", func(t *testing.T) {
+		svc, ok := reg["haruspex"]
 		if !ok {
-			t.Fatal("forecasting missing from registry")
+			t.Fatal("haruspex missing from registry")
 		}
 		wantURLs := URLs{Staging: "https://staging.haruspex.fyi", Prod: "https://haruspex.fyi"}
 		if svc.URLs != wantURLs {
@@ -114,7 +113,7 @@ func TestLoad(t *testing.T) {
 			t.Errorf("Preview.Neon = %+v, want %+v", *svc.Preview.Neon, wantNeon)
 		}
 		if svc.Preview.Neon.Parent == "development" {
-			t.Error("Preview.Neon.Parent = development; forecasting's staging branch is `dev` -- this project does not follow the other two's naming")
+			t.Error("Preview.Neon.Parent = development; haruspex's staging branch is `dev` -- this project does not follow the other two's naming")
 		}
 		wantEnv := map[string]string{
 			"APP_BASE_URL":   "{{ url self }}",
@@ -129,7 +128,7 @@ func TestLoad(t *testing.T) {
 		// gets an assertion of its own rather than living inside the map
 		// compare: an entry that dropped it (or "helpfully" filled it in)
 		// would send every preview's errors into staging's Sentry project.
-		// forecasting's Sentry configs read `process.env.SENTRY_DSN ||
+		// haruspex's Sentry configs read `process.env.SENTRY_DSN ||
 		// undefined`, so "" disables the SDK -- see
 		// TestEnvConfigEmptyOverrideBeatsTheStagingBaseline in
 		// internal/preview for the proof that "" really does overwrite a
@@ -142,7 +141,7 @@ func TestLoad(t *testing.T) {
 		}
 		// ...and it must stay OUT of required:, which rejects an empty
 		// rendered value by design. Listing it there would make every
-		// forecasting preview fail its pre-flight.
+		// haruspex preview fail its pre-flight.
 		if len(svc.Preview.Required) != 0 {
 			t.Errorf("Preview.Required = %v, want empty: SENTRY_DSN renders empty on purpose and required rejects that", svc.Preview.Required)
 		}
@@ -153,9 +152,9 @@ func TestLoad(t *testing.T) {
 		if _, ok := svc.Preview.Env["PUBSUB_TOPIC"]; ok {
 			t.Error("Preview.Env sets PUBSUB_TOPIC; previews deliberately inherit staging's topic (comms#6) -- if that changed, say so here")
 		}
-		// A bundled JS entry point, because forecasting's runner image has
+		// A bundled JS entry point, because haruspex's runner image has
 		// no kysely-ctl and no tsx to invoke a migration CLI with
-		// (forecasting#168).
+		// (haruspex#168).
 		wantMigrate := []string{"node", "/app/migrate/index.js"}
 		if !reflect.DeepEqual(svc.Preview.Migrate, wantMigrate) {
 			t.Errorf("Preview.Migrate = %v, want %v", svc.Preview.Migrate, wantMigrate)

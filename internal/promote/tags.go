@@ -60,7 +60,7 @@ func ExtractSHA(tag string) string {
 // migrate to environment-agnostic builds (plain {sha} + latest, no suffix)
 // while prod still runs a legacy {sha}-prod image; keying off the stale prod
 // tag in that window synthesizes a {sha}-prod reference that was never built,
-// causing ImagePullBackOff (forecasting prod outage, June 2026). prodTag is
+// causing ImagePullBackOff (haruspex prod outage, June 2026). prodTag is
 // intentionally unused.
 func NewProdTag(sha, stagingTag, prodTag string) string {
 	if strings.Contains(stagingTag, "-staging") {

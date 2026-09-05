@@ -464,7 +464,7 @@ ran `up` for is the symptom.
    from**, so `parent:` decides both what data a preview URL hands out and
    what schema it starts on. Today it names each project's **staging** branch
    — `development` for `footstrike-api` and `identity`, `dev` for
-   `forecasting`, whose project also calls its default `main` rather than
+   `haruspex`, whose project also calls its default `main` rather than
    `production`. It used to be
    omitted, which means Neon's default branch — and that default is the
    **production** branch in every one of these projects. That was wrong twice over: previews
@@ -806,7 +806,7 @@ that has already been deleted.
 It's cheap: the work is O(distinct Neon projects), not O(previews).
 `ListBranches` returns a whole project in one call, and `registry.yaml` names
 three distinct projects today (`footstrike-api`'s, `identity`'s and
-`forecasting`'s), so a full orphan check is **three extra HTTP calls per
+`haruspex`'s), so a full orphan check is **three extra HTTP calls per
 sweep** however many previews exist.
 Projects are de-duplicated by ID, so two services sharing one Neon project
 still cost one call.
@@ -852,7 +852,7 @@ the detection site in `reaper.go`.
 
 **It will collect a branch you made by hand.** The sweep has no way to tell a
 branch bifrost created from one a human created: any branch named `preview-*`
-in `footstrike-api`'s, `identity`'s or `forecasting`'s Neon project, older than
+in `footstrike-api`'s, `identity`'s or `haruspex`'s Neon project, older than
 an hour, with no
 matching `preview-<tag>` namespace in the cluster, is deleted on the next tick.
 If you need a scratch branch in one of those projects to survive, **do not name
@@ -899,7 +899,7 @@ wrong answer. Two things to know before adding one:
   project's Neon endpoints to learn which branch staging *actually* talks to.
   Branch names are not a convention across projects and can outlive what they
   describe: `footstrike-api` and `identity` both call it `development`, while
-  `forecasting`'s pair is `dev`/`main` — three onboarded apps, two naming
+  `haruspex`'s pair is `dev`/`main` — three onboarded apps, two naming
   schemes, which is the whole argument for checking the endpoint. A name that
   exists but is the wrong one fails in the only way that matters — the preview
   quietly branches the wrong database — and nothing downstream will catch it.
@@ -928,9 +928,9 @@ image actually have", never "what does the sibling entry say".
   identity's image never adds its `WORKDIR /app` to `PATH`, so a bare
   `auth-service` would fail the initContainer immediately with "executable
   file not found in $PATH" before the `migrate` subcommand ever ran.
-- **forecasting**: `["node", "/app/migrate/index.js"]` — a bundled JS entry
-  point rather than a CLI at all, because forecasting's runner image carries
-  neither `kysely-ctl` nor `tsx`. forecasting#168 added the esbuild bundle
+- **haruspex**: `["node", "/app/migrate/index.js"]` — a bundled JS entry
+  point rather than a CLI at all, because haruspex's runner image carries
+  neither `kysely-ctl` nor `tsx`. haruspex#168 added the esbuild bundle
   specifically so there is something `node` can run with no dev dependencies
   installed.
 
@@ -952,7 +952,7 @@ onboarded apps now connect as a role that cannot:
 |---|---|---|---|
 | footstrike-api | `app_user` | no | `neondb_owner` |
 | identity | `app` | no | `neondb_owner` |
-| forecasting | `app_user` | no | `neondb_owner` |
+| haruspex | `app_user` | no | `neondb_owner` |
 
 So identity's previews could not have run a migration that creates or alters a
 table, and nobody had noticed: a preview branch is cut from staging and starts
@@ -1015,10 +1015,10 @@ literal (no `{{`/`}}`, passed through unchanged) or exactly one
   recognized today.
 
 **The empty string is a literal, not "no value".** `SENTRY_DSN: ""` — which
-forecasting sets — renders to `""` and **overwrites** whatever the app's own
+haruspex sets — renders to `""` and **overwrites** whatever the app's own
 staging ConfigMap had for that key, then survives into the preview ConfigMap as
 a key that is *present and empty*. That distinction is the whole mechanism:
-forecasting's Sentry configs read `process.env.SENTRY_DSN || undefined`, so an
+haruspex's Sentry configs read `process.env.SENTRY_DSN || undefined`, so an
 empty value disables the SDK, while a *missing* key would fall through to
 staging's real DSN and every preview would report its errors into the Sentry
 project someone actually watches. Note the interaction with `required:`, which
@@ -1133,7 +1133,7 @@ That's it — no Go code, no new bifrost endpoint, no orchestrator change.
   bifrost's logs: the POST already returned `202`, so what you see is your tag
   sitting there against somebody else's branch. Rename your branch or tear
   their preview down; see "Two branches can derive the same tag" above.
-- **A forecasting preview sends real notifications.** Its registry entry
+- **A haruspex preview sends real notifications.** Its registry entry
   deliberately does *not* override `PUBSUB_TOPIC`, so a preview inherits
   staging's topic and anything downstream of it fires for real. This is a
   decision, not an oversight — it was accepted rather than hold up onboarding,

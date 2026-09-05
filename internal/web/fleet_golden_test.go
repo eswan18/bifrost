@@ -45,7 +45,7 @@ import (
 func goldenFleetServices() []string {
 	return []string{
 		"asset-manager", "bifrost", "comms", "footstrike-api",
-		"footstrike-dashboard", "forecasting", "identity",
+		"footstrike-dashboard", "haruspex", "identity",
 	}
 }
 
@@ -115,7 +115,7 @@ func goldenFleetRegistry() registry.Registry {
 				Prod:    "https://footstrike.run",
 			},
 		},
-		"forecasting": {
+		"haruspex": {
 			URLs: registry.URLs{
 				Staging: "https://staging.haruspex.fyi",
 				Prod:    "https://haruspex.fyi",
@@ -181,7 +181,7 @@ func wantGoldenFleetApps() []appView {
 			"https://api.staging.footstrike.run", "https://api.footstrike.run"),
 		healthy("footstrike-dashboard", "footstrike-dashboard",
 			"https://staging.footstrike.run", "https://footstrike.run"),
-		healthy("forecasting", "forecasting",
+		healthy("haruspex", "haruspex",
 			"https://staging.haruspex.fyi", "https://haruspex.fyi"),
 		healthy("identity", "identity",
 			"https://identity-staging.tailc06f30.ts.net", "https://identity.ethanswan.com"),

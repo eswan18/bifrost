@@ -20,7 +20,7 @@ bifrost:
 
 comms: {}
 
-forecasting:
+haruspex:
   urls:
     staging: https://staging.haruspex.fyi
     prod: https://haruspex.fyi
@@ -35,20 +35,20 @@ forecasting:
       # table -- see identity's entry above for the full story, including why
       # the app deliberately keeps the lesser role.
       migrateRole: neondb_owner
-      # forecasting's STAGING branch. Note the names: this project's pair is
+      # haruspex's STAGING branch. Note the names: this project's pair is
       # `dev`/`main`, not the `development`/`production` both other projects
       # use -- `main` is this project's Neon default and is what prod runs on,
       # so omitting parent: here would clone PROD, exactly as it would there.
       # That the three projects disagree is the reason the rule is "check the
       # endpoint, never the name": confirmed by matching the endpoint ID
-      # inside the `forecasting_staging_database_url` secret against this
+      # inside the `haruspex_staging_database_url` secret against this
       # project's Neon endpoints. Do the same for the next one.
       parent: dev
     # A bundled JS entry point, not a CLI -- the same "what does THIS image
     # actually have" question footstrike-api's bare `alembic` and identity's
-    # absolute `/app/auth-service` each answer differently. forecasting's
+    # absolute `/app/auth-service` each answer differently. haruspex's
     # runner image carries neither kysely-ctl nor tsx, so there is no
-    # migration CLI to invoke; forecasting#168 added an esbuild bundle at
+    # migration CLI to invoke; haruspex#168 added an esbuild bundle at
     # /app/migrate/index.js precisely so the initContainer has something
     # `node` can run with no dev dependencies present. Check the image before
     # "simplifying" this into a package script.
@@ -58,10 +58,10 @@ forecasting:
       IDP_BASE_URL: "{{ internalUrl identity }}"
       IDP_PUBLIC_URL: "{{ url identity }}"
       # Deliberately empty, and deliberately NOT in required: (which rejects
-      # an empty value by design). All three of forecasting's Sentry configs
+      # an empty value by design). All three of haruspex's Sentry configs
       # read `dsn: process.env.SENTRY_DSN || undefined`, so an empty string
       # disables the SDK. Without this override the key would fall through to
-      # forecasting's own staging ConfigMap and every preview would report its
+      # haruspex's own staging ConfigMap and every preview would report its
       # errors into STAGING's Sentry project, mixing throwaway branch noise
       # into the signal someone actually watches.
       SENTRY_DSN: ""
@@ -73,7 +73,7 @@ forecasting:
     # previews their own topic. If you are here because a preview sent
     # somebody a message, that issue is the fix.
     #
-    # ENV -- needs no override. forecasting's staging value is already what a
+    # ENV -- needs no override. haruspex's staging value is already what a
     # preview wants, and the cascade keeps an app's own staging ConfigMap
     # value untouched when this registry says nothing about the key.
 
@@ -205,7 +205,7 @@ identity:
       # `identity_staging_database_url` secret against this project's
       # endpoints. That it is spelled the same as footstrike-api's is a
       # coincidence of two projects being set up alike, not a convention:
-      # forecasting's equivalent pair is `dev`/`main`. Check the endpoint,
+      # haruspex's equivalent pair is `dev`/`main`. Check the endpoint,
       # never the name, when adding the next one.
       parent: development
     # Absolute "/app/auth-service", NOT bare "auth-service" like

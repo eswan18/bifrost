@@ -693,7 +693,7 @@ func TestServiceNamesComeFromTheRegistry(t *testing.T) {
 	}
 	ibPySERVICES := []string{
 		"asset-manager", "bifrost", "comms", "footstrike-api",
-		"footstrike-dashboard", "forecasting", "identity",
+		"footstrike-dashboard", "haruspex", "identity",
 	}
 	if got := reg.Names(); !slices.Equal(got, ibPySERVICES) {
 		t.Errorf("registry.Names() = %v, ib.py SERVICES = %v", got, ibPySERVICES)
@@ -738,7 +738,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating the service name")
 	}
-	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, forecasting, identity\n"
+	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}
@@ -1677,7 +1677,7 @@ func TestStatusAcceptsSeveralServices(t *testing.T) {
 	// Services that were not named must not be read at all — narrowing has to
 	// still narrow.
 	for _, ns := range c.calls {
-		if strings.HasPrefix(ns, "forecasting-") || strings.HasPrefix(ns, "asset-manager-") {
+		if strings.HasPrefix(ns, "haruspex-") || strings.HasPrefix(ns, "asset-manager-") {
 			t.Errorf("read %s, which was not named", ns)
 		}
 	}

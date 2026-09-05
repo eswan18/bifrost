@@ -59,6 +59,53 @@ func (r promoteRow) newImage(t *testing.T) string {
 	return ki[i+1:]
 }
 
+// renamedApps maps an app name as ib.py knew it to what the fleet calls it now.
+//
+// The oracle fixtures are CAPTURED output, not hand-written expectations: the
+// package doc records the ib.py path and SHA they came from precisely so a
+// later reader can trust them as a recording. Editing the captured stdout to
+// follow a rename would destroy that, and ib.py is deleted, so nothing could
+// ever re-capture it honestly.
+//
+// So the fixture stays byte-for-byte as recorded and the translation happens
+// here instead, at the boundary, where it is visible. What the rows pin is the
+// promote decision and the shape of the output; the app is an input parameter
+// to that, and renaming the service did not change any of it.
+var renamedApps = map[string]string{"forecasting": "haruspex"}
+
+// current returns the row with its app -- and every occurrence of the old name
+// in the captured stdout -- rewritten to the fleet's current naming.
+func (r promoteRow) current() promoteRow {
+	now, ok := renamedApps[r.App]
+	if !ok {
+		return r
+	}
+	r.Stdout = strings.ReplaceAll(r.Stdout, r.App, now)
+	for i, a := range r.KubectlArgv {
+		r.KubectlArgv[i] = strings.ReplaceAll(a, r.App, now)
+	}
+	if r.Patch != nil {
+		s := strings.ReplaceAll(*r.Patch, r.App, now)
+		r.Patch = &s
+	}
+	if r.KustomizeImage != nil {
+		s := strings.ReplaceAll(*r.KustomizeImage, r.App, now)
+		r.KustomizeImage = &s
+	}
+	r.StagingImages = replaceAllIn(r.StagingImages, r.App, now)
+	r.ProdImages = replaceAllIn(r.ProdImages, r.App, now)
+	r.App = now
+	return r
+}
+
+func replaceAllIn(xs []string, old, now string) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = strings.ReplaceAll(x, old, now)
+	}
+	return out
+}
+
 // clusterFor builds a fake holding exactly the row's cluster state.
 func clusterFor(r promoteRow) *fakeCluster {
 	return &fakeCluster{images: map[string][]string{
@@ -80,6 +127,9 @@ func TestPromoteMatchesOracle(t *testing.T) {
 	rows, err := oracle.Load[promoteRow]("promote_decision.json")
 	if err != nil {
 		t.Fatalf("load fixture: %v", err)
+	}
+	for i := range rows {
+		rows[i] = rows[i].current()
 	}
 
 	// The fixture has to cover both sides of every branch this test claims to
@@ -139,6 +189,9 @@ func TestPromoteTargetsTheApplicationTheOracleNamed(t *testing.T) {
 	rows, err := oracle.Load[promoteRow]("promote_decision.json")
 	if err != nil {
 		t.Fatalf("load fixture: %v", err)
+	}
+	for i := range rows {
+		rows[i] = rows[i].current()
 	}
 	checked := 0
 	for _, r := range rows {
@@ -470,7 +523,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating the service name")
 	}
-	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, forecasting, identity\n"
+	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}
@@ -765,7 +818,7 @@ func TestPromoteValidatesEveryNameBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating every service name")
 	}
-	want := "Unknown service: identtiy\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, forecasting, identity\n"
+	want := "Unknown service: identtiy\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}
