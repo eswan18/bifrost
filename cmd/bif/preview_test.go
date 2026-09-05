@@ -140,9 +140,9 @@ const listFixture = `{"previews":[
    "expiresAt":"2026-07-31T12:00:00Z","autoUpdate":true},
   {"tag":"feat-brand-new","branch":"","apps":[],"phase":"busy","health":"unknown",
    "createdAt":"0001-01-01T00:00:00Z","urls":{},"busy":true},
-  {"tag":"feat-long-running","branch":"feat/long-running","apps":["forecasting"],
+  {"tag":"feat-long-running","branch":"feat/long-running","apps":["haruspex"],
    "phase":"creating","health":"degraded","createdAt":"2026-07-31T03:50:00Z",
-   "urls":{"forecasting":"https://forecasting-feat-long-running.preview.footstrike.run"},
+   "urls":{"haruspex":"https://haruspex-feat-long-running.preview.footstrike.run"},
    "busy":true},
   {"tag":"feat-stale","branch":"feat/stale","apps":["comms"],"phase":"ready",
    "health":"unhealthy","createdAt":"2026-07-20T09:00:00Z","urls":{},
@@ -160,7 +160,7 @@ var wantTable = strings.Join([]string{
 	// "busy*", not a bare "busy": bifrost sends phase "busy" AND busy true for
 	// a synthesized record, so the mark applies. See TestPreviewPhaseCell.
 	"feat-brand-new           -                        busy*      unknown      -" + emptyApps,
-	"feat-long-running        feat/long-running        creating*  degraded     -          -     forecasting",
+	"feat-long-running        feat/long-running        creating*  degraded     -          -     haruspex",
 	"feat-stale               feat/stale               ready      unhealthy    expired    -     comms",
 	"",
 }, "\n")

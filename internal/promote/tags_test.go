@@ -66,7 +66,7 @@ func TestNewProdTag(t *testing.T) {
 		// Migration window: staging already on environment-agnostic (plain)
 		// builds while prod still runs a legacy {sha}-prod image. The tag scheme
 		// follows the staging artifact, so a plain {sha}-prod must NOT be
-		// synthesized (it was never built). Regression: forecasting prod
+		// synthesized (it was never built). Regression: haruspex prod
 		// ImagePullBackOff, June 2026.
 		{"plain staging, legacy prod", "e521080", "e521080", "2679590-prod", "e521080"},
 	}
