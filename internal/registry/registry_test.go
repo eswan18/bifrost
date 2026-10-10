@@ -225,7 +225,7 @@ func TestLoad(t *testing.T) {
 		if !ok {
 			t.Fatal("footstrike-dashboard missing from registry")
 		}
-		wantURLs := URLs{Staging: "https://staging.footstrike.run", Prod: "https://footstrike.run"}
+		wantURLs := URLs{Staging: "https://staging.footstrike.run", Prod: "https://app.footstrike.run"}
 		if svc.URLs != wantURLs {
 			t.Errorf("URLs = %+v, want %+v", svc.URLs, wantURLs)
 		}

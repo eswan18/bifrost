@@ -112,7 +112,7 @@ func goldenFleetRegistry() registry.Registry {
 		"footstrike-dashboard": {
 			URLs: registry.URLs{
 				Staging: "https://staging.footstrike.run",
-				Prod:    "https://footstrike.run",
+				Prod:    "https://app.footstrike.run",
 			},
 		},
 		"haruspex": {
@@ -180,7 +180,7 @@ func wantGoldenFleetApps() []appView {
 		healthy("footstrike-api", "footstrike-api",
 			"https://api.staging.footstrike.run", "https://api.footstrike.run"),
 		healthy("footstrike-dashboard", "footstrike-dashboard",
-			"https://staging.footstrike.run", "https://footstrike.run"),
+			"https://staging.footstrike.run", "https://app.footstrike.run"),
 		healthy("haruspex", "haruspex",
 			"https://staging.haruspex.fyi", "https://haruspex.fyi"),
 		healthy("identity", "identity",
