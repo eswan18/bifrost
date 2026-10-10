@@ -158,7 +158,7 @@ footstrike-api:
 footstrike-dashboard:
   urls:
     staging: https://staging.footstrike.run
-    prod: https://footstrike.run
+    prod: https://app.footstrike.run
   preview:
     env:
       APP_API_URL: "{{ url footstrike-api }}"
