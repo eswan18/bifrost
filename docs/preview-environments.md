@@ -1101,15 +1101,14 @@ changes:
    `Orchestrator.TriggerIDs` looks up (`buildMembers` does
    `o.TriggerIDs[svc+"-preview-build"]` with `svc` a registry key, never a
    repo) — while the GitHub *repo* it builds from is sourced independently,
-   from the pair's second element. For every previewable service today the
-   two happen to be the same string, but that's a coincidence, not a rule:
-   `asset-manager` is already a fleet member whose registry entry sets
-   `repo: sensibility` (`internal/registry/registry.yaml`), so onboarding
-   *it* to previews means adding `("asset-manager", "sensibility")` to the
-   loop — the key first, the repo second, never the repo in both slots. Get
-   this backwards and the trigger still builds fine (Cloud Build doesn't
-   care what it's named), but bifrost's lookup by registry key finds no
-   `asset-manager-preview-build` trigger, and the build fails — after the
+   from the pair's second element. For every service today the two are the
+   same string, but that's a coincidence, not a rule: until Oct 2026
+   asset-manager's repo was `asset_manager`, and a service like that is
+   onboarded by adding `("<key>", "<repo>")` to the loop — the key first,
+   the repo second, never the repo in both slots. Get this backwards and the
+   trigger still builds fine (Cloud Build doesn't care what it's named), but
+   bifrost's lookup by registry key finds no `<key>-preview-build` trigger,
+   and the build fails — after the
    preview's namespace already exists, leaving a zombie `failed` preview
    behind it. The GCP IAM prod bifrost needs to run any preview-build
    trigger (`cloudbuild.builds.editor` + `actAs` on the Cloud Build SA) is

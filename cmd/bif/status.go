@@ -79,9 +79,9 @@ type buildSet struct {
 
 // cellFor picks one service's build out of the set. The key is the REPO name,
 // never the service name: LatestBuilds keys on Cloud Build's REPO_NAME
-// substitution, and asset-manager's repo is sensibility — so a lookup by
-// service name silently finds no build for it while looking perfectly correct
-// for the other six services. registry.RepoFor is the mapping;
+// substitution, so for a service whose repo differs from its registry key (as
+// asset-manager's did until it became sensibility) a lookup by service name
+// silently finds no build while looking perfectly correct for the others. registry.RepoFor is the mapping;
 // internal/web/fleet.go resolves the same key the same way for the Apps tab.
 func (s buildSet) cellFor(repo string) buildCell {
 	if !s.known {

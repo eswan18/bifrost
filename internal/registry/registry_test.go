@@ -12,8 +12,8 @@ func TestLoad(t *testing.T) {
 	}
 
 	wantNames := []string{
-		"asset-manager", "bifrost", "comms", "footstrike-api",
-		"footstrike-dashboard", "haruspex", "identity",
+		"bifrost", "comms", "footstrike-api",
+		"footstrike-dashboard", "haruspex", "identity", "sensibility",
 	}
 	if got := reg.Names(); !reflect.DeepEqual(got, wantNames) {
 		t.Errorf("Names() = %v, want %v", got, wantNames)
@@ -26,13 +26,13 @@ func TestLoad(t *testing.T) {
 		t.Errorf("PreviewNames() = %v, want %v", got, wantPreviewNames)
 	}
 
-	t.Run("asset-manager: repo override, urls, no preview", func(t *testing.T) {
-		svc, ok := reg["asset-manager"]
+	t.Run("sensibility: urls, no preview, repo is its own name", func(t *testing.T) {
+		svc, ok := reg["sensibility"]
 		if !ok {
-			t.Fatal("asset-manager missing from registry")
+			t.Fatal("sensibility missing from registry")
 		}
-		if svc.Repo != "sensibility" {
-			t.Errorf("Repo = %q, want sensibility", svc.Repo)
+		if got := reg.RepoFor("sensibility"); got != "sensibility" {
+			t.Errorf("RepoFor = %q, want sensibility", got)
 		}
 		wantURLs := URLs{Staging: "https://staging.sensibility.money", Prod: "https://sensibility.money"}
 		if svc.URLs != wantURLs {
