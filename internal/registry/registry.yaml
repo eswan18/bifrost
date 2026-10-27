@@ -8,10 +8,10 @@
 # comms has no urls: it's a background worker with no ingress, so there's no
 # public staging/prod URL to link to.
 asset-manager:
-  repo: asset_manager
+  repo: sensibility
   urls:
-    staging: https://assets-staging.tailc06f30.ts.net
-    prod: https://assets.ethanswan.com
+    staging: https://staging.sensibility.money
+    prod: https://sensibility.money
 
 bifrost:
   urls:

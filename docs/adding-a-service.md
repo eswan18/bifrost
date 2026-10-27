@@ -36,7 +36,7 @@ Fields, per `internal/registry/registry.go`'s `Service`/`URLs`/`Preview`
 types:
 
 - **`repo`** (optional) — the GitHub repo name, when it differs from the
-  service name (e.g. `asset-manager`'s repo is `asset_manager`). Omit it and
+  service name (e.g. `asset-manager`'s repo is `sensibility`). Omit it and
   the service name is used unchanged. This feeds `Registry.RepoFor`, which
   bifrost uses to build the "view commit" link next to a deployed SHA — get
   it wrong and that link 404s. For a non-previewable service that's the only

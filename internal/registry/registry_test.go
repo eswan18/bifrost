@@ -31,10 +31,10 @@ func TestLoad(t *testing.T) {
 		if !ok {
 			t.Fatal("asset-manager missing from registry")
 		}
-		if svc.Repo != "asset_manager" {
-			t.Errorf("Repo = %q, want asset_manager", svc.Repo)
+		if svc.Repo != "sensibility" {
+			t.Errorf("Repo = %q, want sensibility", svc.Repo)
 		}
-		wantURLs := URLs{Staging: "https://assets-staging.tailc06f30.ts.net", Prod: "https://assets.ethanswan.com"}
+		wantURLs := URLs{Staging: "https://staging.sensibility.money", Prod: "https://sensibility.money"}
 		if svc.URLs != wantURLs {
 			t.Errorf("URLs = %+v, want %+v", svc.URLs, wantURLs)
 		}
@@ -357,13 +357,13 @@ func TestPreviewNames_Empty(t *testing.T) {
 
 func TestRepoFor(t *testing.T) {
 	reg := Registry{
-		"asset-manager": {Repo: "asset_manager"},
+		"asset-manager": {Repo: "sensibility"},
 		"bifrost":       {},
 	}
 
 	t.Run("override configured", func(t *testing.T) {
-		if got := reg.RepoFor("asset-manager"); got != "asset_manager" {
-			t.Errorf("RepoFor(asset-manager) = %q, want asset_manager", got)
+		if got := reg.RepoFor("asset-manager"); got != "sensibility" {
+			t.Errorf("RepoFor(asset-manager) = %q, want sensibility", got)
 		}
 	})
 	t.Run("no override: identity mapping", func(t *testing.T) {
