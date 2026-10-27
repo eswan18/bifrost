@@ -177,7 +177,7 @@ func (r Registry) PreviewNames() []string {
 }
 
 // RepoFor returns svc's repo name: its registry override when one is
-// configured (e.g. asset-manager -> sensibility), or svc itself
+// configured (asset-manager -> asset_manager was the example until Oct 2026), or svc itself
 // otherwise — "repos are named after the service, except when they're not."
 // An svc absent from the registry entirely still returns svc unchanged,
 // matching that same fallback.

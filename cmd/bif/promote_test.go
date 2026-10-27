@@ -523,7 +523,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating the service name")
 	}
-	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
+	want := "Unknown service: bifrsot\nKnown services: bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity, sensibility\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}
@@ -818,7 +818,7 @@ func TestPromoteValidatesEveryNameBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating every service name")
 	}
-	want := "Unknown service: identtiy\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
+	want := "Unknown service: identtiy\nKnown services: bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity, sensibility\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}

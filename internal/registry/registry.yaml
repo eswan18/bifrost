@@ -7,8 +7,7 @@
 #
 # comms has no urls: it's a background worker with no ingress, so there's no
 # public staging/prod URL to link to.
-asset-manager:
-  repo: sensibility
+sensibility:
   urls:
     staging: https://staging.sensibility.money
     prod: https://sensibility.money

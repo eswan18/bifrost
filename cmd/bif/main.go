@@ -188,12 +188,17 @@ func dialDigests(ctx context.Context) (digestResolver, error) {
 	return r, nil
 }
 
+// loadEmbeddedRegistry is registry.Load, as a variable so a test can run the
+// commands against a registry the embedded one cannot provide (see
+// withRepoOverride in status_test.go).
+var loadEmbeddedRegistry = registry.Load
+
 // loadRegistry returns the embedded fleet registry, reporting a load failure
 // on stderr. go:embed means this needs no network, which is what lets it
 // retire ib.py's hand-maintained SERVICES without costing the
 // works-when-bifrost-is-down property.
 func loadRegistry(stderr io.Writer) (registry.Registry, bool) {
-	reg, err := registry.Load()
+	reg, err := loadEmbeddedRegistry()
 	if err != nil {
 		outf(stderr, "Error: loading the service registry: %v\n", err)
 		return nil, false

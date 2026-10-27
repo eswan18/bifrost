@@ -564,6 +564,30 @@ func fleet(t *testing.T) *fakeCluster {
 	return &fakeCluster{images: images}
 }
 
+// withRepoOverride runs the rest of the test against the embedded registry
+// with svc's GitHub repo renamed (to svc+"-repo"), and returns that repo. The
+// repo-name trap (TestBuildColumnUsesTheRegistryRepoName and
+// TestAttentionUsesTheRegistryRepoName) only bites a service whose repo
+// differs from its registry key, and since asset-manager became sensibility
+// no real one does.
+func withRepoOverride(t *testing.T, svc string) string {
+	t.Helper()
+	reg, err := registry.Load()
+	if err != nil {
+		t.Fatalf("load registry: %v", err)
+	}
+	entry, ok := reg[svc]
+	if !ok {
+		t.Fatalf("%s is not in the registry", svc)
+	}
+	entry.Repo = svc + "-repo"
+	reg[svc] = entry
+	prev := loadEmbeddedRegistry
+	loadEmbeddedRegistry = func() (registry.Registry, error) { return reg, nil }
+	t.Cleanup(func() { loadEmbeddedRegistry = prev })
+	return entry.Repo
+}
+
 // TestExitCodesAllForms is the exit-status contract for every form of
 // `bif status`. The mapping is ib.py's and does not vary with -q: only a
 // definite out-of-sync exits 1.
@@ -684,7 +708,8 @@ func TestQuietFlagAcceptedAnywhere(t *testing.T) {
 
 // TestServiceNamesComeFromTheRegistry pins the registry as the source of the
 // fleet list — the thing that retires ib.py's hand-maintained SERVICES. The
-// literal is ib.py's list as captured; if the registry gains a service, this
+// literal is ib.py's list as captured, with asset-manager since renamed
+// sensibility (Oct 2026); if the registry gains a service, this
 // fails and the port has a decision to make rather than a silent drift.
 func TestServiceNamesComeFromTheRegistry(t *testing.T) {
 	reg, err := registry.Load()
@@ -692,8 +717,8 @@ func TestServiceNamesComeFromTheRegistry(t *testing.T) {
 		t.Fatalf("load registry: %v", err)
 	}
 	ibPySERVICES := []string{
-		"asset-manager", "bifrost", "comms", "footstrike-api",
-		"footstrike-dashboard", "haruspex", "identity",
+		"bifrost", "comms", "footstrike-api",
+		"footstrike-dashboard", "haruspex", "identity", "sensibility",
 	}
 	if got := reg.Names(); !slices.Equal(got, ibPySERVICES) {
 		t.Errorf("registry.Names() = %v, ib.py SERVICES = %v", got, ibPySERVICES)
@@ -738,7 +763,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 	if connected {
 		t.Error("connected to the cluster before validating the service name")
 	}
-	want := "Unknown service: bifrsot\nKnown services: asset-manager, bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity\n"
+	want := "Unknown service: bifrsot\nKnown services: bifrost, comms, footstrike-api, footstrike-dashboard, haruspex, identity, sensibility\n"
 	if stdout.String() != want {
 		t.Errorf("stdout = %q, want %q", stdout.String(), want)
 	}
@@ -903,24 +928,18 @@ func known(b gcb.BuildStatus) buildCell { return buildCell{status: b, known: tru
 
 // TestBuildColumnUsesTheRegistryRepoName is the trap this codebase has now
 // walked into three times: LatestBuilds keys on Cloud Build's REPO_NAME
-// substitution, which is the GitHub repo, NOT the registry key. asset-manager
-// lives in sensibility, so a lookup by service name finds nothing for it —
-// and finds the right thing for the other six services, which is why it
-// survives review.
+// substitution, which is the GitHub repo, NOT the registry key. When a
+// service's repo differs from its key, a lookup by service name finds nothing
+// for it, and finds the right thing for every other service, which is why it
+// survives review. No real service differs since asset-manager became
+// sensibility (Oct 2026), so withRepoOverride gives one a different repo.
 //
 // Both directions are asserted. Keying the fake by the repo name must produce
 // the build; keying it by the service name must produce none, which is what
 // fails if RepoFor is dropped from the lookup.
 func TestBuildColumnUsesTheRegistryRepoName(t *testing.T) {
-	reg, err := registry.Load()
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	const svc = "asset-manager"
-	repo := reg.RepoFor(svc)
-	if repo == svc {
-		t.Fatalf("%s's repo no longer differs from its registry key; this test covers nothing until it is pointed at a service where they differ", svc)
-	}
+	const svc = "sensibility"
+	repo := withRepoOverride(t, svc)
 
 	build := gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)}
 
@@ -1457,28 +1476,21 @@ func TestAttentionListsEveryQualifyingService(t *testing.T) {
 // TestAttentionUsesTheRegistryRepoName is the trap this codebase has now walked
 // into three times, asserted for the new build-based checks: LatestBuilds keys
 // on Cloud Build's REPO_NAME, which is the GitHub repo and NOT the registry
-// key. asset-manager lives in sensibility, so a lookup by service name finds
-// nothing for it — and finds the right thing for the other six, which is
-// exactly why it survives review.
+// key. When the two differ, a lookup by service name finds nothing for that
+// service and the right thing for every other, which is exactly why it
+// survives review. withRepoOverride supplies a service where they differ.
 //
 // Both directions are asserted: keyed by the repo the stalled sync is found,
 // keyed by the service name the command wrongly reports an all-clear.
 func TestAttentionUsesTheRegistryRepoName(t *testing.T) {
-	reg, err := registry.Load()
-	if err != nil {
-		t.Fatalf("load registry: %v", err)
-	}
-	const svc = "asset-manager"
-	repo := reg.RepoFor(svc)
-	if repo == svc {
-		t.Fatalf("%s's repo no longer differs from its registry key; this test covers nothing until it is pointed at a service where they differ", svc)
-	}
+	const svc = "sensibility"
+	repo := withRepoOverride(t, svc)
 	build := gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)}
 
 	t.Run("keyed by repo name", func(t *testing.T) {
 		c, builds := attentionFleet(t, map[string]gcb.BuildStatus{repo: build})
 		out, _, code := execBuilds(t, c, builds, "status", "--attention")
-		want := "asset-manager  build 0ab11f2 succeeded 3h ago, staging still on abc1234\n"
+		want := "sensibility  build 0ab11f2 succeeded 3h ago, staging still on abc1234\n"
 		if out != want {
 			t.Errorf("stdout = %q, want %q", out, want)
 		}
@@ -1677,7 +1689,7 @@ func TestStatusAcceptsSeveralServices(t *testing.T) {
 	// Services that were not named must not be read at all — narrowing has to
 	// still narrow.
 	for _, ns := range c.calls {
-		if strings.HasPrefix(ns, "haruspex-") || strings.HasPrefix(ns, "asset-manager-") {
+		if strings.HasPrefix(ns, "haruspex-") || strings.HasPrefix(ns, "sensibility-") {
 			t.Errorf("read %s, which was not named", ns)
 		}
 	}
