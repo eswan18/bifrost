@@ -1104,8 +1104,8 @@ changes:
    from the pair's second element. For every previewable service today the
    two happen to be the same string, but that's a coincidence, not a rule:
    `asset-manager` is already a fleet member whose registry entry sets
-   `repo: asset_manager` (`internal/registry/registry.yaml`), so onboarding
-   *it* to previews means adding `("asset-manager", "asset_manager")` to the
+   `repo: sensibility` (`internal/registry/registry.yaml`), so onboarding
+   *it* to previews means adding `("asset-manager", "sensibility")` to the
    loop — the key first, the repo second, never the repo in both slots. Get
    this backwards and the trigger still builds fine (Cloud Build doesn't
    care what it's named), but bifrost's lookup by registry key finds no

@@ -904,7 +904,7 @@ func known(b gcb.BuildStatus) buildCell { return buildCell{status: b, known: tru
 // TestBuildColumnUsesTheRegistryRepoName is the trap this codebase has now
 // walked into three times: LatestBuilds keys on Cloud Build's REPO_NAME
 // substitution, which is the GitHub repo, NOT the registry key. asset-manager
-// lives in asset_manager, so a lookup by service name finds nothing for it —
+// lives in sensibility, so a lookup by service name finds nothing for it —
 // and finds the right thing for the other six services, which is why it
 // survives review.
 //
@@ -1457,7 +1457,7 @@ func TestAttentionListsEveryQualifyingService(t *testing.T) {
 // TestAttentionUsesTheRegistryRepoName is the trap this codebase has now walked
 // into three times, asserted for the new build-based checks: LatestBuilds keys
 // on Cloud Build's REPO_NAME, which is the GitHub repo and NOT the registry
-// key. asset-manager lives in asset_manager, so a lookup by service name finds
+// key. asset-manager lives in sensibility, so a lookup by service name finds
 // nothing for it — and finds the right thing for the other six, which is
 // exactly why it survives review.
 //

@@ -1102,7 +1102,7 @@ func TestBuildPipelineURL(t *testing.T) {
 }
 
 func TestRepoURL(t *testing.T) {
-	if got := repoURL("eswan18", "asset_manager"); got != "https://github.com/eswan18/asset_manager" {
+	if got := repoURL("eswan18", "sensibility"); got != "https://github.com/eswan18/sensibility" {
 		t.Errorf("repoURL = %q", got)
 	}
 	if repoURL("", "foo") != "" || repoURL("eswan18", "") != "" {

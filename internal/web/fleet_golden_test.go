@@ -22,7 +22,7 @@ import (
 // fixture, and printing its actual output with "%#v" (see the task-2 report
 // for the exact capture harness). It is not hand-derived from the plan or
 // from registry.yaml. It deliberately covers every one of the four migrated
-// fields per service: the repo name (asset-manager's "asset_manager"
+// fields per service: the repo name (asset-manager's "sensibility"
 // override is the one service where RepoFor/RepoOverrides actually changes
 // the answer), the staging URL, the prod URL, and comms' two empty URLs
 // (it's a background worker with no ingress). assembleFleet is the seam, not
@@ -90,10 +90,10 @@ func goldenFleetConfig() *config.Config {
 func goldenFleetRegistry() registry.Registry {
 	return registry.Registry{
 		"asset-manager": {
-			Repo: "asset_manager",
+			Repo: "sensibility",
 			URLs: registry.URLs{
-				Staging: "https://assets-staging.tailc06f30.ts.net",
-				Prod:    "https://assets.ethanswan.com",
+				Staging: "https://staging.sensibility.money",
+				Prod:    "https://sensibility.money",
 			},
 		},
 		"bifrost": {
@@ -172,8 +172,8 @@ func wantGoldenFleetApps() []appView {
 	}
 
 	return []appView{
-		healthy("asset-manager", "asset_manager",
-			"https://assets-staging.tailc06f30.ts.net", "https://assets.ethanswan.com"),
+		healthy("asset-manager", "sensibility",
+			"https://staging.sensibility.money", "https://sensibility.money"),
 		healthy("bifrost", "bifrost",
 			"https://bifrost-staging.tailc06f30.ts.net", "https://bifrost.ethanswan.com"),
 		healthy("comms", "comms", "", ""), // background worker, no ingress: no URLs.

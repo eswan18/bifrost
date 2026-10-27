@@ -79,7 +79,7 @@ type buildSet struct {
 
 // cellFor picks one service's build out of the set. The key is the REPO name,
 // never the service name: LatestBuilds keys on Cloud Build's REPO_NAME
-// substitution, and asset-manager's repo is asset_manager — so a lookup by
+// substitution, and asset-manager's repo is sensibility — so a lookup by
 // service name silently finds no build for it while looking perfectly correct
 // for the other six services. registry.RepoFor is the mapping;
 // internal/web/fleet.go resolves the same key the same way for the Apps tab.
