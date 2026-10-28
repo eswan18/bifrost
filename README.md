@@ -121,11 +121,11 @@ renaming it now would cost every muscle-memory and script that has since learned
 it. An `ib` still on your `PATH` is a leftover install of a script that no
 longer exists in any repo — remove it.
 
-    bif status               # every service
-    bif status <app>         # one service's staging and prod images
+    bif status               # list out-of-sync services (* = mid-deploy)
+    bif status <app>         # minimal output; exit 0 in sync, 1 if not
     bif status <app> <app>   # several services, in the order given
-    bif status -q            # list out-of-sync services (* = mid-deploy)
-    bif status <app> -q      # minimal output; exit 0 in sync, 1 if not
+    bif status -v            # a table: state, staging/prod tags, latest build
+    bif status -vv           # everything: pods, readiness, image repo, build log
     bif status -a            # what needs attention, and why (--attention)
     bif status <app> -a      # the same four checks, for one service
     bif promote <app>        # compare staging vs prod, then ask before promoting
@@ -147,7 +147,7 @@ anything could have been written.
 `docs/preview-environments.md`.
 
 Exit codes are a contract: `status` exits **1** only when a service is
-definitely out of sync, in the default and `-q` forms alike. Mid-deploy, missing
+definitely out of sync, whatever the verbosity. Mid-deploy, missing
 pods and an unreadable staging tag all exit **0** — a script asking "is there
 anything to promote?" gets "no", not an error, when the answer isn't knowable
 yet. (`--attention` asks a broader question and has its own rules; see below.)
@@ -246,23 +246,48 @@ refused is, because the operator asked for a promotion that did not happen.
 A single name keeps the original per-service output and its `Proceed? [y/N]`
 prompt, unchanged.
 
-`bif status` and `bif status <app>` also show each service's most recent Cloud
-Build, under its prod tag:
+### How much `bif status` says
 
-      staging: 0ab11f2
+The default is the least: only the services with something to promote, one
+name per line, `*` marking one mid-deploy. A fleet with nothing to do prints
+nothing. This is the output `-q` used to ask for; `-q`/`--quiet` is still
+accepted, as the same thing, so scripts that pass it keep working.
+
+`-v` is one row per service, and one promote command for everything out of
+sync:
+
+    SERVICE               STATE          STAGING          PROD          BUILD
+    bifrost               ✓ in sync      abc1234          abc1234       ✓ abc1234 succeeded 3h ago
+    comms                 ⚠ deploying    abc1234, def5678 abc1234       ◌ def5678 building (2m)
+    footstrike-dashboard  ✗ out of sync  abc1234-staging  def5678-prod  ✓ abc1234 succeeded 1d ago
+
+    To promote: bif promote footstrike-dashboard
+
+`-vv` (or `-v -v`) is a section per service with everything bif can see — the
+pods behind each tag, with phase, readiness, restarts and why a container is
+waiting; why a service is mid-deploy or unknown; the image repository, which
+is the half of the reference `bif promote` writes that the tags leave out; and
+the build's duration and log link:
+
+    bifrost  ⚠ deploying: staging is running 2 images
+      staging: abc1234, def5678
+        bifrost-7c9d8b5f4-x2k4p  abc1234  Running  1/1 ready
+        bifrost-6f5b9c7d8-qq9zt  def5678  Running  0/1 ready  4 restarts  CrashLoopBackOff
       prod:    abc1234
-      build:   ◌ 0ab11f2 building (2m)
+        bifrost-5d4c3b2a1-m3n4p  abc1234  Running  1/1 ready
+      image:   us-central1-docker.pkg.dev/ethans-services/containers/bifrost
+      build:   ✓ def5678 succeeded 3h ago, took 58s
+               https://console.cloud.google.com/cloud-build/builds/...
 
-`✓ <sha> succeeded 3h ago` / `✗ <sha> failed 12m ago` once it finishes. The
-column is **information, never a verdict**: a failed build does not make a
-service out of sync and never changes the exit code — what's deployed is what
-that word means. It is also best-effort. One API call covers the whole fleet,
-it is bounded by its own short timeout, and if Cloud Build is slow, unreachable
-or unauthenticated the cell reads `(build status unavailable)`, a note goes to
-stderr, and the rest of the output is exactly what it would have been. `bif
-status -q` is untouched: its output is a scriptable contract, so it renders no
-build text and makes no Cloud Build call at all. The project is `GCP_PROJECT`,
-defaulting to `ethans-services`.
+The build cell (`◌` in flight, `✓` succeeded, `✗` failed) is **information,
+never a verdict**: a failed build does not make a service out of sync and never
+changes the exit code — what's deployed is what that word means. It is also
+best-effort. One API call covers the whole fleet, it is bounded by its own short
+timeout, and if Cloud Build is slow, unreachable or unauthenticated the cell
+reads `(build status unavailable)`, a note goes to stderr, and the rest of the
+output is exactly what it would have been. The default list makes no Cloud
+Build call at all. The project is `GCP_PROJECT`, defaulting to
+`ethans-services`.
 
 ### `bif status --attention`
 
@@ -323,7 +348,7 @@ existed. The reads use the same Application Default Credentials as the Cloud
 Build lookup (one token per invocation, not one per service), run concurrently
 across services, and are bounded by their own short timeout. Nothing is dialled
 at all unless some service's build tag and staging tag actually differ, and
-`-q` is untouched: no Cloud Build call, no registry call.
+the default list is untouched: no Cloud Build call, no registry call.
 
 The **staging-versus-prod** verdict stays a tag comparison, deliberately.
 `footstrike-dashboard` builds `{sha}-staging` and `{sha}-prod` as genuinely
@@ -358,9 +383,9 @@ deliberate departure from the build column's best-effort degradation below,
 which is right for `status` — whose answer comes from the cluster — and wrong
 here.
 
-`-a` and `-q` together are refused rather than resolved: they are two different
-answers to what stdout should be, and either winner silently takes something
-away — `-q`'s offline guarantee, or the mode that was asked for. `bif status
+`-a`, `-v`/`-vv` and `-q` are refused in any combination rather than resolved:
+each is a different answer to what stdout should be, and any winner silently
+takes something away — `-q`'s offline guarantee, or the mode that was asked for. `bif status
 <app> -a` is accepted and scoped to that one service; it costs the same single
 Cloud Build call, which answers for the whole fleet either way.
 
@@ -394,7 +419,7 @@ expects.
 An **unparseable prod tag** (`latest`, `prod` — see "Unpinned prod" below) reads
 as *out of sync* here, where `ib.py`'s `status` called it indeterminate. Go is
 right: `ib.py`'s own `promote` promoted from that state, and calling it unknown
-is the bug behind bifrost#30. The visible cost is that `bif status -q` prints
+is the bug behind bifrost#30. The visible cost is that `bif status` prints
 the service and exits **1** where the Python printed nothing and exited **0**.
 
 The **kustomize override key** comes from the image that's running, not from the

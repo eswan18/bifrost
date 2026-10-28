@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
@@ -158,24 +159,72 @@ func exitCode(verdicts []verdict) int {
 	return 0
 }
 
+// verbosity is how much `bif status` says about each service. The default is
+// the least: the list -q has always printed, which is a scriptable contract
+// and the answer to the question asked most often — is there anything to
+// promote? Each -v adds a tier on top of it rather than a different view, so
+// that what -vv prints is always a superset of what -v does.
+type verbosity int
+
+const (
+	// listOutput is the default, and what -q still asks for by name: only the
+	// services needing a promote, bare, and "*" for mid-deploy. No build
+	// lookup, so it stays exactly as cheap and as offline as it always was.
+	listOutput verbosity = iota
+	// tableOutput (-v) is one row per service — state, both environments'
+	// tags, the latest build — and one copy-pasteable promote line for
+	// everything out of sync.
+	tableOutput
+	// detailOutput (-vv) is everything bif can see: each service's pods with
+	// their tag, phase, readiness and restarts, the image repository, why a
+	// service is mid-deploy or unknown, and the build's duration and log.
+	detailOutput
+)
+
+// takeVerbosity removes -v, -vv and --verbose from args wherever they appear,
+// as takeFlag does, and returns the tier they add up to. `-v -v` is -vv, and
+// anything past it is -vv too.
+func takeVerbosity(args []string) ([]string, verbosity) {
+	level := 0
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		switch arg {
+		case "-v", "--verbose":
+			level++
+		case "-vv":
+			level += 2
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out, verbosity(min(level, int(detailOutput)))
+}
+
 // statusCmd implements every form of `bif status`.
 //
 // dialDigests is reached by --attention alone, and only when a service's build
 // tag and staging tag differ — see resolveSameContent, which does not so much
-// as dial when nothing qualifies. -q makes no build lookup and no registry
-// lookup: its offline guarantee is unchanged.
+// as dial when nothing qualifies. The default list makes no build lookup and
+// no registry lookup: its offline guarantee is unchanged.
 func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error), dialDigests func(context.Context) (digestResolver, error)) int {
 	args, quiet := takeFlag(args, "-q", "--quiet")
 	args, attention := takeFlag(args, "-a", "--attention")
+	args, level := takeVerbosity(args)
 
-	// -q and --attention are two different answers to "what should stdout be",
-	// and there is no sensible winner. Letting -q win would silently drop the
-	// mode the operator asked for; letting --attention win would break -q's
-	// scriptable contract AND its offline guarantee, since --attention cannot
-	// work without a Cloud Build read and -q deliberately makes none. So the
-	// combination is refused rather than resolved.
-	if quiet && attention {
-		outf(stderr, "Error: -q and --attention are different output modes; pass one or the other.\n")
+	// -q, -v and --attention are each a different answer to "what should
+	// stdout be", and there is no sensible winner. Letting -q win would
+	// silently drop the mode the operator asked for; letting either of the
+	// others win would break -q's scriptable contract AND its offline
+	// guarantee, since both read Cloud Build and -q deliberately makes no
+	// call. So any combination is refused rather than resolved.
+	modes := 0
+	for _, on := range []bool{quiet, attention, level > listOutput} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		outf(stderr, "Error: -q, -v/-vv and --attention are different output modes; pass one.\n")
 		return 1
 	}
 
@@ -191,10 +240,9 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 	apps := reg.Names()
 
 	// Any number of names narrows the fleet list to those names, in the order
-	// given. Every form below — the table, -q, --attention — already loops over
-	// `apps`, so several names cost this one line and nothing else: the
-	// single-name case is just the list of length one it always was, and the
-	// build lookup stays the single fleet-wide call it is for every other form.
+	// given. Every form below already loops over `apps`, so several names cost
+	// this one line and nothing else, and the build lookup stays the single
+	// fleet-wide call it is for every other form.
 	if len(args) > 0 {
 		named, ok := resolveApps(stdout, apps, args)
 		if !ok {
@@ -203,13 +251,12 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 		apps = named
 	}
 
-	// -q gets no build lookup at all. Its output is a scriptable contract —
-	// bare app names, "*" for mid-deploy — so there is nothing to render, and
-	// skipping the call keeps the quiet form exactly as cheap and as offline
-	// as it was. Started here, before connect, so the Cloud Build read and the
+	// The default list gets no build lookup at all: it renders no build text,
+	// and skipping the call keeps it exactly as cheap and as offline as it
+	// was. Started here, before connect, so the Cloud Build read and the
 	// cluster reads overlap rather than adding up.
 	var builds <-chan buildSet
-	if !quiet {
+	if attention || level > listOutput {
 		builds = fetchBuilds(ctx, dialBuilds)
 	}
 
@@ -235,101 +282,107 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 		return attentionReport(ctx, stdout, stderr, cluster, reg, apps, set, dialDigests, time.Now())
 	}
 
-	verdicts := make([]verdict, 0, len(apps))
+	// Every service is read before anything prints, because the table's
+	// column widths and its promote line depend on all of them.
+	services := make([]serviceStatus, 0, len(apps))
 	for _, app := range apps {
-		staging := deployedImages(ctx, cluster, stderr, app+"-staging")
-		prod := deployedImages(ctx, cluster, stderr, app+"-prod")
-		verdicts = append(verdicts, statusOne(stdout, app, staging, prod, quiet, set.cellFor(reg.RepoFor(app))))
+		services = append(services, newServiceStatus(app,
+			envOf(deployedPods(ctx, cluster, stderr, app+"-staging")),
+			envOf(deployedPods(ctx, cluster, stderr, app+"-prod")),
+			set.cellFor(reg.RepoFor(app))))
+	}
+
+	switch level {
+	case tableOutput:
+		writeTable(stdout, services, time.Now())
+	case detailOutput:
+		writeDetail(stdout, services, time.Now())
+	default:
+		writeList(stdout, services)
+	}
+
+	verdicts := make([]verdict, 0, len(services))
+	for _, s := range services {
+		verdicts = append(verdicts, s.verdict())
 	}
 	return exitCode(verdicts)
 }
 
-// deployedImages returns the images running in a namespace. A List failure is
-// reported and then read as "no pods": ib.py does the same thing (its kubectl
-// helper prints the error and exits, and get_deployed_images catches that exit
-// and returns an empty set), so a namespace that doesn't exist yet reads as
-// indeterminate instead of aborting a whole-fleet status.
-func deployedImages(ctx context.Context, cluster podLister, stderr io.Writer, ns string) []string {
+// deployedPods returns the pods in a namespace. A List failure is reported and
+// then read as "no pods": ib.py did the same thing (its kubectl helper printed
+// the error and exited, and get_deployed_images caught that exit and returned
+// an empty set), so a namespace that doesn't exist yet reads as indeterminate
+// instead of aborting a whole-fleet status.
+func deployedPods(ctx context.Context, cluster podLister, stderr io.Writer, ns string) []kube.PodInfo {
 	pods, err := cluster.ListPods(ctx, ns)
 	if err != nil {
 		outf(stderr, "Error: listing pods in %s: %v\n", ns, err)
 		return nil
 	}
-	return kube.Images(pods)
+	return pods
 }
 
-// statusOne renders one service and returns its verdict.
+// deployedImages returns the images running in a namespace; see deployedPods.
+func deployedImages(ctx context.Context, cluster podLister, stderr io.Writer, ns string) []string {
+	return kube.Images(deployedPods(ctx, cluster, stderr, ns))
+}
+
+// envState is one environment of one service: the images the verdict is
+// computed from, and the pods running them, which only -vv shows.
+type envState struct {
+	images []string
+	pods   []kube.PodInfo
+}
+
+// envOf reads an environment from its pods. Job pods are dropped from both
+// halves — kube.Images already drops them from the images, for the reason it
+// gives, and listing a finished migration among the pods serving traffic would
+// make -vv contradict the verdict printed above it.
+func envOf(pods []kube.PodInfo) envState {
+	env := envState{images: kube.Images(pods)}
+	for _, p := range pods {
+		if p.OwnerKind != "Job" {
+			env.pods = append(env.pods, p)
+		}
+	}
+	return env
+}
+
+// serviceStatus is everything one `bif status` row or section is rendered
+// from.
 //
 // The verdict comes from promote.StatusOf — the same decision logic the server
-// runs, which is the whole reason for this port. The table does NOT: it is
-// rendered straight from the image lists, exactly as ib.py renders it.
+// runs. The rendering does NOT come from the Status: promote.Status zeroes its
+// tags whenever either side is mid-deploy or has no pods, and the table still
+// shows the other side's tag in both cases. So promote decides, and cmd/bif
+// displays from the image lists it already holds, and no verdict moved to make
+// the output match.
 //
-// That split is deliberate, and it is how this resolves Task 1's second
-// finding (promote.Status zeroes StagingTag/ProdTag when either side is
-// mid-deploy or has no pods, where ib.py still displays the other side's tag).
-// The alternative was widening promote.Status, and it is the wrong shape: what
-// the mid-deploy display needs is every tag, so Status would have to carry
-// []string per environment — its own input handed back — and gain fields whose
-// meaning changed with State. cmd/bif already holds the image lists, having
-// just fetched them. So promote decides, and cmd/bif displays, and no verdict
-// moved to make the output match.
-// The build cell is the one thing here that is neither ib.py's nor a verdict:
-// it is information, and it never moves the exit code. A service whose last
-// build failed is not thereby "out of sync" — the images running in the two
-// namespaces are what that word means, and a red build says something about
-// the next deploy, not this one.
-func statusOne(w io.Writer, app string, stagingImages, prodImages []string, quiet bool, build buildCell) verdict {
-	staging := normalize(stagingImages)
-	prod := normalize(prodImages)
-	status := promote.StatusOf(staging, prod)
-
-	if quiet {
-		// Quiet mode prints only the names a script cares about: bare for out
-		// of sync, "*"-suffixed for mid-deploy. In sync and indeterminate
-		// print nothing at all — and no build cell, which is why statusCmd
-		// does not even look one up for -q.
-		switch status.State {
-		case promote.MidDeploy:
-			outf(w, "%s*\n", app)
-		case promote.OutOfSync:
-			outln(w, app)
-		}
-		return verdictOf(status.State)
-	}
-
-	outf(w, "\n%s deployment status:\n", app)
-	outln(w, strings.Repeat("-", 50))
-	writeImages(w, "staging", staging)
-	writeImages(w, "prod", prod)
-	writeCell(w, "build", buildLabel(build, time.Now()))
-
-	switch status.State {
-	case promote.MidDeploy:
-		// Which environment is rolling is a property of the image lists, and
-		// staging is checked first because ib.py checks it first — with both
-		// mid-deploy, staging is the one named.
-		if len(staging) > 1 {
-			outln(w, "\n⚠ Staging has an image mismatch (deployment in progress?)")
-		} else {
-			outln(w, "\n⚠ Prod has an image mismatch (deployment in progress?)")
-		}
-	case promote.InSync:
-		outln(w, "\n✓ In sync")
-	case promote.OutOfSync:
-		outln(w, "\n✗ Out of sync")
-		// ib.py points at itself here; this points at this binary, because as
-		// of `bif promote` the hint is true. It is the one line of status
-		// output that deliberately differs from the oracle — see
-		// oraclePromoteHint in status_test.go.
-		outf(w, "  To promote: bif promote %s\n", app)
-		outf(w, "  This will deploy %s to prod\n", status.NewProdTag)
-	default:
-		// Indeterminate: the table is the whole answer, and ib.py still ends
-		// with a blank line here.
-		outln(w)
-	}
-	return verdictOf(status.State)
+// The build cell is neither: it is information, and it never moves the exit
+// code. A service whose last build failed is not thereby "out of sync" — the
+// images running in the two namespaces are what that word means, and a red
+// build says something about the next deploy, not this one.
+type serviceStatus struct {
+	app           string
+	staging, prod envState
+	status        promote.Status
+	build         buildCell
 }
+
+// newServiceStatus normalizes both environments' images and takes the verdict.
+func newServiceStatus(app string, staging, prod envState, build buildCell) serviceStatus {
+	staging.images = normalize(staging.images)
+	prod.images = normalize(prod.images)
+	return serviceStatus{
+		app:     app,
+		staging: staging,
+		prod:    prod,
+		status:  promote.StatusOf(staging.images, prod.images),
+		build:   build,
+	}
+}
+
+func (s serviceStatus) verdict() verdict { return verdictOf(s.status.State) }
 
 func verdictOf(state promote.State) verdict {
 	switch state {
@@ -342,28 +395,259 @@ func verdictOf(state promote.State) verdict {
 	}
 }
 
-// writeImages renders one environment's line(s). ib.py pads the labels to a
-// fixed width ("  staging: x" / "  prod:    x") but drops the padding when it
-// has several images to list under a header, so both forms are reproduced.
-func writeImages(w io.Writer, label string, images []string) {
-	switch len(images) {
-	case 0:
-		writeCell(w, label, "(no pods found)")
-	case 1:
-		writeCell(w, label, promote.ExtractTag(images[0]))
+// stateLabel is a service's verdict as the -v and -vv output show it, in the
+// same glyphs the build cell uses: ✓ good, ✗ needs a human, ⚠ moving.
+func (s serviceStatus) stateLabel() string {
+	switch s.status.State {
+	case promote.InSync:
+		return "✓ in sync"
+	case promote.OutOfSync:
+		return "✗ out of sync"
+	case promote.MidDeploy:
+		return "⚠ deploying"
 	default:
-		outf(w, "  %s:\n", label)
-		for _, img := range images {
-			outf(w, "    - %s\n", promote.ExtractTag(img))
+		return "? unknown"
+	}
+}
+
+// reason says why a service is mid-deploy or unknown, for -vv. Both verdicts
+// exit 0 and print nothing in the default list, so they are the two an
+// operator is most likely to need explained; "" for the other two, whose label
+// is the whole story.
+func (s serviceStatus) reason() string {
+	switch s.status.State {
+	case promote.MidDeploy:
+		// Both environments are named when both are rolling, where the old
+		// single-block output named only staging.
+		var rolling []string
+		for _, env := range []struct {
+			name   string
+			images []string
+		}{{"staging", s.staging.images}, {"prod", s.prod.images}} {
+			if len(env.images) > 1 {
+				rolling = append(rolling, fmt.Sprintf("%s is running %d images", env.name, len(env.images)))
+			}
+		}
+		return strings.Join(rolling, ", ")
+	case promote.Unknown:
+		switch {
+		case len(s.staging.images) == 0 && len(s.prod.images) == 0:
+			return "no pods in staging or prod"
+		case len(s.staging.images) == 0:
+			return "no pods in staging"
+		case len(s.prod.images) == 0:
+			return "no pods in prod"
+		default:
+			// The one other way StatusOf reaches Unknown: staging's tag is
+			// not a commit (an unpinned `latest`), so there is nothing to
+			// promote it as.
+			return fmt.Sprintf("staging tag %s names no commit", s.status.StagingTag)
+		}
+	}
+	return ""
+}
+
+// ---- default: the list --------------------------------------------------
+
+// writeList prints only the names a script cares about: bare for out of sync,
+// "*"-suffixed for mid-deploy. In sync and indeterminate print nothing at all,
+// so a fleet with nothing to do prints nothing — which is what makes this the
+// default and `bif status || ...` a guard.
+func writeList(w io.Writer, services []serviceStatus) {
+	for _, s := range services {
+		switch s.status.State {
+		case promote.MidDeploy:
+			outf(w, "%s*\n", s.app)
+		case promote.OutOfSync:
+			outln(w, s.app)
 		}
 	}
 }
 
-// writeCell renders one labelled row of the table. ib.py's padding is the
-// contract here — it is what makes "build:" line its value up under prod's,
-// and every byte of it is pinned by the oracle fixtures.
+// ---- -v: the table ------------------------------------------------------
+
+// writeTable prints one row per service and, when anything is out of sync, a
+// single `bif promote` line naming all of it — promote takes several services
+// and shows one plan for them, so that line is the whole next step.
+//
+//	SERVICE               STATE          STAGING          PROD          BUILD
+//	bifrost               ✓ in sync      abc1234          abc1234       ✓ abc1234 succeeded 3h ago
+//	comms                 ⚠ deploying    abc1234, def5678 abc1234       ◌ def5678 building (2m)
+//	footstrike-dashboard  ✗ out of sync  abc1234-staging  def5678-prod  ✓ abc1234 succeeded 1d ago
+//
+//	To promote: bif promote footstrike-dashboard
+func writeTable(w io.Writer, services []serviceStatus, now time.Time) {
+	rows := [][]string{{"SERVICE", "STATE", "STAGING", "PROD", "BUILD"}}
+	var promotable []string
+	for _, s := range services {
+		rows = append(rows, []string{
+			s.app,
+			s.stateLabel(),
+			tagsCell(s.staging.images),
+			tagsCell(s.prod.images),
+			buildLabel(s.build, now),
+		})
+		if s.status.State == promote.OutOfSync {
+			promotable = append(promotable, s.app)
+		}
+	}
+	writeColumns(w, "", rows)
+	if len(promotable) > 0 {
+		outf(w, "\nTo promote: bif promote %s\n", strings.Join(promotable, " "))
+	}
+}
+
+// tagsCell renders one environment's tags. Every tag is shown during a
+// rollout, rather than a count, because which two tags are live is exactly
+// what a mid-deploy reader wants to know.
+func tagsCell(images []string) string {
+	if len(images) == 0 {
+		return "(no pods)"
+	}
+	return strings.Join(tagsOf(images), ", ")
+}
+
+// writeColumns lays rows out in left-aligned columns two spaces apart, each as
+// wide as its widest cell, after an indent. The last column is left unpadded
+// so no line ends in spaces. Widths are in runes (see pad): the glyphs in the
+// state and build columns are one character and three bytes.
+func writeColumns(w io.Writer, indent string, rows [][]string) {
+	var widths []int
+	for _, row := range rows {
+		for i, cell := range row {
+			if i == len(widths) {
+				widths = append(widths, 0)
+			}
+			widths[i] = max(widths[i], utf8.RuneCountInString(cell))
+		}
+	}
+	for _, row := range rows {
+		var b strings.Builder
+		b.WriteString(indent)
+		for i, cell := range row {
+			if i == len(row)-1 {
+				b.WriteString(cell)
+				break
+			}
+			b.WriteString(pad(cell, widths[i]+2))
+		}
+		outln(w, b.String())
+	}
+}
+
+// ---- -vv: the detail ----------------------------------------------------
+
+// writeDetail prints a section per service, blank-line separated:
+//
+//	bifrost  ✗ out of sync
+//	  staging: abc1234
+//	    bifrost-7c9d8b5f4-x2k4p  abc1234  Running  1/1 ready
+//	  prod:    def5678
+//	    bifrost-6f5b9c7d8-qq9zt  def5678  Running  1/1 ready  3 restarts
+//	  image:   us-central1-docker.pkg.dev/ethans-services/containers/bifrost
+//	  build:   ✓ abc1234 succeeded 3h ago, took 58s
+//	           https://console.cloud.google.com/cloud-build/builds/...
+//	  promote: bif promote bifrost (deploys abc1234 to prod)
+//
+// The pods are the point of this tier. Mid-deploy and unknown both print
+// nothing in the default list, and the pod rows are what tell a rollout that is
+// landing (new pods ready, old ones going) from one that is stuck
+// (CrashLoopBackOff, climbing restarts).
+func writeDetail(w io.Writer, services []serviceStatus, now time.Time) {
+	for i, s := range services {
+		if i > 0 {
+			outln(w)
+		}
+		head := s.app + "  " + s.stateLabel()
+		if r := s.reason(); r != "" {
+			head += ": " + r
+		}
+		outln(w, head)
+
+		writeEnv(w, "staging", s.staging)
+		writeEnv(w, "prod", s.prod)
+		if repos := imageRepos(s); repos != "" {
+			writeCell(w, "image", repos)
+		}
+		writeCell(w, "build", buildDetail(s.build, now))
+		if url := s.build.status.LogURL; s.build.known && url != "" {
+			writeCell(w, "", url)
+		}
+		if s.status.State == promote.OutOfSync {
+			writeCell(w, "promote", fmt.Sprintf("bif promote %s (deploys %s to prod)", s.app, s.status.NewProdTag))
+		}
+	}
+}
+
+// writeEnv renders one environment's tags and then its pods, one row each.
+func writeEnv(w io.Writer, label string, env envState) {
+	writeCell(w, label, tagsCell(env.images))
+	rows := make([][]string, 0, len(env.pods))
+	for _, p := range env.pods {
+		rows = append(rows, podRow(p))
+	}
+	writeColumns(w, "    ", rows)
+}
+
+// podRow is one pod as -vv lists it: name, the tag(s) it runs, its phase, how
+// many of its containers are ready, and — only when there is something to say
+// — its restarts and why a container is waiting.
+func podRow(p kube.PodInfo) []string {
+	var tags []string
+	ready, restarts := 0, int32(0)
+	waiting := ""
+	for _, c := range p.Containers {
+		tags = append(tags, promote.ExtractTag(c.Image))
+		if c.Ready {
+			ready++
+		}
+		restarts += c.RestartCount
+		if waiting == "" {
+			waiting = c.WaitingReason
+		}
+	}
+	row := []string{p.Name, strings.Join(tags, ","), p.Phase, fmt.Sprintf("%d/%d ready", ready, len(p.Containers))}
+	if restarts > 0 {
+		row = append(row, fmt.Sprintf("%d restarts", restarts))
+	}
+	if waiting != "" {
+		row = append(row, waiting)
+	}
+	return row
+}
+
+// imageRepos is the repository the service's images come from, without a tag.
+// It is worth a line because nothing guarantees it is the service's name, and
+// it is the half of the reference `bif promote` writes that the tag columns
+// leave out.
+func imageRepos(s serviceStatus) string {
+	var repos []string
+	for _, img := range append(slices.Clone(s.staging.images), s.prod.images...) {
+		if base := promote.ImageBase(img); !slices.Contains(repos, base) {
+			repos = append(repos, base)
+		}
+	}
+	return strings.Join(repos, ", ")
+}
+
+// buildDetail is buildLabel plus how long a finished build took.
+func buildDetail(c buildCell, now time.Time) string {
+	label := buildLabel(c, now)
+	b := c.status
+	if c.known && !b.StartTime.IsZero() && !b.FinishTime.IsZero() {
+		label += ", took " + elapsed(b.FinishTime.Sub(b.StartTime))
+	}
+	return label
+}
+
+// writeCell renders one labelled line of a -vv section, padded so every value
+// lines up under the longest label ("promote:"). An empty label continues the
+// line above it.
 func writeCell(w io.Writer, label, value string) {
-	outf(w, "  %-8s %s\n", label+":", value)
+	if label != "" {
+		label += ":"
+	}
+	outf(w, "  %-8s %s\n", label, value)
 }
 
 // buildLabel renders one service's most recent build.

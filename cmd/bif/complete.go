@@ -94,13 +94,17 @@ func completeCmd(ctx context.Context, args []string, stdout io.Writer, dial func
 var topLevelCommands = []string{"status", "promote", "preview", "completion"}
 
 // flagGroup is one flag and its aliases. Grouping them is what makes "already
-// given" mean the flag rather than the spelling: `bif status --quiet <TAB>`
-// must not go on offering -q, which is the same flag under its other name and
-// which takeFlag would strip right back out.
+// given" mean the flag rather than the spelling: `bif status --verbose <TAB>`
+// must not go on offering -v, which is the same flag under its other name and
+// which takeVerbosity would strip right back out. -vv shares the group because
+// it is the same flag again: a second -v is -vv.
+//
+// status's -q is not offered at all. The list it asks for is the default now,
+// and -q is still accepted only so the scripts that pass it keep working.
 type flagGroup []string
 
 var (
-	statusFlags      = []flagGroup{{"-q", "--quiet"}, {"-a", "--attention"}}
+	statusFlags      = []flagGroup{{"-v", "-vv", "--verbose"}, {"-a", "--attention"}}
 	promoteFlags     = []flagGroup{{"-y", "--yes"}}
 	previewUpFlags   = []flagGroup{{"--ttl"}, {"--no-wait"}, {"--auto-update"}}
 	previewDownFlags = []flagGroup{{"-y", "--yes"}}

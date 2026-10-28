@@ -139,7 +139,7 @@ func TestCompletePositions(t *testing.T) {
 		{
 			name:  "status offers the fleet and its flags",
 			words: []string{"status", ""},
-			want:  append(append([]string{}, fleet...), "-q", "--quiet", "-a", "--attention"),
+			want:  append(append([]string{}, fleet...), "-v", "-vv", "--verbose", "-a", "--attention"),
 		},
 		{
 			name:  "promote offers the fleet and its flag",
@@ -225,7 +225,7 @@ func TestCompleteOmitsNamesAlreadyOnTheLine(t *testing.T) {
 		{
 			name:  "status drops the one name given",
 			words: []string{"status", "bifrost", ""},
-			want:  append(without(fleet, "bifrost"), "-q", "--quiet", "-a", "--attention"),
+			want:  append(without(fleet, "bifrost"), "-v", "-vv", "--verbose", "-a", "--attention"),
 		},
 		{
 			name:  "promote drops every name given",
@@ -256,9 +256,9 @@ func TestCompleteOmitsNamesAlreadyOnTheLine(t *testing.T) {
 }
 
 // TestCompleteOmitsFlagsAlreadyGiven checks the same exclusion for flags, and
-// checks it per FLAG rather than per spelling: -q and --quiet are one flag,
-// and offering the other alias of one already given is offering a token
-// takeFlag would strip straight back out.
+// checks it per FLAG rather than per spelling: -v, -vv and --verbose are one
+// flag, and offering another alias of one already given is offering a token
+// takeVerbosity would strip straight back out.
 func TestCompleteOmitsFlagsAlreadyGiven(t *testing.T) {
 	fleet := fleetNames(t)
 	tests := []struct {
@@ -267,18 +267,18 @@ func TestCompleteOmitsFlagsAlreadyGiven(t *testing.T) {
 		want  []string
 	}{
 		{
-			name:  "the short alias is dropped when the long one is given",
-			words: []string{"status", "--quiet", "-"},
+			name:  "the short aliases are dropped when the long one is given",
+			words: []string{"status", "--verbose", "-"},
 			want:  []string{"-a", "--attention"},
 		},
 		{
-			name:  "the long alias is dropped when the short one is given",
-			words: []string{"status", "-q", "-"},
+			name:  "the long alias is dropped when a short one is given",
+			words: []string{"status", "-vv", "-"},
 			want:  []string{"-a", "--attention"},
 		},
 		{
 			name:  "both flags given leaves only the fleet",
-			words: []string{"status", "-q", "-a", ""},
+			words: []string{"status", "-v", "-a", ""},
 			want:  fleet,
 		},
 		{

@@ -56,7 +56,7 @@ func TestDispatch(t *testing.T) {
 			name:     "no arguments prints usage",
 			args:     nil,
 			wantCode: 1,
-			wantOut:  []string{"bif status <app> -q", "bif promote <app> -y", "Deployment status and promotion helper"},
+			wantOut:  []string{"bif status -vv", "bif promote <app> -y", "Deployment status and promotion helper"},
 		},
 		{
 			name:     "unknown command",
