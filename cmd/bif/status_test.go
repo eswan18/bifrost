@@ -189,8 +189,6 @@ type statusRow struct {
 	State         string   `json:"state"`
 	QuietReturn   *bool    `json:"quietReturn"`
 	QuietStdout   string   `json:"quietStdout"`
-	VerboseReturn *bool    `json:"verboseReturn"`
-	VerboseStdout string   `json:"verboseStdout"`
 }
 
 func (r statusRow) key() string {
@@ -232,52 +230,21 @@ type divergence struct {
 	why           string
 }
 
-// verboseDivergences / quietDivergences: DIVERGENCE #1 from Task 1, the only
-// place `bif status` deliberately disagrees with ib.py.
+// quietDivergences: the only fixture rows where `bif status` deliberately
+// disagrees with ib.py.
 //
-// ib.py's status() calls an unparseable PROD tag indeterminate, because it
-// requires both SHAs before it will compare them. promote.StatusOf requires
+// ib.py's status() called an unparseable PROD tag indeterminate, because it
+// required both SHAs before it would compare them. promote.StatusOf requires
 // only the staging SHA — the artifact being promoted — and calls the same
-// state out of sync.
-//
-// Go is right, and it is a divergence from ib.py's *status*, not its
-// *promote*: ib.py's own promote() accepts exactly this state and promotes
-// from it. The state is real and recoverable — the prod Application lost its
-// image pin and fell back to the mutable `latest`/`prod` tag in the repo
-// manifests — and calling it "unknown" is what left bifrost refusing to
-// promote with no way out (bifrost#30).
-//
-// The visible cost, which is why it is spelled out here rather than left to
-// be discovered: `bif status -q` now prints the app and exits 1 where ib.py
-// printed nothing and exited 0. That is a scriptable contract changing.
-var verboseDivergences = map[string]divergence{
-	"bifrost staging=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234] prod=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest]": {
-		pythonStdout: "\nbifrost deployment status:\n" + strings.Repeat("-", 50) +
-			"\n  staging: abc1234\n  prod:    latest\n\n",
-		pythonVerdict: indeterminate,
-		goStdout: "\nbifrost deployment status:\n" + strings.Repeat("-", 50) +
-			"\n  staging: abc1234\n  prod:    latest\n" +
-			"\n✗ Out of sync\n  To promote: bif promote bifrost\n  This will deploy abc1234 to prod\n",
-		goVerdict: outOfSync,
-		why:       "prod unpinned on a mutable tag; ib.py status() needs both SHAs, ib.py promote() does not (bifrost#30)",
-	},
-	"footstrike-dashboard staging=[us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging] prod=[us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:prod]": {
-		pythonStdout: "\nfootstrike-dashboard deployment status:\n" + strings.Repeat("-", 50) +
-			"\n  staging: abc1234-staging\n  prod:    prod\n\n",
-		pythonVerdict: indeterminate,
-		goStdout: "\nfootstrike-dashboard deployment status:\n" + strings.Repeat("-", 50) +
-			"\n  staging: abc1234-staging\n  prod:    prod\n" +
-			"\n✗ Out of sync\n  To promote: bif promote footstrike-dashboard\n  This will deploy abc1234-prod to prod\n",
-		goVerdict: outOfSync,
-		why:       "same, on the {sha}-{env} tagging scheme",
-	},
-}
-
+// state out of sync. ib.py's own promote() accepted exactly this state and
+// promoted from it: the prod Application lost its image pin and fell back to
+// the mutable `latest`/`prod` tag, and calling it "unknown" is what left
+// bifrost refusing to promote with no way out (bifrost#30).
 var quietDivergences = map[string]divergence{
 	"bifrost staging=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:abc1234] prod=[us-central1-docker.pkg.dev/ethans-services/containers/bifrost:latest]": {
 		pythonStdout: "", pythonVerdict: indeterminate,
 		goStdout: "bifrost\n", goVerdict: outOfSync,
-		why: "bifrost#30: -q prints the app and exits 1 where ib.py printed nothing and exited 0",
+		why: "bifrost#30: the list prints the app and exits 1 where ib.py printed nothing and exited 0",
 	},
 	"footstrike-dashboard staging=[us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:abc1234-staging] prod=[us-central1-docker.pkg.dev/ethans-services/containers/footstrike-dashboard:prod]": {
 		pythonStdout: "", pythonVerdict: indeterminate,
@@ -286,211 +253,148 @@ var quietDivergences = map[string]divergence{
 	},
 }
 
-// The out-of-sync hint is the one line where `bif status` deliberately does
-// not reproduce the oracle's bytes: ib.py named itself, and this names the
-// binary the reader is already running. `bif promote` is the implementation
-// and `ib promote` no longer exists. Nothing else about the line moves — same
-// indent, same position, same following line.
-const (
-	oraclePromoteHint = "  To promote: ib promote "
-	bifPromoteHint    = "  To promote: bif promote "
-)
-
-// retargetPromoteHint applies that one substitution to a captured ib.py
-// output, so the golden comparison stays byte-exact everywhere else instead of
-// being weakened to a "contains" check.
-func retargetPromoteHint(oracleStdout string) string {
-	return strings.ReplaceAll(oracleStdout, oraclePromoteHint, bifPromoteHint)
-}
-
 // unknownBuild is the build cell for tests that are not about the build
 // column: Cloud Build was not reachable, which is the state every one of them
 // runs its cluster assertions in.
 var unknownBuild = buildCell{}
 
-// buildLinePrefix is the build cell's label as writeCell renders it — the
-// padding included, since lining up under "prod:" is the point of it.
+// buildLinePrefix is the build cell's label as -vv renders it — the padding
+// included, since lining up under "promote:" is the point of it.
 const buildLinePrefix = "  build:   "
 
-// stripBuildLine removes the build line from `bif status` output and fails if
-// there is not exactly one.
-//
-// The oracle predates the build column by an entire tool, so its captured
-// output cannot contain one, and the golden comparison below would otherwise
-// have to be weakened to a "contains". Requiring exactly one before removing
-// it turns the strip into an assertion of its own: every oracle row — every
-// cluster state ib.py was ever captured against, in sync, mid-deploy, no pods
-// — now also proves the build line is rendered there, exactly once.
-func stripBuildLine(t *testing.T, out string) string {
-	t.Helper()
-	lines := strings.Split(out, "\n")
-	kept := make([]string, 0, len(lines))
-	found := 0
-	for _, line := range lines {
-		if strings.HasPrefix(line, buildLinePrefix) {
-			found++
-			continue
-		}
-		kept = append(kept, line)
-	}
-	if found != 1 {
-		t.Fatalf("output has %d lines starting %q, want exactly 1:\n%s", found, buildLinePrefix, out)
-	}
-	return strings.Join(kept, "\n")
+// statusOf builds one service's status straight from image lists, the shape
+// the oracle fixtures record.
+func statusOf(app string, staging, prod []string, build buildCell) serviceStatus {
+	return newServiceStatus(app, envState{images: staging}, envState{images: prod}, build)
 }
 
-// TestStatusRenderingMatchesOracle is the golden comparison: for every cluster
-// state ib.py was captured against, `bif status` must print exactly what ib.py
-// printed and return the same verdict — byte for byte, including the table
-// alignment, the blank lines and the ⚠/✓/✗ glyphs. The exceptions are the
-// promote hint (see retargetPromoteHint) and the build line, which ib.py had
-// no notion of (see stripBuildLine).
-func TestStatusRenderingMatchesOracle(t *testing.T) {
+// TestDefaultListMatchesOracle runs the default output — the list -q has
+// always printed, and still a scriptable contract — over every cluster state
+// ib.py was captured against, and checks the verdict for each. The -v and -vv
+// renderings are bif's own and are no longer compared to ib.py's; the fixtures
+// stay because they are the widest matrix of cluster states this package has.
+func TestDefaultListMatchesOracle(t *testing.T) {
 	rows, err := oracle.Load[statusRow]("status.json")
 	if err != nil {
 		t.Fatalf("load fixture: %v", err)
 	}
-
-	// Guard the substitution before relying on it. If ib.py's captured output
-	// no longer contains the hint at all, retargetPromoteHint is a silent
-	// no-op and every out-of-sync row would then be asserting that `bif
-	// status` prints no hint whatsoever — a passing test for a broken tool.
-	hinted := 0
 	for _, r := range rows {
-		if strings.Contains(r.VerboseStdout, oraclePromoteHint) {
-			hinted++
-		}
-	}
-	if hinted == 0 {
-		t.Fatalf("no fixture row contains %q; the promote-hint rewrite is a no-op and this test no longer checks the hint", oraclePromoteHint)
-	}
+		t.Run(r.key(), func(t *testing.T) {
+			s := statusOf(r.App, r.StagingImages, r.ProdImages, unknownBuild)
+			var buf bytes.Buffer
+			writeList(&buf, []serviceStatus{s})
+			got, gotVerdict := buf.String(), s.verdict()
 
-	for _, mode := range []struct {
-		name        string
-		quiet       bool
-		stdout      func(statusRow) string
-		ret         func(statusRow) *bool
-		divergences map[string]divergence
-		// got normalizes what bif printed before it is compared to ib.py's
-		// bytes. Verbose strips the build line, which ib.py could not have
-		// printed; quiet has no build line to strip. See stripBuildLine.
-		got func(*testing.T, string) string
-	}{
-		{
-			name:        "verbose",
-			quiet:       false,
-			stdout:      func(r statusRow) string { return retargetPromoteHint(r.VerboseStdout) },
-			ret:         func(r statusRow) *bool { return r.VerboseReturn },
-			divergences: verboseDivergences,
-			got:         stripBuildLine,
-		},
-		{
-			name:        "quiet",
-			quiet:       true,
-			stdout:      func(r statusRow) string { return r.QuietStdout },
-			ret:         func(r statusRow) *bool { return r.QuietReturn },
-			divergences: quietDivergences,
-			got:         func(_ *testing.T, out string) string { return out },
-		},
-	} {
-		t.Run(mode.name, func(t *testing.T) {
-			for _, r := range rows {
-				t.Run(r.key(), func(t *testing.T) {
-					var raw bytes.Buffer
-					got := statusOne(&raw, r.App, r.StagingImages, r.ProdImages, mode.quiet, unknownBuild)
-					buf := mode.got(t, raw.String())
-
-					wantStdout := mode.stdout(r)
-					wantVerdict := verdictFromOracle(mode.ret(r))
-
-					if d, known := mode.divergences[r.key()]; known {
-						// Guard the oracle first: if ib.py's captured output
-						// moved, the divergence note is describing a Python
-						// that no longer exists and has to be re-derived.
-						if wantStdout != d.pythonStdout || wantVerdict != d.pythonVerdict {
-							t.Fatalf("oracle changed: ib.py now prints %q / returns %v; divergence table records %q / %v",
-								wantStdout, wantVerdict, d.pythonStdout, d.pythonVerdict)
-						}
-						if buf != d.goStdout {
-							t.Fatalf("known divergence changed:\n got %q\nwant %q\n(%s)", buf, d.goStdout, d.why)
-						}
-						if got != d.goVerdict {
-							t.Fatalf("known divergence changed: verdict %v, was %v (%s)", got, d.goVerdict, d.why)
-						}
-						return
-					}
-
-					if buf != wantStdout {
-						t.Errorf("stdout mismatch\n got %q\nib.py %q", buf, wantStdout)
-					}
-					if got != wantVerdict {
-						t.Errorf("verdict = %v, ib.py returned %v", got, wantVerdict)
-					}
-				})
+			wantStdout, wantVerdict := r.QuietStdout, verdictFromOracle(r.QuietReturn)
+			if d, known := quietDivergences[r.key()]; known {
+				// Guard the oracle first: if the captured output moved, the
+				// divergence note describes a Python that no longer exists.
+				if wantStdout != d.pythonStdout || wantVerdict != d.pythonVerdict {
+					t.Fatalf("oracle changed: ib.py now prints %q / returns %v; divergence table records %q / %v",
+						wantStdout, wantVerdict, d.pythonStdout, d.pythonVerdict)
+				}
+				wantStdout, wantVerdict = d.goStdout, d.goVerdict
+			}
+			if got != wantStdout {
+				t.Errorf("stdout = %q, want %q", got, wantStdout)
+			}
+			if gotVerdict != wantVerdict {
+				t.Errorf("verdict = %v, want %v", gotVerdict, wantVerdict)
 			}
 		})
 	}
 }
 
-// TestMidDeployKeepsTheOtherEnvironmentsTag pins the resolution of Task 1's
-// DIVERGENCE #2. promote.Status zeroes StagingTag/ProdTag whenever either side
-// is mid-deploy or empty, so a `cmd/bif` that rendered from Status would print
-// a table with a hole in it. It renders from the image lists instead, and this
-// is the assertion that says so: prod's tag survives a staging rollout, and
-// staging's survives a prod one.
-//
-// The oracle rows already cover these states; this test exists on top of them
-// to name the property, so that a future refactor toward "just use Status"
-// fails with the reason rather than as a diff.
+// TestMidDeployKeepsTheOtherEnvironmentsTag: promote.Status zeroes its tags
+// whenever either side is mid-deploy or empty, so a table rendered from Status
+// would have a hole in it. It renders from the image lists instead, and this
+// says so: prod's tag survives a staging rollout, and staging's survives a
+// prod one.
 func TestMidDeployKeepsTheOtherEnvironmentsTag(t *testing.T) {
 	tests := []struct {
-		name     string
-		staging  []string
-		prod     []string
-		wantLine string
+		name    string
+		staging []string
+		prod    []string
+		wantRow []string // SERVICE, STATE, STAGING, PROD
 	}{
 		{
-			name:     "staging rolling, prod tag still shown",
-			staging:  []string{image("bifrost", "abc1234"), image("bifrost", "def5678")},
-			prod:     []string{image("bifrost", "abc1234")},
-			wantLine: "  prod:    abc1234",
+			name:    "staging rolling, prod tag still shown",
+			staging: []string{image("bifrost", "abc1234"), image("bifrost", "def5678")},
+			prod:    []string{image("bifrost", "abc1234")},
+			wantRow: []string{"bifrost", "⚠ deploying", "abc1234, def5678", "abc1234"},
 		},
 		{
-			name:     "prod rolling, staging tag still shown",
-			staging:  []string{image("bifrost", "abc1234")},
-			prod:     []string{image("bifrost", "abc1234"), image("bifrost", "def5678")},
-			wantLine: "  staging: abc1234",
+			name:    "prod rolling, staging tag still shown",
+			staging: []string{image("bifrost", "abc1234")},
+			prod:    []string{image("bifrost", "abc1234"), image("bifrost", "def5678")},
+			wantRow: []string{"bifrost", "⚠ deploying", "abc1234", "abc1234, def5678"},
 		},
 		{
-			name:     "no staging pods, prod tag still shown",
-			staging:  nil,
-			prod:     []string{image("bifrost", "abc1234")},
-			wantLine: "  prod:    abc1234",
+			name:    "no staging pods, prod tag still shown",
+			staging: nil,
+			prod:    []string{image("bifrost", "abc1234")},
+			wantRow: []string{"bifrost", "? unknown", "(no pods)", "abc1234"},
 		},
 		{
-			name:     "no prod pods, staging tag still shown",
-			staging:  []string{image("bifrost", "abc1234")},
-			prod:     nil,
-			wantLine: "  staging: abc1234",
+			name:    "no prod pods, staging tag still shown",
+			staging: []string{image("bifrost", "abc1234")},
+			prod:    nil,
+			wantRow: []string{"bifrost", "? unknown", "abc1234", "(no pods)"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			if v := statusOne(&buf, "bifrost", tc.staging, tc.prod, false, unknownBuild); v != indeterminate {
+			s := statusOf("bifrost", tc.staging, tc.prod, unknownBuild)
+			if v := s.verdict(); v != indeterminate {
 				t.Fatalf("verdict = %v, want indeterminate", v)
 			}
-			if !slices.Contains(strings.Split(buf.String(), "\n"), tc.wantLine) {
-				t.Errorf("output is missing %q:\n%s", tc.wantLine, buf.String())
+			var buf bytes.Buffer
+			writeTable(&buf, []serviceStatus{s}, time.Now())
+			if got := tableCells(t, buf.String(), "bifrost")[:4]; !slices.Equal(got, tc.wantRow) {
+				t.Errorf("row = %q, want %q\n%s", got, tc.wantRow, buf.String())
 			}
 		})
 	}
 }
 
+// tableCells splits app's row of a -v table into its cells, by the column
+// starts the header row sets. Splitting on runs of spaces would not do: a
+// mid-deploy cell is "abc1234, def5678" and a state is "✓ in sync".
+func tableCells(t *testing.T, out, app string) []string {
+	t.Helper()
+	lines := strings.Split(out, "\n")
+	header := []rune(lines[0])
+	var starts []int
+	for i, r := range header {
+		if r != ' ' && (i == 0 || header[i-1] == ' ') {
+			starts = append(starts, i)
+		}
+	}
+	for _, line := range lines[1:] {
+		row := []rune(line)
+		if !strings.HasPrefix(line, app+" ") {
+			continue
+		}
+		cells := make([]string, len(starts))
+		for i, st := range starts {
+			end := len(row)
+			if i+1 < len(starts) {
+				end = min(starts[i+1], len(row))
+			}
+			if st < len(row) {
+				cells[i] = strings.TrimSpace(string(row[st:end]))
+			}
+		}
+		return cells
+	}
+	t.Fatalf("no row for %s in:\n%s", app, out)
+	return nil
+}
+
 // TestUnparseableProdTagIsOutOfSync is DIVERGENCE #1 stated as a contract
 // rather than as a fixture exception: an unpinned prod is promotable, so
-// `bif status -q` names it and exits 1. ib.py exited 0 here. See
-// verboseDivergences for why Go is the correct side.
+// `bif status` names it and exits 1. ib.py exited 0 here. See
+// quietDivergences for why Go is the correct side.
 func TestUnparseableProdTagIsOutOfSync(t *testing.T) {
 	for _, tc := range []struct {
 		app        string
@@ -507,42 +411,48 @@ func TestUnparseableProdTagIsOutOfSync(t *testing.T) {
 				tc.app + "-prod":    {image(tc.app, tc.prodTag)},
 			}}
 
-			out, code := exec(t, cluster, "status", tc.app, "-q")
+			out, code := exec(t, cluster, "status", tc.app)
 			if out != tc.app+"\n" {
-				t.Errorf("quiet stdout = %q, want %q (ib.py printed nothing here)", out, tc.app+"\n")
+				t.Errorf("stdout = %q, want %q (ib.py printed nothing here)", out, tc.app+"\n")
 			}
 			if code != 1 {
 				t.Errorf("exit = %d, want 1 (ib.py exited 0 here)", code)
 			}
 
-			out, code = exec(t, cluster, "status", tc.app)
-			if !strings.Contains(out, "This will deploy "+tc.wantPromo+" to prod") {
-				t.Errorf("verbose output does not offer the promotion:\n%s", out)
+			out, code = exec(t, cluster, "status", tc.app, "-vv")
+			if want := "  promote: bif promote " + tc.app + " (deploys " + tc.wantPromo + " to prod)\n"; !strings.Contains(out, want) {
+				t.Errorf("-vv output does not offer the promotion %q:\n%s", want, out)
 			}
 			if code != 1 {
-				t.Errorf("verbose exit = %d, want 1", code)
+				t.Errorf("-vv exit = %d, want 1", code)
 			}
 		})
 	}
 }
 
-// TestOutOfSyncHintNamesBif: the hint has to name a command that exists and
-// does the thing. It said `ib promote` while promote lived only in the Python;
-// now that `bif promote` is the implementation and the Python is deleted,
-// pointing at `ib` would send an operator to a command that isn't there.
-func TestOutOfSyncHintNamesBif(t *testing.T) {
+// TestPromoteLineNamesEveryOutOfSyncService: -v ends with ONE promote command
+// covering everything out of sync, in the order the table listed them —
+// promote takes several services and shows one plan, so that line is the whole
+// next step. A mid-deploy service is not on it: promote would refuse a staging
+// rollout, and a prod one is not something to promote over.
+func TestPromoteLineNamesEveryOutOfSyncService(t *testing.T) {
 	c := fleet(t)
 	c.images["bifrost-prod"] = []string{image("bifrost", "def5678")}
+	c.images["identity-prod"] = []string{image("identity", "def5678")}
+	c.images["comms-staging"] = []string{image("comms", "abc1234"), image("comms", "def5678")}
 
-	out, code := exec(t, c, "status", "bifrost")
+	out, code := exec(t, c, "status", "-v")
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(out, bifPromoteHint+"bifrost\n") {
-		t.Errorf("status does not offer `bif promote bifrost`:\n%s", out)
+	if !strings.HasSuffix(out, "\nTo promote: bif promote bifrost identity\n") {
+		t.Errorf("output does not end with one promote line for bifrost and identity:\n%s", out)
 	}
-	if strings.Contains(out, oraclePromoteHint) {
-		t.Errorf("status still points at the Python CLI:\n%s", out)
+
+	// Nothing out of sync, no line at all — not an empty `bif promote`.
+	out, _ = exec(t, fleet(t), "status", "-v")
+	if strings.Contains(out, "To promote") {
+		t.Errorf("an in-sync fleet still printed a promote line:\n%s", out)
 	}
 }
 
@@ -589,8 +499,9 @@ func withRepoOverride(t *testing.T, svc string) string {
 }
 
 // TestExitCodesAllForms is the exit-status contract for every form of
-// `bif status`. The mapping is ib.py's and does not vary with -q: only a
-// definite out-of-sync exits 1.
+// `bif status`: only a definite out-of-sync exits 1, and how much is printed
+// never changes that — the default, -q, -v and -vv all agree, for one service
+// and for the whole fleet.
 func TestExitCodesAllForms(t *testing.T) {
 	// state applies one service's cluster state onto an otherwise in-sync
 	// fleet.
@@ -608,10 +519,11 @@ func TestExitCodesAllForms(t *testing.T) {
 
 	tests := []struct {
 		state string
-		// wantCode is the same for all four forms — that is the property.
+		// wantCode is the same for every form — that is the property.
 		wantCode int
-		// wantQuiet is what the -q forms print for bifrost.
-		wantQuiet string
+		// wantList is what the default and -q forms print. Only bifrost is
+		// interesting, so the whole-fleet list is exactly the one-service one.
+		wantList string
 	}{
 		{"in sync", 0, ""},
 		{"out of sync", 1, "bifrost\n"},
@@ -620,45 +532,34 @@ func TestExitCodesAllForms(t *testing.T) {
 		{"unreadable staging", 0, ""},
 	}
 
+	forms := []struct {
+		args []string
+		list bool // prints the list, so its stdout is checked too
+	}{
+		{[]string{"status"}, true},
+		{[]string{"status", "bifrost"}, true},
+		{[]string{"status", "-q"}, true},
+		{[]string{"status", "bifrost", "-q"}, true},
+		{[]string{"status", "-v"}, false},
+		{[]string{"status", "bifrost", "-v"}, false},
+		{[]string{"status", "-vv"}, false},
+		{[]string{"status", "bifrost", "-vv"}, false},
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.state, func(t *testing.T) {
 			st := states[tc.state]
-
-			// Form 2: bif status <app>
-			c := fleet(t)
-			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
-			if _, code := exec(t, c, "status", "bifrost"); code != tc.wantCode {
-				t.Errorf("`bif status bifrost` exit = %d, want %d", code, tc.wantCode)
-			}
-
-			// Form 4: bif status <app> -q
-			c = fleet(t)
-			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
-			out, code := exec(t, c, "status", "bifrost", "-q")
-			if code != tc.wantCode {
-				t.Errorf("`bif status bifrost -q` exit = %d, want %d", code, tc.wantCode)
-			}
-			if out != tc.wantQuiet {
-				t.Errorf("`bif status bifrost -q` stdout = %q, want %q", out, tc.wantQuiet)
-			}
-
-			// Form 1: bif status (whole fleet; every other service in sync)
-			c = fleet(t)
-			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
-			if _, code := exec(t, c, "status"); code != tc.wantCode {
-				t.Errorf("`bif status` exit = %d, want %d", code, tc.wantCode)
-			}
-
-			// Form 3: bif status -q. Only the interesting service prints, so
-			// the whole-fleet quiet output is exactly the one-service output.
-			c = fleet(t)
-			c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
-			out, code = exec(t, c, "status", "-q")
-			if code != tc.wantCode {
-				t.Errorf("`bif status -q` exit = %d, want %d", code, tc.wantCode)
-			}
-			if out != tc.wantQuiet {
-				t.Errorf("`bif status -q` stdout = %q, want %q", out, tc.wantQuiet)
+			for _, form := range forms {
+				c := fleet(t)
+				c.images["bifrost-staging"], c.images["bifrost-prod"] = st.staging, st.prod
+				out, code := exec(t, c, form.args...)
+				cmd := "`bif " + strings.Join(form.args, " ") + "`"
+				if code != tc.wantCode {
+					t.Errorf("%s exit = %d, want %d", cmd, code, tc.wantCode)
+				}
+				if form.list && out != tc.wantList {
+					t.Errorf("%s stdout = %q, want %q", cmd, out, tc.wantList)
+				}
 			}
 		})
 	}
@@ -701,6 +602,71 @@ func TestQuietFlagAcceptedAnywhere(t *testing.T) {
 				t.Errorf("stdout = %q, exit = %d; want %q and 1", out, code, "bifrost\n")
 			}
 		})
+	}
+}
+
+// TestVerbosityFlagsAcceptedAnywhere: -v, --verbose and -vv are filtered out
+// wherever they appear, as -q is, and repeating -v is -vv.
+func TestVerbosityFlagsAcceptedAnywhere(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want verbosity
+	}{
+		{[]string{"bifrost", "-v"}, tableOutput},
+		{[]string{"-v", "bifrost"}, tableOutput},
+		{[]string{"--verbose", "bifrost"}, tableOutput},
+		{[]string{"bifrost", "-vv"}, detailOutput},
+		{[]string{"-v", "bifrost", "-v"}, detailOutput},
+		{[]string{"-vv", "-v", "bifrost"}, detailOutput},
+		{[]string{"bifrost"}, listOutput},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			rest, got := takeVerbosity(tc.args)
+			if got != tc.want || !slices.Equal(rest, []string{"bifrost"}) {
+				t.Errorf("takeVerbosity = %v, %d; want [bifrost], %d", rest, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetailShowsThePods is what -vv adds over -v: the pods behind each tag,
+// with what makes a rollout stuck rather than landing — readiness, restarts,
+// a waiting reason — plus the image repository, which is not always the
+// service's name, and the build's duration and log.
+func TestDetailShowsThePods(t *testing.T) {
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	staging := envOf([]kube.PodInfo{
+		{Name: "bifrost-old-aaaaa", OwnerKind: "ReplicaSet", Phase: "Running",
+			Containers: []kube.ContainerInfo{{Image: image("fitness-api", "abc1234"), Ready: true}}},
+		{Name: "bifrost-new-bbbbb", OwnerKind: "ReplicaSet", Phase: "Running",
+			Containers: []kube.ContainerInfo{{Image: image("fitness-api", "def5678"), RestartCount: 4, WaitingReason: "CrashLoopBackOff"}}},
+		// A finished migration is not serving anything and must not be listed.
+		{Name: "bifrost-migrate-ccccc", OwnerKind: "Job", Phase: "Succeeded",
+			Containers: []kube.ContainerInfo{{Image: image("fitness-api", "0000000")}}},
+	})
+	prod := envOf([]kube.PodInfo{
+		{Name: "bifrost-prod-ddddd", OwnerKind: "ReplicaSet", Phase: "Running",
+			Containers: []kube.ContainerInfo{{Image: image("fitness-api", "abc1234"), Ready: true}}},
+	})
+	build := known(gcb.BuildStatus{
+		Status: "SUCCESS", SHA: "def5678", LogURL: "https://console.cloud.google.com/cloud-build/builds/x",
+		StartTime: now.Add(-3*time.Hour - 2*time.Minute), FinishTime: now.Add(-3 * time.Hour),
+	})
+
+	var buf bytes.Buffer
+	writeDetail(&buf, []serviceStatus{newServiceStatus("bifrost", staging, prod, build)}, now)
+
+	want := "bifrost  ⚠ deploying: staging is running 2 images\n" +
+		"  staging: abc1234, def5678\n" +
+		"    bifrost-old-aaaaa  abc1234  Running  1/1 ready\n" +
+		"    bifrost-new-bbbbb  def5678  Running  0/1 ready  4 restarts  CrashLoopBackOff\n" +
+		"  prod:    abc1234\n" +
+		"    bifrost-prod-ddddd  abc1234  Running  1/1 ready\n" +
+		"  image:   " + testRegistry + "/fitness-api\n" +
+		"  build:   ✓ def5678 succeeded 3h ago, took 2m\n" +
+		"           https://console.cloud.google.com/cloud-build/builds/x\n"
+	if got := buf.String(); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -778,11 +744,11 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, unreachableDigests, noPreview)
+	code := run(context.Background(), []string{"status", "bifrost", "-vv"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, unreachableDigests, noPreview)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(stdout.String(), "prod:    (no pods found)") {
+	if !strings.Contains(stdout.String(), "bifrost  ? unknown: no pods in prod\n") || !strings.Contains(stdout.String(), "  prod:    (no pods)\n") {
 		t.Errorf("stdout does not report the missing pods:\n%s", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "bifrost-prod") {
@@ -944,7 +910,7 @@ func TestBuildColumnUsesTheRegistryRepoName(t *testing.T) {
 	build := gcb.BuildStatus{Status: "SUCCESS", SHA: "0ab11f2", FinishTime: time.Now().Add(-3 * time.Hour)}
 
 	t.Run("keyed by repo name", func(t *testing.T) {
-		out, _, code := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{repo: build}}, "status", svc)
+		out, _, code := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{repo: build}}, "status", svc, "-vv")
 		if want := buildLinePrefix + "✓ 0ab11f2 succeeded 3h ago\n"; !strings.Contains(out, want) {
 			t.Errorf("output is missing %q:\n%s", want, out)
 		}
@@ -954,16 +920,16 @@ func TestBuildColumnUsesTheRegistryRepoName(t *testing.T) {
 	})
 
 	t.Run("keyed by service name finds nothing", func(t *testing.T) {
-		out, _, _ := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{svc: build}}, "status", svc)
+		out, _, _ := execBuilds(t, fleet(t), &fakeBuilds{byRepo: map[string]gcb.BuildStatus{svc: build}}, "status", svc, "-vv")
 		if want := buildLinePrefix + "(no recent build)\n"; !strings.Contains(out, want) {
 			t.Errorf("a build keyed by the service name must not be found (Cloud Build keys on %q):\n%s", repo, out)
 		}
 	})
 }
 
-// TestBuildColumnRendersInFlightAndCompleted drives the whole command for the
-// two states an operator actually looks for, and pins the build line's place
-// in the table: under prod, above the verdict.
+// TestBuildColumnRendersInFlightAndCompleted drives the whole -v table for the
+// two states an operator actually looks for: a build running and a build that
+// failed, each beside a service that is still in sync.
 func TestBuildColumnRendersInFlightAndCompleted(t *testing.T) {
 	now := time.Now()
 	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{
@@ -971,20 +937,19 @@ func TestBuildColumnRendersInFlightAndCompleted(t *testing.T) {
 		"identity": {Status: "FAILURE", SHA: "def5678", FinishTime: now.Add(-12 * time.Minute)},
 	}}
 
-	out, _, code := execBuilds(t, fleet(t), builds, "status")
+	out, _, code := execBuilds(t, fleet(t), builds, "status", "-v")
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0: a build is not a verdict", code)
 	}
 
-	wantBlocks := []string{
-		"  staging: abc1234\n  prod:    abc1234\n  build:   ◌ 0ab11f2 building (2m)\n\n✓ In sync\n",
-		"  staging: abc1234\n  prod:    abc1234\n  build:   ✗ def5678 failed 12m ago\n\n✓ In sync\n",
+	for app, want := range map[string][]string{
+		"bifrost":  {"bifrost", "✓ in sync", "abc1234", "abc1234", "◌ 0ab11f2 building (2m)"},
+		"identity": {"identity", "✓ in sync", "abc1234", "abc1234", "✗ def5678 failed 12m ago"},
 		// A service Cloud Build returned nothing for still gets a cell.
-		"  staging: abc1234\n  prod:    abc1234\n  build:   (no recent build)\n\n✓ In sync\n",
-	}
-	for _, want := range wantBlocks {
-		if !strings.Contains(out, want) {
-			t.Errorf("output is missing:\n%s\ngot:\n%s", want, out)
+		"comms": {"comms", "✓ in sync", "abc1234", "abc1234", "(no recent build)"},
+	} {
+		if got := tableCells(t, out, app); !slices.Equal(got, want) {
+			t.Errorf("%s row = %q, want %q", app, got, want)
 		}
 	}
 }
@@ -1002,7 +967,7 @@ func TestBuildLookupIsOneCallForTheWholeFleet(t *testing.T) {
 	}
 
 	builds := &fakeBuilds{byRepo: map[string]gcb.BuildStatus{}}
-	if _, _, code := execBuilds(t, fleet(t), builds, "status"); code != 0 {
+	if _, _, code := execBuilds(t, fleet(t), builds, "status", "-v"); code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	if dials, calls := builds.counts(); dials != 1 || calls != 1 {
@@ -1010,13 +975,16 @@ func TestBuildLookupIsOneCallForTheWholeFleet(t *testing.T) {
 	}
 }
 
-// TestQuietModeMakesNoBuildLookup: `bif status -q` is a scriptable contract —
-// bare app names, "*" for mid-deploy — so it gains no build text, and since
-// there is nothing to render there is nothing to ask for either. That is not
-// only tidiness: -q is what a script runs in a loop, and it stays exactly as
-// cheap and as offline as it was before the build column existed.
+// TestQuietModeMakesNoBuildLookup: the default list (and -q, its explicit
+// spelling) is a scriptable contract — bare app names, "*" for mid-deploy — so
+// it gains no build text, and since there is nothing to render there is
+// nothing to ask for either. That is not only tidiness: it is what a script
+// runs in a loop, and it stays exactly as cheap and as offline as it was
+// before the build column existed.
 func TestQuietModeMakesNoBuildLookup(t *testing.T) {
 	for _, args := range [][]string{
+		{"status"},
+		{"status", "bifrost"},
 		{"status", "-q"},
 		{"status", "bifrost", "-q"},
 	} {
@@ -1087,7 +1055,7 @@ func TestBuildColumnFailuresLeaveStatusIntact(t *testing.T) {
 			var code int
 			go func() {
 				defer close(done)
-				out, errOut, code = execBuilds(t, c, tc.builds, "status", "bifrost")
+				out, errOut, code = execBuilds(t, c, tc.builds, "status", "bifrost", "-vv")
 			}()
 			select {
 			case <-done:
@@ -1097,10 +1065,10 @@ func TestBuildColumnFailuresLeaveStatusIntact(t *testing.T) {
 
 			// The deployment status is untouched, down to the promote hint.
 			for _, want := range []string{
+				"bifrost  ✗ out of sync\n",
 				"  staging: abc1234\n",
 				"  prod:    def5678\n",
-				"\n✗ Out of sync\n",
-				bifPromoteHint + "bifrost\n",
+				"  promote: bif promote bifrost (deploys abc1234 to prod)\n",
 			} {
 				if !strings.Contains(out, want) {
 					t.Errorf("output is missing %q:\n%s", want, out)
@@ -1133,11 +1101,11 @@ func TestFailedBuildIsNotAVerdict(t *testing.T) {
 		"bifrost": {Status: "FAILURE", SHA: "0ab11f2", FinishTime: time.Now().Add(-12 * time.Minute)},
 	}}
 
-	out, _, code := execBuilds(t, fleet(t), builds, "status", "bifrost")
+	out, _, code := execBuilds(t, fleet(t), builds, "status", "bifrost", "-vv")
 	if code != 0 {
 		t.Errorf("exit = %d, want 0: a failed build must not make an in-sync service out of sync", code)
 	}
-	if !strings.Contains(out, "\n✓ In sync\n") {
+	if !strings.HasPrefix(out, "bifrost  ✓ in sync\n") {
 		t.Errorf("verdict changed with the build state:\n%s", out)
 	}
 	if !strings.Contains(out, buildLinePrefix+"✗ 0ab11f2 failed 12m ago\n") {
@@ -1592,11 +1560,15 @@ func TestAttentionWithAnAppIsScopedToThatApp(t *testing.T) {
 // would silently take something away — -q's offline guarantee, or the mode the
 // operator actually asked for — so the combination is an error, and it is one
 // diagnosed on argv alone, before anything is dialled.
-func TestAttentionAndQuietAreRefusedTogether(t *testing.T) {
+func TestOutputModesAreRefusedTogether(t *testing.T) {
 	for _, args := range [][]string{
 		{"status", "-q", "-a"},
 		{"status", "-a", "-q"},
 		{"status", "bifrost", "--quiet", "--attention"},
+		{"status", "-v", "-a"},
+		{"status", "-vv", "--attention"},
+		{"status", "-q", "-v"},
+		{"status", "bifrost", "--verbose", "--quiet"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			c, builds := attentionFleet(t, nil)
@@ -1607,8 +1579,8 @@ func TestAttentionAndQuietAreRefusedTogether(t *testing.T) {
 			if out != "" {
 				t.Errorf("stdout = %q, want nothing", out)
 			}
-			if !strings.Contains(errOut, "-q") || !strings.Contains(errOut, "--attention") {
-				t.Errorf("stderr = %q, want it to name both flags", errOut)
+			if !strings.Contains(errOut, "-q") || !strings.Contains(errOut, "-v") || !strings.Contains(errOut, "--attention") {
+				t.Errorf("stderr = %q, want it to name every mode", errOut)
 			}
 			if dials, calls := builds.counts(); dials != 0 || calls != 0 {
 				t.Errorf("dialled Cloud Build %d times and called it %d times before rejecting the invocation; want 0 and 0", dials, calls)
@@ -1643,16 +1615,15 @@ func distinctFleet(t *testing.T, staging, prod map[string]string) *fakeCluster {
 	return c
 }
 
-// sectionOrder returns the services whose `bif status` table appeared in out,
-// in the order they appeared. It matches the header line specifically rather
-// than searching for the name anywhere, because a service's name also shows up
-// in another service's output — the promote hint under a neighbouring "Out of
-// sync" says `bif promote <name>` — and a whole-output scan would count that.
+// sectionOrder returns the services whose `bif status -vv` section appeared in
+// out, in the order they appeared. It matches the unindented heading line
+// specifically rather than searching for the name anywhere, because a
+// service's name also shows up in its pods' names and in its promote line.
 func sectionOrder(out string) []string {
 	var apps []string
 	for _, line := range strings.Split(out, "\n") {
-		if app, ok := strings.CutSuffix(line, " deployment status:"); ok {
-			apps = append(apps, app)
+		if line != "" && !strings.HasPrefix(line, " ") {
+			apps = append(apps, strings.Fields(line)[0])
 		}
 	}
 	return apps
@@ -1667,7 +1638,7 @@ func TestStatusAcceptsSeveralServices(t *testing.T) {
 		map[string]string{"bifrost": "aaa1111", "comms": "bbb2222", "identity": "ccc3333"},
 		map[string]string{"bifrost": "ddd4444", "comms": "eee5555", "identity": "ccc3333"})
 
-	out, code := exec(t, c, "status", "bifrost", "comms", "identity")
+	out, code := exec(t, c, "status", "bifrost", "comms", "identity", "-vv")
 
 	if got := sectionOrder(out); !slices.Equal(got, []string{"bifrost", "comms", "identity"}) {
 		t.Errorf("rendered %v, want all three named services", got)
@@ -1702,7 +1673,7 @@ func TestStatusAcceptsSeveralServices(t *testing.T) {
 // fails.
 func TestStatusFollowsTheOrderGiven(t *testing.T) {
 	c := fleet(t)
-	out, code := exec(t, c, "status", "identity", "comms", "bifrost")
+	out, code := exec(t, c, "status", "identity", "comms", "bifrost", "-vv")
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0\n%s", code, out)
 	}
@@ -1717,7 +1688,7 @@ func TestStatusFollowsTheOrderGiven(t *testing.T) {
 // cluster round-trips for one answer.
 func TestStatusDedupesRepeatedNames(t *testing.T) {
 	c := fleet(t)
-	out, code := exec(t, c, "status", "bifrost", "comms", "bifrost")
+	out, code := exec(t, c, "status", "bifrost", "comms", "bifrost", "-vv")
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0\n%s", code, out)
 	}
@@ -1737,7 +1708,7 @@ func TestStatusDedupesRepeatedNames(t *testing.T) {
 // have written to prod first.
 func TestStatusValidatesEveryNameBeforeReadingTheCluster(t *testing.T) {
 	c := fleet(t)
-	out, code := exec(t, c, "status", "bifrost", "comms", "identtiy")
+	out, code := exec(t, c, "status", "bifrost", "comms", "identtiy", "-vv")
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -1748,7 +1719,7 @@ func TestStatusValidatesEveryNameBeforeReadingTheCluster(t *testing.T) {
 	if !strings.HasPrefix(out, "Unknown service: identtiy\n") {
 		t.Errorf("stdout = %q, want it to name the bad argument first", out)
 	}
-	if strings.Contains(out, "deployment status:") {
+	if strings.Contains(out, "in sync") {
 		t.Errorf("rendered a service despite the bad name:\n%s", out)
 	}
 }

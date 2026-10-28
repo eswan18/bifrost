@@ -53,11 +53,11 @@ import (
 const usage = `Deployment status and promotion helper for GKE services.
 
 Usage:
-    bif status               # Show status for all services
-    bif status <app>         # Show current images for staging and prod
+    bif status               # List out-of-sync services (* = mid-deploy)
+    bif status <app>         # Exit 0 if in sync, 1 if not (minimal output)
     bif status <app> <app>   # Same, for several services (order given)
-    bif status -q            # List out-of-sync services (* = mid-deploy)
-    bif status <app> -q      # Exit 0 if in sync, 1 if not (minimal output)
+    bif status -v            # Table: state, staging/prod tags, latest build
+    bif status -vv           # Everything: pods, readiness, image repo, build log
     bif status -a            # List everything noteworthy, and why (--attention)
     bif status <app> -a      # Same, for one service
     bif promote <app>        # Compare staging vs prod, offer to promote
