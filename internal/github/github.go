@@ -29,9 +29,10 @@ const maxK8sExtractBytes = 5 * 1024 * 1024 // 5MB
 var ErrNoBranch = errors.New("branch not found")
 
 type Client interface {
-	// BranchSHA returns the head commit SHA of repo's branch.
+	// BranchSHA returns the head commit SHA of owner/repo's branch. The
+	// owner picks the token (see New).
 	// A missing branch is ErrNoBranch; other failures are opaque errors.
-	BranchSHA(ctx context.Context, repo, branch string) (string, error)
+	BranchSHA(ctx context.Context, owner, repo, branch string) (string, error)
 
 	// FetchK8s downloads repo's tarball at ref and returns the k8s/ subtree
 	// as path→content, with paths relative to k8s/ (e.g.
@@ -41,32 +42,48 @@ type Client interface {
 	// fails the whole fetch rather than being normalized or silently
 	// dropped. A missing ref is ErrNoBranch; other failures are opaque
 	// errors.
-	FetchK8s(ctx context.Context, repo, ref string) (map[string][]byte, error)
+	FetchK8s(ctx context.Context, owner, repo, ref string) (map[string][]byte, error)
 }
 
 type client struct {
-	org     string
-	token   string
-	baseURL string
-	http    *http.Client
+	token       string
+	ownerTokens map[string]string // lower-cased owner → token
+	baseURL     string
+	http        *http.Client
 }
 
-func New(org, token string) Client {
-	return NewWithBaseURL(org, token, "https://api.github.com")
+// New builds a client that authenticates with ownerTokens[owner] (matched
+// case-insensitively) when the request's owner has one, else defaultToken.
+// Fine-grained GitHub tokens are scoped to a single owner, so a fleet spread
+// across several owners needs one token each.
+func New(defaultToken string, ownerTokens map[string]string) Client {
+	return NewWithBaseURL(defaultToken, ownerTokens, "https://api.github.com")
 }
 
 // NewWithBaseURL exists as a test seam; production code uses New.
-func NewWithBaseURL(org, token, baseURL string) Client {
-	return &client{org: org, token: token, baseURL: baseURL, http: &http.Client{Timeout: httpTimeout}}
+func NewWithBaseURL(defaultToken string, ownerTokens map[string]string, baseURL string) Client {
+	lowered := make(map[string]string, len(ownerTokens))
+	for o, t := range ownerTokens {
+		lowered[strings.ToLower(o)] = t
+	}
+	return &client{token: defaultToken, ownerTokens: lowered, baseURL: baseURL, http: &http.Client{Timeout: httpTimeout}}
 }
 
-func (c *client) BranchSHA(ctx context.Context, repo, branch string) (string, error) {
-	reqURL := fmt.Sprintf("%s/repos/%s/%s/branches/%s", c.baseURL, c.org, url.PathEscape(repo), url.PathEscape(branch))
+// tokenFor returns the token for owner, falling back to the default.
+func (c *client) tokenFor(owner string) string {
+	if t, ok := c.ownerTokens[strings.ToLower(owner)]; ok && t != "" {
+		return t
+	}
+	return c.token
+}
+
+func (c *client) BranchSHA(ctx context.Context, owner, repo, branch string) (string, error) {
+	reqURL := fmt.Sprintf("%s/repos/%s/%s/branches/%s", c.baseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(branch))
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.tokenFor(owner))
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	resp, err := c.http.Do(req)
@@ -99,13 +116,13 @@ func (c *client) BranchSHA(ctx context.Context, repo, branch string) (string, er
 // path→content, with paths relative to k8s/. Every returned path is
 // path.Clean-canonical and confined under k8s/; see the Client interface
 // doc for the enforced invariant.
-func (c *client) FetchK8s(ctx context.Context, repo, ref string) (map[string][]byte, error) {
-	reqURL := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", c.baseURL, c.org, url.PathEscape(repo), url.PathEscape(ref))
+func (c *client) FetchK8s(ctx context.Context, owner, repo, ref string) (map[string][]byte, error) {
+	reqURL := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", c.baseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.tokenFor(owner))
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	// This endpoint 302s to codeload.github.com; the default http.Client

@@ -57,9 +57,9 @@ func TestBranchSHA(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	sha, err := c.BranchSHA(context.Background(), "footstrike-api", "hae-cadence")
+	sha, err := c.BranchSHA(context.Background(), "eswan18", "footstrike-api", "hae-cadence")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestBranchSHA(t *testing.T) {
 		t.Errorf("sha = %q, want 49a402ab12cd", sha)
 	}
 
-	_, err = c.BranchSHA(context.Background(), "footstrike-api", "missing")
+	_, err = c.BranchSHA(context.Background(), "eswan18", "footstrike-api", "missing")
 	if !errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected ErrNoBranch, got %v", err)
 	}
@@ -78,8 +78,8 @@ func TestBranchSHAServerError(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
-	_, err := c.BranchSHA(context.Background(), "footstrike-api", "main")
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
+	_, err := c.BranchSHA(context.Background(), "eswan18", "footstrike-api", "main")
 	if err == nil || errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected non-ErrNoBranch error, got %v", err)
 	}
@@ -94,9 +94,9 @@ func TestBranchSHAWithSlash(t *testing.T) {
 		_, _ = w.Write([]byte(`{"name":"feat/x","commit":{"sha":"abc123def456"}}`))
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	sha, err := c.BranchSHA(context.Background(), "footstrike-api", "feat/x")
+	sha, err := c.BranchSHA(context.Background(), "eswan18", "footstrike-api", "feat/x")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -110,9 +110,9 @@ func TestBranchSHAMissingSHA(t *testing.T) {
 		_, _ = w.Write([]byte(`{"name":"main","commit":{}}`))
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	_, err := c.BranchSHA(context.Background(), "footstrike-api", "main")
+	_, err := c.BranchSHA(context.Background(), "eswan18", "footstrike-api", "main")
 	if err == nil {
 		t.Errorf("expected error for missing SHA, got nil")
 	}
@@ -136,9 +136,9 @@ func TestFetchK8s(t *testing.T) {
 		_, _ = w.Write(tarball)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	files, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	files, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "hae-cadence")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -162,9 +162,9 @@ func TestFetchK8sNotFound(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	_, err := c.FetchK8s(context.Background(), "footstrike-api", "missing")
+	_, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "missing")
 	if !errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected ErrNoBranch, got %v", err)
 	}
@@ -175,9 +175,9 @@ func TestFetchK8sServerError(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	_, err := c.FetchK8s(context.Background(), "footstrike-api", "main")
+	_, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "main")
 	if err == nil || errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected non-ErrNoBranch error, got %v", err)
 	}
@@ -194,9 +194,9 @@ func TestFetchK8sRefWithSlash(t *testing.T) {
 		_, _ = w.Write(tarball)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	if _, err := c.FetchK8s(context.Background(), "footstrike-api", "feat/x"); err != nil {
+	if _, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "feat/x"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -210,9 +210,9 @@ func TestFetchK8sExceedsExtractionCap(t *testing.T) {
 		_, _ = w.Write(tarball)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	_, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "hae-cadence")
 	if err == nil {
 		t.Fatalf("expected an error for an oversized tarball, got nil")
 	}
@@ -239,9 +239,9 @@ func TestFetchK8sRejectsNonCanonicalPaths(t *testing.T) {
 				_, _ = w.Write(tarball)
 			}))
 			defer srv.Close()
-			c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+			c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-			_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+			_, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "hae-cadence")
 			if err == nil {
 				t.Fatalf("expected an error for entry %q, got nil", tt.entry)
 			}
@@ -267,13 +267,59 @@ func TestFetchK8sAggregateCapAcrossEntries(t *testing.T) {
 		_, _ = w.Write(tarball)
 	}))
 	defer srv.Close()
-	c := NewWithBaseURL("eswan18", "test-pat", srv.URL)
+	c := NewWithBaseURL("test-pat", nil, srv.URL)
 
-	_, err := c.FetchK8s(context.Background(), "footstrike-api", "hae-cadence")
+	_, err := c.FetchK8s(context.Background(), "eswan18", "footstrike-api", "hae-cadence")
 	if err == nil {
 		t.Fatalf("expected an error when combined entry sizes exceed the extraction cap, got nil")
 	}
 	if errors.Is(err, ErrNoBranch) {
 		t.Errorf("expected non-ErrNoBranch error, got %v", err)
+	}
+}
+
+func TestOwnerInURLAndTokenPerOwner(t *testing.T) {
+	tarball := buildTarGz(t, map[string]string{"r-1/k8s/a.yaml": "a\n"})
+	var gotPaths, gotAuths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotAuths = append(gotAuths, r.Header.Get("Authorization"))
+		if strings.Contains(r.URL.Path, "/tarball/") {
+			_, _ = w.Write(tarball)
+			return
+		}
+		_, _ = w.Write([]byte(`{"commit":{"sha":"abc"}}`))
+	}))
+	defer srv.Close()
+	c := NewWithBaseURL("default-pat", map[string]string{"Footstrike": "fs-pat"}, srv.URL)
+	ctx := context.Background()
+
+	if _, err := c.BranchSHA(ctx, "Footstrike", "footstrike-api", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.BranchSHA(ctx, "footstrike", "footstrike-api", "main"); err != nil { // case-insensitive
+		t.Fatal(err)
+	}
+	if _, err := c.BranchSHA(ctx, "eswan18", "identity", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.FetchK8s(ctx, "Footstrike", "footstrike-api", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.FetchK8s(ctx, "eswan18", "identity", "main"); err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{
+		"/repos/Footstrike/footstrike-api/branches/main",
+		"/repos/footstrike/footstrike-api/branches/main",
+		"/repos/eswan18/identity/branches/main",
+		"/repos/Footstrike/footstrike-api/tarball/main",
+		"/repos/eswan18/identity/tarball/main",
+	}
+	wantAuths := []string{"Bearer fs-pat", "Bearer fs-pat", "Bearer default-pat", "Bearer fs-pat", "Bearer default-pat"}
+	for i := range wantPaths {
+		if gotPaths[i] != wantPaths[i] || gotAuths[i] != wantAuths[i] {
+			t.Errorf("request %d = %s / %s, want %s / %s", i, gotPaths[i], gotAuths[i], wantPaths[i], wantAuths[i])
+		}
 	}
 }

@@ -18,9 +18,10 @@ type Config struct {
 	OIDCClientSecret   string
 	SessionSecret      []byte
 	ArgoCDNamespace    string
-	// GitHubOrg is the single org every fleet repo lives under; per-service
-	// repo names (when they differ from the service name) live in the
-	// registry now (see internal/registry.Registry.RepoFor), not here.
+	// GitHubOrg is the DEFAULT GitHub owner for fleet repos. A service whose
+	// repo lives under a different owner sets `owner:` in the registry (see
+	// internal/registry.Registry.OwnerFor); per-service repo names live there
+	// too (RepoFor).
 	GitHubOrg  string
 	GCPProject string // for Cloud Build status; "" disables it
 	// DisplayLocation renders timestamps ("today 09:58", next job runs) in the
@@ -30,9 +31,13 @@ type Config struct {
 	// Which services are previewable, and their Neon references, live in the
 	// registry (see internal/registry/registry.go), not here — these are
 	// just the secrets/tokens the orchestrator needs to act on it.
-	GitHubToken     string // PAT for branch lookups on private repos
-	NeonAPIKey      string // Neon API key for branch create/delete
-	PreviewAPIToken string // static bearer token for the preview API (CLI use)
+	GitHubToken string // default PAT for branch lookups on private repos
+	// GitHubOwnerTokens holds per-owner PATs from GITHUB_TOKEN_<OWNER> env
+	// vars, keyed by the lower-cased owner (fine-grained tokens are scoped to
+	// one owner). Owners without an entry use GitHubToken.
+	GitHubOwnerTokens map[string]string
+	NeonAPIKey        string // Neon API key for branch create/delete
+	PreviewAPIToken   string // static bearer token for the preview API (CLI use)
 	// PreviewOAuthClientID is the OAuth client the preview dashboard's
 	// APP_OAUTH_CLIENT_ID resolves to (the wildcard-registered staging
 	// dashboard client — see the 3c orchestration plan). Optional; empty
@@ -40,6 +45,11 @@ type Config struct {
 	// load time.
 	PreviewOAuthClientID string
 }
+
+// ownerTokenPrefix prefixes the per-owner GitHub token env vars:
+// GITHUB_TOKEN_FOOTSTRIKE holds the token for owner "Footstrike" (matched
+// case-insensitively, so the owner is stored lower-cased).
+const ownerTokenPrefix = "GITHUB_TOKEN_"
 
 func Load() (*Config, error) {
 	m := map[string]string{}
@@ -53,6 +63,11 @@ func Load() (*Config, error) {
 		"PREVIEW_OAUTH_CLIENT_ID",
 	} {
 		m[k] = os.Getenv(k)
+	}
+	for _, kv := range os.Environ() {
+		if k, _, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, ownerTokenPrefix) {
+			m[k] = os.Getenv(k)
+		}
 	}
 	return loadFromMap(m)
 }
@@ -90,6 +105,13 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		org = "eswan18"
 	}
 
+	ownerTokens := map[string]string{}
+	for k, v := range m {
+		if owner, ok := strings.CutPrefix(k, ownerTokenPrefix); ok && owner != "" && v != "" {
+			ownerTokens[strings.ToLower(owner)] = v
+		}
+	}
+
 	tz := m["DISPLAY_TIMEZONE"]
 	if tz == "" {
 		tz = "America/New_York"
@@ -114,6 +136,7 @@ func loadFromMap(m map[string]string) (*Config, error) {
 		GCPProject:           m["GCP_PROJECT"],
 		DisplayLocation:      loc,
 		GitHubToken:          m["GITHUB_TOKEN"],
+		GitHubOwnerTokens:    ownerTokens,
 		NeonAPIKey:           m["NEON_API_KEY"],
 		PreviewAPIToken:      m["PREVIEW_API_TOKEN"],
 		PreviewOAuthClientID: m["PREVIEW_OAUTH_CLIENT_ID"],

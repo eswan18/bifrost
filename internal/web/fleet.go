@@ -324,7 +324,7 @@ func groupByNamespace(pods []kube.PodInfo, rsets []kube.ReplicaSetInfo, cronjobs
 // assembleApp derives one service's full view from its two environments' raw
 // reads. Pure derivation — all cluster I/O happens up front in assembleFleet.
 func (h *Handlers) assembleApp(svc string, now time.Time, argo map[string]kube.AppStatus, builds map[string]gcb.BuildStatus, sRaw, pRaw envRaw) appView {
-	org := h.Cfg.GitHubOrg
+	org := h.Registry.OwnerFor(svc, h.Cfg.GitHubOrg)
 	repo := h.Registry.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
 	urls := h.Registry[svc].URLs

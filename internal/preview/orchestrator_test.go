@@ -51,7 +51,7 @@ type fakeGitHub struct {
 // says otherwise.
 const defaultBranchSHA = "deadbeef0123456789"
 
-func (f *fakeGitHub) BranchSHA(_ context.Context, repo, _ string) (string, error) {
+func (f *fakeGitHub) BranchSHA(_ context.Context, _, repo, _ string) (string, error) {
 	if f.hook != nil {
 		f.hook(repo)
 	}
@@ -67,7 +67,7 @@ func (f *fakeGitHub) BranchSHA(_ context.Context, repo, _ string) (string, error
 	return "", github.ErrNoBranch
 }
 
-func (f *fakeGitHub) FetchK8s(_ context.Context, repo, _ string) (map[string][]byte, error) {
+func (f *fakeGitHub) FetchK8s(_ context.Context, _, repo, _ string) (map[string][]byte, error) {
 	if err, ok := f.fetchErr[repo]; ok {
 		return nil, err
 	}

@@ -648,3 +648,34 @@ foo:
 		}
 	})
 }
+
+func TestOwnerFor(t *testing.T) {
+	reg := Registry{
+		"footstrike-api": {Owner: "Footstrike"},
+		"identity":       {},
+	}
+	if got := reg.OwnerFor("footstrike-api", "eswan18"); got != "Footstrike" {
+		t.Errorf("override: got %q, want Footstrike", got)
+	}
+	if got := reg.OwnerFor("identity", "eswan18"); got != "eswan18" {
+		t.Errorf("no override: got %q, want eswan18", got)
+	}
+	if got := reg.OwnerFor("unknown", "eswan18"); got != "eswan18" {
+		t.Errorf("absent: got %q, want eswan18", got)
+	}
+}
+
+func TestEmbeddedFootstrikeOwner(t *testing.T) {
+	reg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, svc := range []string{"footstrike-api", "footstrike-dashboard"} {
+		if got := reg.OwnerFor(svc, "eswan18"); got != "Footstrike" {
+			t.Errorf("OwnerFor(%s) = %q, want Footstrike", svc, got)
+		}
+	}
+	if got := reg.OwnerFor("identity", "eswan18"); got != "eswan18" {
+		t.Errorf("OwnerFor(identity) = %q, want eswan18", got)
+	}
+}
