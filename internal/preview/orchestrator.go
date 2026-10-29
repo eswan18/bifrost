@@ -770,7 +770,7 @@ func (o *Orchestrator) resolveMembers(ctx context.Context, branch string) ([]str
 	var members []string
 	shas := map[string]string{}
 	for _, svc := range o.Registry.Names() {
-		sha, err := o.GitHub.BranchSHA(ctx, o.Fleet.RepoFor(svc), branch)
+		sha, err := o.GitHub.BranchSHA(ctx, o.Fleet.OwnerFor(svc, o.Cfg.GitHubOrg), o.Fleet.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
 			continue
@@ -1433,7 +1433,7 @@ func (o *Orchestrator) copySecrets(ctx context.Context, ns string, members []str
 func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch string, members []string, built map[string]builtImage) (map[string]string, error) {
 	appImages := make(map[string]string, len(members))
 	for _, svc := range members {
-		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Fleet.RepoFor(svc), branch)
+		k8sFiles, err := o.GitHub.FetchK8s(ctx, o.Fleet.OwnerFor(svc, o.Cfg.GitHubOrg), o.Fleet.RepoFor(svc), branch)
 		if err != nil {
 			return nil, fmt.Errorf("fetch k8s files for %s: %w", svc, err)
 		}

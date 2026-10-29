@@ -162,7 +162,7 @@ func main() {
 	// is off, not misconfigured.
 	var ghClient github.Client
 	if cfg.GitHubToken != "" {
-		ghClient = github.New(cfg.GitHubOrg, cfg.GitHubToken)
+		ghClient = github.New(cfg.GitHubToken, cfg.GitHubOwnerTokens)
 	}
 	var neonClient neon.Client
 	if cfg.NeonAPIKey != "" {

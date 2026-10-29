@@ -45,6 +45,11 @@ types:
   `orchestrator.go`'s `resolveMembers`) and fetches k8s manifests
   (`FetchK8s`, `renderAndApply`) — get it wrong there and the service either
   never joins a preview or fails to render one.
+- **`owner`** (optional) — the GitHub user/org that owns the repo, when it
+  differs from the default owner (`GITHUB_ORG`, default `eswan18`). Fine-grained
+  tokens are scoped to one owner, so a non-default owner also needs a token in
+  the `GITHUB_TOKEN_<OWNER>` env var (owner uppercased, e.g.
+  `GITHUB_TOKEN_FOOTSTRIKE`); otherwise the default `GITHUB_TOKEN` is used.
 - **`urls.staging`** / **`urls.prod`** (both optional) — the public URL for
   the "open ↗" link on that environment's card. Leave a field (or the whole
   `urls:` block) empty for a service with no ingress on that environment —

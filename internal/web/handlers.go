@@ -303,7 +303,7 @@ func (h *Handlers) StatusJSON(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown service", http.StatusNotFound)
 		return
 	}
-	org, repo := h.Cfg.GitHubOrg, h.Registry.RepoFor(svc)
+	org, repo := h.Registry.OwnerFor(svc, h.Cfg.GitHubOrg), h.Registry.RepoFor(svc)
 	loc := h.Cfg.DisplayLocation
 
 	var sRaw, pRaw envRaw

@@ -93,6 +93,7 @@ haruspex:
 # {{ config KEY }} is an operator-supplied value from bifrost's config.
 # Neon references live here and never come from the branch under test.
 footstrike-api:
+  owner: Footstrike
   urls:
     staging: https://api.staging.footstrike.run
     prod: https://api.footstrike.run
@@ -155,6 +156,7 @@ footstrike-api:
     migrate: ["alembic", "upgrade", "head"]
 
 footstrike-dashboard:
+  owner: Footstrike
   urls:
     staging: https://staging.footstrike.run
     prod: https://app.footstrike.run

@@ -183,7 +183,7 @@ func (o *Orchestrator) movedMembers(ctx context.Context, ns kube.NamespaceInfo) 
 
 	var changes []string
 	for _, svc := range splitAnnotationList(ns.Annotations[appsAnnotationKey]) {
-		sha, err := o.GitHub.BranchSHA(ctx, o.Fleet.RepoFor(svc), branch)
+		sha, err := o.GitHub.BranchSHA(ctx, o.Fleet.OwnerFor(svc, o.Cfg.GitHubOrg), o.Fleet.RepoFor(svc), branch)
 		switch {
 		case errors.Is(err, github.ErrNoBranch):
 			return nil, fmt.Errorf("%s: %w", svc, errBranchGone)

@@ -106,3 +106,34 @@ func minimalValidEnv() map[string]string {
 		"SESSION_SECRET":       "12345678901234567890123456789012",
 	}
 }
+
+func TestGitHubOwnerTokens(t *testing.T) {
+	env := minimalValidEnv()
+	env["GITHUB_TOKEN"] = "default"
+	env["GITHUB_TOKEN_FOOTSTRIKE"] = "fs"
+	env["GITHUB_TOKEN_EMPTY"] = ""
+	cfg, err := loadFromMap(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHubToken != "default" {
+		t.Errorf("GitHubToken = %q, want default", cfg.GitHubToken)
+	}
+	if len(cfg.GitHubOwnerTokens) != 1 || cfg.GitHubOwnerTokens["footstrike"] != "fs" {
+		t.Errorf("GitHubOwnerTokens = %v, want {footstrike: fs}", cfg.GitHubOwnerTokens)
+	}
+}
+
+func TestLoadReadsOwnerTokenEnv(t *testing.T) {
+	for k, v := range minimalValidEnv() {
+		t.Setenv(k, v)
+	}
+	t.Setenv("GITHUB_TOKEN_FOOTSTRIKE", "fs")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHubOwnerTokens["footstrike"] != "fs" {
+		t.Errorf("GitHubOwnerTokens = %v", cfg.GitHubOwnerTokens)
+	}
+}

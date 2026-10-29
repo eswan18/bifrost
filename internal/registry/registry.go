@@ -98,7 +98,8 @@ type URLs struct {
 
 // Service is one app in the fleet.
 type Service struct {
-	Repo    string   `json:"repo,omitempty"` // defaults to the service name; see RepoFor
+	Repo    string   `json:"repo,omitempty"`  // defaults to the service name; see RepoFor
+	Owner   string   `json:"owner,omitempty"` // GitHub owner (user or org); defaults to the configured default owner; see OwnerFor
 	URLs    URLs     `json:"urls,omitempty"`
 	Preview *Preview `json:"preview,omitempty"` // nil = not onboarded to preview environments
 }
@@ -186,4 +187,14 @@ func (r Registry) RepoFor(svc string) string {
 		return s.Repo
 	}
 	return svc
+}
+
+// OwnerFor returns the GitHub owner of svc's repo: its registry override when
+// one is set, else fallback (normally config.GitHubOrg). Most of the fleet
+// lives under one owner; the override exists for repos that moved elsewhere.
+func (r Registry) OwnerFor(svc, fallback string) string {
+	if s, ok := r[svc]; ok && s.Owner != "" {
+		return s.Owner
+	}
+	return fallback
 }
