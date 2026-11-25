@@ -1,13 +1,46 @@
 # Bifrost
 
-An opinionated application state dashboard that supports promotion (staging -> prod) and rollback.
+Bifrost is the deploy tool for a small fleet of services running on one GKE
+cluster. It answers "what's running in staging and prod?" and moves a
+service's staging image to prod. Staging updates itself: CI builds an image,
+ArgoCD Image Updater rolls it onto staging. Prod only changes when someone
+promotes it, and that is what bifrost is for.
 
-Built atop Argo CD and Kubernetes.
+It comes in two parts that share one implementation of the promote logic and
+one list of services:
 
-## What it does
+- **The web UI** (`cmd/bifrost`), a Go server running in the cluster behind
+  OIDC login. It shows status, promotes and rolls back, watches CronJobs, and
+  creates and tears down preview environments. It is built to work from a
+  phone.
+- **The `bif` CLI** (`cmd/bif`), which does the same status and promote work
+  from a terminal. It reads the cluster directly, so it still works when the
+  bifrost server is down, including to recover bifrost itself. It also creates
+  and tears down per-branch preview environments.
 
-Three tabs (real routes; each has a polling fragment endpoint that swaps its
-body in place):
+Both are built on Argo CD and Kubernetes. For the regular staging and prod
+environments, a promote or rollback patches the service's ArgoCD `Application`,
+and ArgoCD does the actual deploy. Preview environments work differently:
+bifrost renders and applies their manifests itself.
+
+What's in the repo:
+
+| Path | What it is |
+|------|------------|
+| `cmd/bifrost` | The web server |
+| `cmd/bif` | The CLI |
+| `internal/registry/registry.yaml` | The fleet: every service bifrost knows about, its repo, URLs, and preview config. Embedded in both binaries |
+| `internal/promote` | The staging→prod decision logic both halves share |
+| `internal/preview` | Preview-environment orchestration (namespaces, Neon branches, Cloud Build) |
+| `templates/`, `static/` | The UI's server-rendered HTML and hand-written CSS |
+| `k8s/` | Bifrost's own deployment (Kustomize base + staging/prod overlays, ArgoCD apps) |
+| `docs/` | Runbooks: `preview-environments.md`, `adding-a-service.md` |
+| `scripts/`, `testdata/oracle/` | Fixtures captured from the retired Python `ib.py`, which the Go port is tested against |
+
+## The web UI
+
+Four tabs. Each has its own route and a fragment endpoint that it polls to
+refresh in place:
 
 - **Overview** (`/`) — an attention queue (crashlooping apps, failed jobs,
   drift ready to promote), fleet counts, and running / recently-failed /
@@ -18,6 +51,11 @@ body in place):
 - **Jobs** (`/jobs`, `?app=` filter) — every CronJob across both environments,
   each tagged `stg`/`prod`, with last-run state (incl. exit code), duration,
   and next run.
+- **Previews** (`/previews`, `/previews/{tag}` for one) — every preview
+  environment with its branch, phase, expiry and URLs, plus forms to create one
+  from a branch and tear one down. These forms call the same `/api/previews`
+  endpoints as `bif preview`. Those endpoints accept either a browser session
+  or the CLI's bearer token (see "Preview environments" below).
 
 Promote and roll back are confirmed in a hash-diff modal. Both re-validate live
 cluster state server-side before patching (a stale hash is refused) and patch
@@ -94,6 +132,14 @@ Requires these env vars to run (see `internal/config/config.go`):
     OIDC_CLIENT_ID=...
     OIDC_CLIENT_SECRET=...
     SESSION_SECRET=$(openssl rand -base64 32)
+
+Optional ones turn features on or override defaults. `GCP_PROJECT` enables the
+CI-build column. `GITHUB_TOKEN`, `NEON_API_KEY`, `PREVIEW_API_TOKEN` and
+`PREVIEW_OAUTH_CLIENT_ID` are what preview environments need. For a service
+whose registry entry sets `owner:`, `GITHUB_TOKEN_<OWNER>` (e.g.
+`GITHUB_TOKEN_FOOTSTRIKE`) supplies the token for that owner's repos, because a
+fine-grained PAT is scoped to one owner. The default token covers everything
+else.
 
 The two `OIDC_ISSUER_*` vars exist because in-cluster pods can't resolve the
 issuer's public hostname: discovery is fetched from the internal URL and the
@@ -302,12 +348,12 @@ service so it stands alone under `grep`:
 
 Four conditions qualify: **staging and prod differ** (something to promote);
 **two or more distinct images inside one environment** (a deploy in progress —
-what `-q` marks with `*`); **a build running right now** (`QUEUED`/`PENDING`/
+what the default list marks with `*`); **a build running right now** (`QUEUED`/`PENDING`/
 `WORKING`); and **the newest successful build's image is not what staging is
 running**.
 
 That last one is the point of the mode. The other three are already visible
-somewhere — in the table, in `-q`, on the Apps tab — but a green build that
+somewhere — in the default list, in the `-v` table, on the Apps tab — but a green build that
 never reached staging is visible nowhere, and it is the signature of a failure
 this fleet has actually hit: when ArgoCD's `github-eswan18-repocreds` PAT
 expires, the Applications go to `ComparisonError` and **syncs silently stop**.
@@ -379,7 +425,7 @@ four checks are unknowable without build data, so the run says on *stdout* that
 they were skipped, prints whatever the two cluster-only checks found, and exits
 **1**. `0` is reserved for "I checked all four and the fleet is clean", because
 that is the only state in which this command's silence means anything. This is a
-deliberate departure from the build column's best-effort degradation below,
+deliberate departure from the build column's best-effort degradation above,
 which is right for `status` — whose answer comes from the cluster — and wrong
 here.
 
