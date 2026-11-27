@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haruspex-staging-env-config
+data:
+  ENV: "staging"
+  APP_BASE_URL: "https://staging.haruspex.fyi"
+  IDP_AUDIENCE: "ethanswan:haruspex"
+  MCP_RESOURCE_URL: "https://staging.haruspex.fyi/mcp"
+  IDP_BASE_URL: "http://identity.identity-staging.svc.cluster.local"
+  IDP_PUBLIC_URL: "https://identity-staging.tailc06f30.ts.net"
+  PUBSUB_TOPIC: "haruspex-events-staging"
+  SENTRY_DSN: "https://42fb7fde7d5842831f2324ed33c7f50f@o4509062063587328.ingest.us.sentry.io/4509062066012160"

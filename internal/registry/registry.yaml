@@ -24,6 +24,19 @@ haruspex:
     staging: https://staging.haruspex.fyi
     prod: https://haruspex.fyi
   preview:
+    # haruspex's manifests are not where every other repo's are. The
+    # forecasting -> haruspex rename stood these two trees up beside the old
+    # k8s/base and k8s/staging so both sets of ArgoCD Applications could run
+    # at once (haruspex#194), then deleted the old pair (haruspex#196), and
+    # the prefixed names were what was left. Nothing read them but ArgoCD, so
+    # nothing noticed -- except previews, which could not find a base at all
+    # and failed every haruspex `up` from that day until these two lines.
+    #
+    # Renaming the directories back is the other fix, and is not free: each
+    # ArgoCD Application's `path:` has to be re-pointed by hand at the moment
+    # the rename merges, prod's included. If that is ever done, delete these.
+    baseDir: haruspex-base
+    stagingDir: haruspex-staging
     neon:
       project: blue-term-48495338
       database: neondb

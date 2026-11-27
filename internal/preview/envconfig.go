@@ -9,15 +9,18 @@ import (
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
-// stagingConfigMapPath is where github.FetchK8s's returned map carries the
-// service's staging ConfigMap (path relative to k8s/), the baseline every
-// preview's env config starts from.
-const stagingConfigMapPath = "staging/configmap-env.yaml"
+// stagingConfigMapFile is the file in a service's staging overlay holding its
+// staging ConfigMap, the baseline every preview's env config starts from.
+const stagingConfigMapFile = "configmap-env.yaml"
 
 // parseStagingEnv extracts the staging ConfigMap's data map from a member's
-// fetched k8s/ tree. A repo with no staging/configmap-env.yaml (e.g. the
-// dashboard, which is env-agnostic) yields an empty map, not an error.
-func parseStagingEnv(k8sFiles map[string][]byte) (map[string]string, error) {
+// fetched k8s/ tree (github.FetchK8s's map, paths relative to k8s/).
+// stagingDir is the directory its staging overlay is in, "staging" for every
+// repo but haruspex (registry.Preview.K8sStagingDir). A repo with no
+// configmap-env.yaml there (e.g. the dashboard, which is env-agnostic) yields
+// an empty map, not an error.
+func parseStagingEnv(k8sFiles map[string][]byte, stagingDir string) (map[string]string, error) {
+	stagingConfigMapPath := stagingDir + "/" + stagingConfigMapFile
 	content, ok := k8sFiles[stagingConfigMapPath]
 	if !ok {
 		return map[string]string{}, nil

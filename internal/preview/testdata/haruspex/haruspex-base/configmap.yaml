@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: haruspex-config
+data:
+  K8S: "1"
+  NODE_ENV: "production"
+  GCP_PROJECT_ID: "ethans-services"

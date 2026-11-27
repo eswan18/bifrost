@@ -2,6 +2,7 @@ package registry
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -677,5 +678,75 @@ func TestEmbeddedFootstrikeOwner(t *testing.T) {
 	}
 	if got := reg.OwnerFor("identity", "eswan18"); got != "eswan18" {
 		t.Errorf("OwnerFor(identity) = %q, want eswan18", got)
+	}
+}
+
+// TestPreviewK8sDirs covers where a preview looks for a repo's manifests
+// under k8s/: the fleet's base and staging unless the entry says otherwise.
+// haruspex is why it can say otherwise -- see its entry in registry.yaml.
+func TestPreviewK8sDirs(t *testing.T) {
+	t.Run("default to the fleet's base and staging", func(t *testing.T) {
+		reg, err := parseRegistry([]byte(`
+foo:
+  preview:
+    env:
+      A: b
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		p := reg["foo"].Preview
+		if got := p.K8sBaseDir(); got != "base" {
+			t.Errorf("K8sBaseDir() = %q, want %q", got, "base")
+		}
+		if got := p.K8sStagingDir(); got != "staging" {
+			t.Errorf("K8sStagingDir() = %q, want %q", got, "staging")
+		}
+	})
+
+	t.Run("baseDir and stagingDir override them, each on its own", func(t *testing.T) {
+		reg, err := parseRegistry([]byte(`
+both:
+  preview:
+    baseDir: both-base
+    stagingDir: both-staging
+onlyBase:
+  preview:
+    baseDir: elsewhere
+`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		both := reg["both"].Preview
+		if got := both.K8sBaseDir(); got != "both-base" {
+			t.Errorf("both: K8sBaseDir() = %q, want %q", got, "both-base")
+		}
+		if got := both.K8sStagingDir(); got != "both-staging" {
+			t.Errorf("both: K8sStagingDir() = %q, want %q", got, "both-staging")
+		}
+		onlyBase := reg["onlyBase"].Preview
+		if got := onlyBase.K8sBaseDir(); got != "elsewhere" {
+			t.Errorf("onlyBase: K8sBaseDir() = %q, want %q", got, "elsewhere")
+		}
+		if got := onlyBase.K8sStagingDir(); got != "staging" {
+			t.Errorf("onlyBase: K8sStagingDir() = %q, want the default %q", got, "staging")
+		}
+	})
+
+	// A directory NAME, never a path. The value is joined onto k8s/ to pick
+	// files out of a fetched tree, so anything with a separator or a dot
+	// segment in it is a typo at best.
+	for _, key := range []string{"baseDir", "stagingDir"} {
+		for _, bad := range []string{"k8s/base", "base/", "/base", "..", ".", "../base"} {
+			t.Run(key+" "+bad+" errors", func(t *testing.T) {
+				_, err := parseRegistry([]byte("foo:\n  preview:\n    " + key + ": \"" + bad + "\"\n"))
+				if err == nil {
+					t.Fatalf("expected an error for %s: %q, got nil", key, bad)
+				}
+				if !strings.Contains(err.Error(), "foo") || !strings.Contains(err.Error(), key) {
+					t.Errorf("error = %q, want it to name the service and the key", err.Error())
+				}
+			})
+		}
 	}
 }

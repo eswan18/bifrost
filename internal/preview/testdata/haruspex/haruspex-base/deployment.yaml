@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: haruspex
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: haruspex
+  template:
+    metadata:
+      labels:
+        app: haruspex
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: haruspex
+      tolerations:
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: haruspex
+          # A tag that deliberately does not exist, and must never be
+          # published. ArgoCD's kustomize image override replaces this line in
+          # both environments, and the override is keyed on this image's NAME
+          # -- so anything that breaks the match (a package rename, a typo)
+          # falls back to whatever is literally written here.
+          #
+          # That fallback should FAIL, not succeed. maxUnavailable floors to 0
+          # at these replica counts, so an unpullable tag stalls the rollout
+          # and the running pods keep serving. A real tag here would instead
+          # pull cleanly and silently roll the environment back to whatever
+          # that build was, with nothing to alert on.
+          #
+          # This previously said :latest, which worked as a tripwire only by
+          # accident -- CI stopped publishing that tag in #165 -- and would
+          # have quietly become a moving target if it were ever restored.
+          image: us-central1-docker.pkg.dev/ethans-services/containers/haruspex:override-required
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "5m"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets"
+              readOnly: true
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true

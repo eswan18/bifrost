@@ -1437,7 +1437,11 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 		if err != nil {
 			return nil, fmt.Errorf("fetch k8s files for %s: %w", svc, err)
 		}
-		stagingData, err := parseStagingEnv(k8sFiles)
+		// Where this repo keeps its base and its staging overlay under k8s/.
+		// A service with no registry entry gets the zero Preview, whose
+		// answers are the fleet's base and staging.
+		entry := o.Registry[svc]
+		stagingData, err := parseStagingEnv(k8sFiles, entry.K8sStagingDir())
 		if err != nil {
 			return nil, fmt.Errorf("parse staging env for %s: %w", svc, err)
 		}
@@ -1464,6 +1468,7 @@ func (o *Orchestrator) renderAndApply(ctx context.Context, ns, tag, branch strin
 			Tag:              tag,
 			ShortSHA:         built[svc].ShortSHA,
 			K8sFiles:         k8sFiles,
+			BaseDir:          entry.K8sBaseDir(),
 			EnvConfig:        envConfig,
 			SecretName:       secretName,
 			Migrate:          o.Registry[svc].Migrate,

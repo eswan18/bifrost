@@ -13,6 +13,7 @@ package registry
 import (
 	_ "embed"
 	"fmt"
+	"path"
 	"sort"
 
 	sigsyaml "sigs.k8s.io/yaml"
@@ -86,6 +87,55 @@ type Preview struct {
 	// only when the Neon ref sets MigrateRole — see there for why migrations
 	// may need a role the app deliberately doesn't have.
 	Migrate []string `json:"migrate,omitempty"`
+	// BaseDir and StagingDir name the directories under the repo's k8s/ that
+	// hold its kustomize base and its staging overlay, for a repo that does
+	// not call them "base" and "staging" as the rest of the fleet does. A
+	// preview is rendered from the first and starts from the second's
+	// configmap-env.yaml, so a repo that keeps them elsewhere cannot be
+	// previewed until this says where. Empty means the fleet's name; read
+	// them through K8sBaseDir and K8sStagingDir, which apply that default.
+	//
+	// They live here, like the Neon reference, and never in the branch under
+	// test: a branch does not get to choose which of its directories bifrost
+	// builds.
+	BaseDir    string `json:"baseDir,omitempty"`
+	StagingDir string `json:"stagingDir,omitempty"`
+}
+
+// The directories every repo in the fleet keeps its kustomize base and its
+// staging overlay in, under k8s/, unless its registry entry says otherwise.
+const (
+	DefaultK8sBaseDir    = "base"
+	DefaultK8sStagingDir = "staging"
+)
+
+// K8sBaseDir is the directory under the repo's k8s/ holding its kustomize
+// base: BaseDir when the entry sets one, else the fleet's.
+func (p Preview) K8sBaseDir() string {
+	if p.BaseDir != "" {
+		return p.BaseDir
+	}
+	return DefaultK8sBaseDir
+}
+
+// K8sStagingDir is the directory under the repo's k8s/ holding its staging
+// overlay: StagingDir when the entry sets one, else the fleet's.
+func (p Preview) K8sStagingDir() string {
+	if p.StagingDir != "" {
+		return p.StagingDir
+	}
+	return DefaultK8sStagingDir
+}
+
+// invalidK8sDir reports whether dir, a baseDir or stagingDir value, is
+// anything but a single directory name. It is joined onto k8s/ to pick files
+// out of a fetched tree, so a separator or a dot segment in it can only be a
+// mistake. Empty is valid: it means the default.
+func invalidK8sDir(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	return dir != path.Base(dir) || dir == "." || dir == ".." || dir == "/"
 }
 
 // URLs is a service's public endpoints, used for the "open ↗" links on its
@@ -134,6 +184,9 @@ func Load() (Registry, error) {
 // wired up. Rejecting is also the fail-safe direction of the likelier typo:
 // somebody adding migrateRole and forgetting migrate wants to be told, and
 // nobody is served by a registry that quietly half-configures.
+//
+// baseDir and stagingDir must each be a single directory name; see
+// invalidK8sDir.
 func parseRegistry(data []byte) (Registry, error) {
 	var reg Registry
 	if err := sigsyaml.UnmarshalStrict(data, &reg); err != nil {
@@ -150,6 +203,12 @@ func parseRegistry(data []byte) (Registry, error) {
 		}
 		if svc.Preview.Neon != nil && svc.Preview.Neon.MigrateRole != "" && len(svc.Preview.Migrate) == 0 {
 			return nil, fmt.Errorf("registry: %s: preview.neon.migrateRole is set but preview.migrate is not: the role only names who runs the migrate initContainer, and there is none", name)
+		}
+		if invalidK8sDir(svc.Preview.BaseDir) {
+			return nil, fmt.Errorf("registry: %s: preview.baseDir %q must be the name of one directory under k8s/, not a path", name, svc.Preview.BaseDir)
+		}
+		if invalidK8sDir(svc.Preview.StagingDir) {
+			return nil, fmt.Errorf("registry: %s: preview.stagingDir %q must be the name of one directory under k8s/, not a path", name, svc.Preview.StagingDir)
 		}
 	}
 	return reg, nil
