@@ -55,7 +55,7 @@ data:
   JWT_AUDIENCE: "ethanswan:fitness"
 `),
 		}
-		got, err := parseStagingEnv(files)
+		got, err := parseStagingEnv(files, "staging")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -66,7 +66,7 @@ data:
 	})
 
 	t.Run("absent file yields empty map, not an error", func(t *testing.T) {
-		got, err := parseStagingEnv(map[string][]byte{"base/deployment.yaml": []byte("irrelevant")})
+		got, err := parseStagingEnv(map[string][]byte{"base/deployment.yaml": []byte("irrelevant")}, "staging")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -79,7 +79,7 @@ data:
 		files := map[string][]byte{
 			"staging/configmap-env.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"),
 		}
-		got, err := parseStagingEnv(files)
+		got, err := parseStagingEnv(files, "staging")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -90,7 +90,7 @@ data:
 
 	t.Run("malformed yaml errors", func(t *testing.T) {
 		files := map[string][]byte{"staging/configmap-env.yaml": []byte("not: [valid: yaml")}
-		if _, err := parseStagingEnv(files); err == nil {
+		if _, err := parseStagingEnv(files, "staging"); err == nil {
 			t.Fatal("expected an error for malformed YAML, got nil")
 		}
 	})

@@ -506,7 +506,9 @@ ran `up` for is the symptom.
    `staging/configmap-env.yaml` (empty map if it has none), compute the final
    env via the registry's templates (see "The registry" below), build a
    generated kustomize overlay atop the fetched `k8s/base`, and
-   server-side-apply the result into the preview namespace.
+   server-side-apply the result into the preview namespace. A repo that keeps
+   those two directories under other names says so in the registry — see
+   "`baseDir:` and `stagingDir:`" below.
 8. **Wait for pods** (step: `waiting for pods`): poll the namespace's pods (`podPollInterval`, 5s) until
    every member has at least one Deployment-managed pod and all of them
    report ready, bounded at `podReadyTimeout` (5 minutes — a cold-node image
@@ -1066,6 +1068,36 @@ mind if you're ever tempted to "fix" a preview URL by editing
 `internal/registry/registry.yaml` — check the `staging/configmap-env.yaml`
 of the app whose env you're changing first.
 
+### `baseDir:` and `stagingDir:` — manifests that are not in `k8s/base`
+
+A preview reads two things from a member's repo: the kustomize base it
+renders from, and the staging overlay's `configmap-env.yaml` its env config
+starts from. Everywhere in the fleet but one, those are `k8s/base` and
+`k8s/staging`, and an entry that says nothing gets exactly that.
+
+`haruspex` is the one: its trees are `k8s/haruspex-base` and
+`k8s/haruspex-staging`, left over from the forecasting → haruspex rename, so
+its entry carries
+
+```yaml
+    baseDir: haruspex-base
+    stagingDir: haruspex-staging
+```
+
+Each is the name of one directory under `k8s/`, never a path (a separator or
+a dot segment is rejected at registry-load time), and each can be set without
+the other. They live in the registry for the same reason the Neon reference
+does: the branch under test does not get to choose which of its directories
+bifrost builds.
+
+The two failures look nothing alike, which is why both keys exist. A missing
+base is loud: the run fails at `applying manifests` with `no <dir>/ files
+found in K8sFiles`. A missing staging ConfigMap is silent, because a repo
+with none is legitimate (the dashboard) — the preview renders with none of
+staging's config and fails later, somewhere less obvious. If a preview comes
+up missing every value its app's staging ConfigMap sets, check `stagingDir`
+first.
+
 ## Onboarding a new previewable app
 
 The app must already be a fleet member — a plain entry in
@@ -1079,7 +1111,8 @@ changes:
    templates (`{{ url X }}` / `{{ internalUrl X }}` / `{{ config KEY }}`, or
    plain literals), and a `required:` list for any keys that must render
    non-empty (a required key with no matching `env` entry is rejected at
-   load time). If it has a database, **set `neon.parent` to its staging
+   load time). If the repo's manifests are not in `k8s/base` and
+   `k8s/staging`, name where they are with `baseDir:` / `stagingDir:`. If it has a database, **set `neon.parent` to its staging
    branch** — verified by endpoint, per "The registry" above. Leaving it out
    is not a neutral default: previews will clone that project's *production*
    branch. If it also declares `migrate:`, **check whether its `role:` can

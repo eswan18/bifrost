@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/eswan18/bifrost/internal/registry"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/kustomize/api/konfig"
 	"sigs.k8s.io/kustomize/api/krusty"
@@ -39,10 +40,15 @@ type RenderInput struct {
 	ShortSHA string // preview image tag suffix
 
 	// K8sFiles is the service's whole k8s/ subtree as returned by
-	// github.FetchK8s (path relative to k8s/ -> content). Only the base/
+	// github.FetchK8s (path relative to k8s/ -> content). Only the BaseDir
 	// subtree is used; other directories (staging/, prod/, argocd/, ...)
 	// are ignored.
 	K8sFiles map[string][]byte
+
+	// BaseDir is the directory in K8sFiles holding the service's kustomize
+	// base. Empty means "base", where every repo but haruspex keeps it; the
+	// orchestrator passes the registry's answer (registry.Preview.K8sBaseDir).
+	BaseDir string
 
 	// EnvConfig is the final preview ConfigMap data, computed by the
 	// caller (Task 4) and carried into the generated <svc>-preview-env
@@ -107,11 +113,16 @@ func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
 		return nil, errors.New("preview: render: MigrateSecretKey is set but there is no Migrate command to apply it to")
 	}
 
+	baseDir := in.BaseDir
+	if baseDir == "" {
+		baseDir = registry.DefaultK8sBaseDir
+	}
+
 	fs := filesys.MakeFsInMemory()
-	if err := writeBase(fs, in.K8sFiles); err != nil {
+	if err := writeBase(fs, in.K8sFiles, baseDir); err != nil {
 		return nil, err
 	}
-	if err := validateLocalKustomizeRefs(in.K8sFiles); err != nil {
+	if err := validateLocalKustomizeRefs(in.K8sFiles, baseDir); err != nil {
 		return nil, fmt.Errorf("preview: render %s: %w", in.Service, err)
 	}
 
@@ -145,12 +156,13 @@ func Render(in RenderInput) ([]*unstructured.Unstructured, error) {
 	return objs, nil
 }
 
-// writeBase writes every k8sFiles entry rooted under "base/" into fs at
-// /base/<relative path>, stripping the "base/" prefix. Everything else
+// writeBase writes every k8sFiles entry rooted under baseDir into fs at
+// /base/<relative path>, stripping the "<baseDir>/" prefix. Everything else
 // (staging/, prod/, argocd/, ...) is ignored — the generated overlay only
-// ever builds atop the fetched base.
-func writeBase(fs filesys.FileSystem, k8sFiles map[string][]byte) error {
-	const prefix = "base/"
+// ever builds atop the fetched base. Whatever the repo calls the directory,
+// it lands at /base, which is the one name the generated overlay refers to.
+func writeBase(fs filesys.FileSystem, k8sFiles map[string][]byte, baseDir string) error {
+	prefix := baseDir + "/"
 	wrote := false
 	for p, content := range k8sFiles {
 		rel, ok := strings.CutPrefix(p, prefix)
@@ -167,7 +179,7 @@ func writeBase(fs filesys.FileSystem, k8sFiles map[string][]byte) error {
 		wrote = true
 	}
 	if !wrote {
-		return errors.New("preview: render: no base/ files found in K8sFiles")
+		return fmt.Errorf("preview: render: no %s files found in K8sFiles", prefix)
 	}
 	return nil
 }
@@ -193,7 +205,8 @@ type minimalKustomizationRefs struct {
 	} `json:"patchesJson6902,omitempty"`
 }
 
-// validateLocalKustomizeRefs rejects any fetched base/ kustomization file —
+// validateLocalKustomizeRefs rejects any fetched kustomization file under
+// baseDir —
 // any of konfig.RecognizedKustomizationFileNames() (currently
 // "kustomization.yaml", "kustomization.yml", and the extensionless
 // "Kustomization" — driven off krusty's own list rather than a hardcoded
@@ -217,12 +230,14 @@ type minimalKustomizationRefs struct {
 // busy-tag claim (see Orchestrator.acquire) since Render never returns.
 //
 // k8sFiles is the whole fetched k8s/ tree (RenderInput.K8sFiles); only
-// entries under the "base/" prefix are checked, matching the only subtree
-// writeBase copies into the build filesystem — kustomization files
-// elsewhere (staging/, prod/, argocd/) are never read by kustomizeBuild, so
-// scanning them would only produce irrelevant false rejections.
-func validateLocalKustomizeRefs(k8sFiles map[string][]byte) error {
-	const prefix = "base/"
+// entries under baseDir are checked, matching the only subtree writeBase
+// copies into the build filesystem — kustomization files elsewhere
+// (staging/, prod/, argocd/) are never read by kustomizeBuild, so scanning
+// them would only produce irrelevant false rejections. It takes the same
+// baseDir writeBase does, and must: checking one directory while building
+// from another would check nothing.
+func validateLocalKustomizeRefs(k8sFiles map[string][]byte, baseDir string) error {
+	prefix := baseDir + "/"
 	for p, content := range k8sFiles {
 		rel, ok := strings.CutPrefix(p, prefix)
 		if !ok || rel == "" {
