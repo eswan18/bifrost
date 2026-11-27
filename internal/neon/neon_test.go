@@ -389,3 +389,115 @@ func TestListBranchesReportsTheDefaultBranch(t *testing.T) {
 		t.Errorf("branches[1] (%s) Default = true, want false", branches[1].Name)
 	}
 }
+
+// TestDirectConnectionURI covers the URI a migration connects through. A
+// migration holds session state (an advisory lock, a SET) across statements,
+// and Neon's pooled host is PgBouncer in transaction mode, which hands each
+// transaction to whichever server connection is free. So the URI must name
+// the endpoint's own host, never its "-pooler" one.
+//
+// The request says so (pooled=false), and the answer is checked anyway: the
+// API handed back pooled URIs to requests that did not ask for them, which is
+// how haruspex's migration runner came to refuse every preview.
+func TestDirectConnectionURI(t *testing.T) {
+	cases := []struct {
+		name     string
+		returned string
+		want     string
+	}{
+		{
+			name:     "a pooled host loses its -pooler",
+			returned: "postgresql://neondb_owner:npg_abc@ep-ancient-violet-a4xf2xox-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+			want:     "postgresql://neondb_owner:npg_abc@ep-ancient-violet-a4xf2xox.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+		},
+		{
+			name:     "a direct host is returned as it came",
+			returned: "postgresql://neondb_owner:npg_abc@ep-ancient-violet-a4xf2xox.us-east-1.aws.neon.tech/neondb?sslmode=require",
+			want:     "postgresql://neondb_owner:npg_abc@ep-ancient-violet-a4xf2xox.us-east-1.aws.neon.tech/neondb?sslmode=require",
+		},
+		{
+			name:     "a port stays where it was",
+			returned: "postgresql://owner:pw@ep-x-pooler.neon.tech:5432/db",
+			want:     "postgresql://owner:pw@ep-x.neon.tech:5432/db",
+		},
+		{
+			// Only the host is touched, and the rest comes back byte for
+			// byte: an escaped password is not re-encoded, and "-pooler"
+			// anywhere but the host's first label means nothing.
+			name:     "nothing but the host changes",
+			returned: "postgresql://my-pooler:p%40ss-pooler@ep-x-pooler.neon.tech/db-pooler?options=a-pooler",
+			want:     "postgresql://my-pooler:p%40ss-pooler@ep-x.neon.tech/db-pooler?options=a-pooler",
+		},
+		{
+			name:     "a later label that ends in -pooler is not the pooler",
+			returned: "postgresql://owner:pw@ep-x.my-pooler.example.com/db",
+			want:     "postgresql://owner:pw@ep-x.my-pooler.example.com/db",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, mux := newTestServer(t)
+			mux.HandleFunc("GET /projects/proj-abc/connection_uri", func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if q.Get("branch_id") != "br-prev-456" || q.Get("database_name") != "neondb" || q.Get("role_name") != "neondb_owner" {
+					t.Errorf("query = %v", q)
+				}
+				if got := q.Get("pooled"); got != "false" {
+					t.Errorf("pooled = %q, want it asked for explicitly as false", got)
+				}
+				_, _ = w.Write([]byte(`{"uri":"` + tc.returned + `"}`))
+			})
+			c := NewWithBaseURL("neon-key", srv.URL)
+			uri, err := c.DirectConnectionURI(context.Background(), "proj-abc", "br-prev-456", "neondb", "neondb_owner")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if uri != tc.want {
+				t.Errorf("uri = %q, want %q", uri, tc.want)
+			}
+		})
+	}
+}
+
+// TestDirectConnectionURINeverPutsTheURIInAnError: a URI that cannot be read
+// as a URL is still a credential. net/url quotes its input in its errors, so
+// that error must not be passed along.
+func TestDirectConnectionURINeverPutsTheURIInAnError(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/connection_uri", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"uri":"postgresql://owner:hunter2@%zz-pooler/db"}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	uri, err := c.DirectConnectionURI(context.Background(), "proj-abc", "br-prev-456", "neondb", "neondb_owner")
+	if err == nil {
+		t.Fatalf("expected an error for a URI that is not a URL, got %q", uri)
+	}
+	if uri != "" {
+		t.Errorf("uri = %q, want nothing returned alongside an error", uri)
+	}
+	for _, secret := range []string{"hunter2", "owner", "%zz"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error = %q, which carries %q from the connection string", err.Error(), secret)
+		}
+	}
+}
+
+// TestConnectionURIDoesNotAskAboutPooling: the app's URI is whatever Neon
+// gives by default, as it always has been. Only the migrate URI asks.
+func TestConnectionURIDoesNotAskAboutPooling(t *testing.T) {
+	srv, mux := newTestServer(t)
+	mux.HandleFunc("GET /projects/proj-abc/connection_uri", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("pooled") {
+			t.Errorf("query = %v, want no pooled parameter", r.URL.Query())
+		}
+		_, _ = w.Write([]byte(`{"uri":"postgresql://app:pw@ep-x-pooler.neon.tech/db"}`))
+	})
+	c := NewWithBaseURL("neon-key", srv.URL)
+	uri, err := c.ConnectionURI(context.Background(), "proj-abc", "br-prev-456", "db", "app")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if uri != "postgresql://app:pw@ep-x-pooler.neon.tech/db" {
+		t.Errorf("uri = %q, want it untouched", uri)
+	}
+}

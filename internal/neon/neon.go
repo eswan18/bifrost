@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,7 +49,16 @@ type Client interface {
 	// Empty parentID branches from the project's default branch.
 	CreateBranch(ctx context.Context, projectID, name, parentID string) (Branch, error)
 	DeleteBranch(ctx context.Context, projectID, branchID string) error
+	// ConnectionURI is the connection string Neon gives for role by default,
+	// which in practice is the endpoint's pooled host. Right for an app;
+	// wrong for anything that needs a session — see DirectConnectionURI.
 	ConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error)
+	// DirectConnectionURI is the same connection string on the endpoint's
+	// own host, never its "-pooler" one. It is what a migration connects
+	// through: a migration holds session state across statements (an
+	// advisory lock, a SET), and the pooled host is PgBouncer in transaction
+	// mode, which gives each transaction whichever server connection is free.
+	DirectConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error)
 	// ListRoles returns the NAMES of the Postgres roles on a branch. A branch
 	// inherits its parent's roles, so asking the branch a preview will be cut
 	// from answers "will this role exist in the preview?" before the preview
@@ -252,11 +262,70 @@ func (c *client) DeleteBranch(ctx context.Context, projectID, branchID string) e
 // anyway, and every other Neon error already names the operation and status
 // code without it.
 func (c *client) ConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error) {
-	q := url.Values{
+	return c.connectionURI(ctx, projectID, url.Values{
 		"branch_id":     {branchID},
 		"database_name": {database},
 		"role_name":     {role},
+	})
+}
+
+// DirectConnectionURI asks for an unpooled URI and then makes sure it has
+// one. The check is not belt and braces for its own sake: Neon's spec
+// describes `pooled` as adding "-pooler" when true and names no default, and
+// the live API returned pooled URIs to requests that left it out (found when
+// haruspex's migration runner, which refuses a pooled host, refused every
+// preview). A parameter whose omission did not mean what the spec implies is
+// not one to take on trust when set, and a pooled migrate URI costs a failed
+// preview to discover.
+func (c *client) DirectConnectionURI(ctx context.Context, projectID, branchID, database, role string) (string, error) {
+	uri, err := c.connectionURI(ctx, projectID, url.Values{
+		"branch_id":     {branchID},
+		"database_name": {database},
+		"role_name":     {role},
+		"pooled":        {"false"},
+	})
+	if err != nil {
+		return "", err
 	}
+	return directURI(uri)
+}
+
+// poolerSuffix is how Neon names an endpoint's pooled host: the endpoint's
+// hostname with this on the end of its first label
+// (ep-cool-name-a1b2c3-pooler.us-east-1.aws.neon.tech).
+const poolerSuffix = "-pooler"
+
+// directURI returns uri pointed at the endpoint's own host instead of its
+// pooled one, and uri itself if it already is. Only the host changes; the
+// rest comes back byte for byte, so nothing in the credentials is re-encoded.
+//
+// uri is a secret. net/url quotes its input in every error it returns, so a
+// parse failure is reported in this function's own words and never wrapped.
+func directURI(uri string) (string, error) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Host == "" {
+		return "", errors.New("neon: the connection uri returned is not a URL")
+	}
+	label, rest, hasRest := strings.Cut(u.Host, ".")
+	direct, pooled := strings.CutSuffix(label, poolerSuffix)
+	if !pooled {
+		return uri, nil
+	}
+	host := direct
+	if hasRest {
+		host += "." + rest
+	}
+	// The host follows the userinfo's "@" when there is one, and the "//"
+	// otherwise; anchoring on that keeps a password or database name that
+	// happens to contain the host from being the thing replaced.
+	anchor := "//"
+	if u.User != nil {
+		anchor = "@"
+	}
+	return strings.Replace(uri, anchor+u.Host, anchor+host, 1), nil
+}
+
+func (c *client) connectionURI(ctx context.Context, projectID string, q url.Values) (string, error) {
 	var body struct {
 		URI string `json:"uri"`
 	}

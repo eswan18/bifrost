@@ -983,6 +983,15 @@ How it reaches the pod, and what it deliberately isn't:
 - bifrost mints a **second** connection URI for the same preview branch and
   database as `migrateRole:`, and copies it into the preview Secret as
   `MIGRATE_DATABASE_URL` (step 6).
+- **that URI is on the endpoint's direct host, never its `-pooler` one.** A
+  migration needs one session from start to finish (an advisory lock, a
+  `SET`), and Neon's pooled host is PgBouncer in transaction mode, which does
+  not give it one. haruspex's runner refuses a pooled host outright; the
+  others do not check. bifrost asks Neon for an unpooled URI and strips
+  `-pooler` from the host itself if one comes back anyway — the API returned
+  pooled URIs to requests that did not ask for them, so its answer is not
+  taken on trust (`neon.DirectConnectionURI`). The app's own `DATABASE_URL` is
+  untouched and stays whatever Neon gives by default.
 - the generated Deployment gives the migrate initContainer **one explicit
   `env:` entry** re-pointing `DATABASE_URL` at that Secret key via
   `valueFrom.secretKeyRef`. An explicit `env:` entry outranks an `envFrom`
