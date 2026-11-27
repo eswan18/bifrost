@@ -1373,7 +1373,11 @@ func (o *Orchestrator) ensureNeonBranch(ctx context.Context, ref NeonRef, tag st
 	}
 	uris := previewDBURIs{App: uri}
 	if ref.MigrateRole != "" {
-		migrateURI, err := o.Neon.ConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.MigrateRole)
+		// Direct, not pooled: a migration needs one session from start to
+		// finish. haruspex's runner refuses a pooled host outright (kysely
+		// holds a session advisory lock for the run); alembic and identity's
+		// migrator do not check, which is not the same as being safe on one.
+		migrateURI, err := o.Neon.DirectConnectionURI(ctx, ref.Project, branchID, ref.Database, ref.MigrateRole)
 		if err != nil {
 			// Named distinctly from the app's: with two URIs minted per
 			// member, "fetching connection uri" alone would leave an

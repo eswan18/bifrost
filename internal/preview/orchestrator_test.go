@@ -321,6 +321,22 @@ func (f *fakeNeon) ConnectionURI(_ context.Context, projectID, _, database, role
 	return "postgres://" + role + ":fakesecret@" + projectID + "/" + database, nil
 }
 
+// DirectConnectionURI answers with a host ConnectionURI never produces, so a
+// test can tell which of the two a URI came from: the migrate URI has to be
+// the direct one, and "the orchestrator asked the right method" is otherwise
+// invisible in a Secret's contents.
+func (f *fakeNeon) DirectConnectionURI(_ context.Context, projectID, _, database, role string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err, ok := f.connErr[projectID]; ok {
+		return "", err
+	}
+	if uri, ok := f.connURI[projectID]; ok {
+		return uri, nil
+	}
+	return "postgres://" + role + ":fakesecret@direct." + projectID + "/" + database, nil
+}
+
 func (f *fakeNeon) ListRoles(_ context.Context, projectID, branchID string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1034,7 +1050,7 @@ func TestUpHappyPathTwoMembers(t *testing.T) {
 	// for — the app's and the migrate initContainer's.
 	const apiProject = "aged-river-81935268"
 	wantAppURI := "postgres://app_user:fakesecret@" + apiProject + "/neondb"
-	wantMigrateURI := "postgres://neondb_owner:fakesecret@" + apiProject + "/neondb"
+	wantMigrateURI := "postgres://neondb_owner:fakesecret@direct." + apiProject + "/neondb"
 	if got := string(apiCall.overrides["DATABASE_URL"]); got != wantAppURI {
 		t.Errorf("DATABASE_URL override = %q, want %q (the APP's DML-only role)", got, wantAppURI)
 	}
@@ -1900,7 +1916,7 @@ func TestUpGivesTheMigrateStepItsOwnRole(t *testing.T) {
 	}
 	const project = "plain-heart-27630935"
 	wantApp := "postgres://app:fakesecret@" + project + "/neondb"
-	wantMigrate := "postgres://neondb_owner:fakesecret@" + project + "/neondb"
+	wantMigrate := "postgres://neondb_owner:fakesecret@direct." + project + "/neondb"
 	if got := string(idCall.overrides["DATABASE_URL"]); got != wantApp {
 		t.Errorf("DATABASE_URL override = %q, want %q (the APP's lesser role, unchanged)", got, wantApp)
 	}
