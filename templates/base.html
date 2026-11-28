@@ -77,10 +77,13 @@
           <div class="micro">PRODUCTION</div>
           <div class="hash-diff"><span class="from">{{.PromoteFrom}}</span><span class="arrow">→</span><span class="to">{{.PromoteTo}}</span></div>
           <div class="modal-note">{{.PromoteNote}}</div>
-          <form method="POST" action="/services/{{.Name}}/promote" class="js-mutate" data-service="{{.Name}}" data-env="prod" data-newtag="{{.PromoteTo}}">
+          {{- with .Changes}}{{template "promote-changes" .}}{{end}}
+          <form method="POST" action="/services/{{.Name}}/promote" class="js-mutate{{if .Changes}} promote-confirm{{end}}" data-service="{{.Name}}" data-env="prod" data-newtag="{{.PromoteTo}}">
             <input type="hidden" name="csrf" value="{{$csrf}}">
             <input type="hidden" name="expected_sha" value="{{.PromoteTo}}">
-            <button type="submit" class="pill pill-primary">Promote to prod</button>
+            {{- with .Changes}}{{range .UnreadPRs}}
+            <input type="hidden" name="unread_pr" value="{{.}}">{{end}}{{end}}
+            <button type="submit" class="pill pill-primary">{{if and .Changes .Changes.Confirm}}{{.Changes.Confirm}}{{else}}Promote to prod{{end}}</button>
           </form>
         </div>
       </div>
@@ -106,6 +109,53 @@
   </div>
 {{end}}
 {{end}}
+
+{{/* promote-changes is what a promotion would ship (changesView), shown above
+     the confirm button: the PRs nobody has read first, each a link to the PR,
+     then a quiet count of the rest and the whole list folded away. Every title
+     and login here is text from GitHub and is only ever auto-escaped; every
+     URL was built server-side from owner, repo and number. */}}
+{{define "promote-changes"}}
+          <div class="changes">
+            {{- if .Unavailable}}
+            <div class="modal-note">The changes could not be read from GitHub.</div>
+            {{- else}}
+            {{- if .Unread}}
+            <div class="changes-head"><span class="dot dot-amb"></span>{{.UnreadHead}}</div>
+            <ul class="change-list">
+              {{- range .Unread}}
+              <li><a class="change-row" href="{{.URL}}" target="_blank" rel="noopener">
+                <span class="mono change-pr">#{{.PR}}</span>
+                <span class="change-main"><span class="change-title">{{.Title}}</span>{{if .Author}}<span class="change-author">{{.Author}}</span>{{end}}</span>
+                <span class="ext" aria-hidden="true">↗</span>
+              </a></li>
+              {{- end}}
+            </ul>
+            {{- end}}
+            {{- if .Summary}}
+            <div class="modal-note changes-summary">{{.Summary}}</div>
+            {{- end}}
+            {{- if .Truncated}}
+            <div class="modal-note changes-truncated">{{.Truncated}}</div>
+            {{- end}}
+            <details class="all-commits">
+              <summary>{{.AllLabel}}</summary>
+              <ul class="commit-list">
+                {{- range .Commits}}
+                <li>{{if .URL}}<a class="commit-row" href="{{.URL}}" target="_blank" rel="noopener">{{else}}<span class="commit-row">{{end}}
+                  <span class="mono commit-sha">{{.SHA}}</span>
+                  <span class="commit-text">{{if .PR}}<span class="mono commit-pr">#{{.PR}}</span> {{end}}{{.Title}}{{if .Mark}} <span class="env-badge {{if .Unread}}env-prod{{else}}env-stg{{end}}">{{.Mark}}</span>{{end}}</span>
+                {{if .URL}}</a>{{else}}</span>{{end}}</li>
+                {{- end}}
+              </ul>
+            </details>
+            {{- end}}
+          </div>
+{{end}}
+
+{{/* promote-note is the short line beside a Promote control: "21 to promote
+     · 1 unread". Only the unread half is allowed to stand out. */}}
+{{define "promote-note"}}{{with .Changes}}{{if .Note}}<span class="promote-note">{{.Note}}{{if .UnreadNote}} · <span class="unread-count">{{.UnreadNote}}</span>{{end}}</span>{{end}}{{end}}{{end}}
 
 {{/* rollback-row renders one env's current→previous revert. When no previous
      image is known the button is disabled and the diff reads accordingly. The
@@ -243,7 +293,7 @@
         mutating = false;
         closeModal();
         showNotice(promoting
-          ? 'Promoting ' + svc + ' → ' + res.newTag + ' — deploying…'
+          ? 'Promoting ' + svc + ' → ' + res.newTag + ' — deploying…' + (res.note || '')
           : 'Rolling back ' + svc + ' ' + res.env + ' → ' + res.newTag + '…');
         schedule(ACTIVE);
         pollRollout(svc, res.env, res.newTag, Date.now());

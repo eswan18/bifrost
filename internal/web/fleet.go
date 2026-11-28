@@ -123,6 +123,12 @@ type appView struct {
 	PromoteFrom string
 	PromoteTo   string
 	PromoteNote string
+
+	// Changes is what promoting would ship and which of it nobody has read
+	// (commits.go). nil whenever there is nothing to say — no commit client,
+	// not promotable, an empty range — and the page then renders as it always
+	// did.
+	Changes *changesView
 }
 
 // stuckAfter is how long an env may stay degraded mid-rollout before it reads
@@ -174,6 +180,10 @@ type attentionItem struct {
 	Sub    string
 	Action string // "Roll back" | "View" | "Promote"
 	Href   string // "#modal-…" for a modal, "/jobs?app=…" for View
+	// Note and Unread extend a promote item with what it would ship:
+	// "21 to promote" (quiet) and "1 unread" (stands out). Both "" otherwise.
+	Note   string
+	Unread string
 }
 
 type overviewJob struct {
@@ -282,6 +292,8 @@ func (h *Handlers) assembleFleet(ctx context.Context) *fleet {
 	for i, svc := range names {
 		apps[i] = h.assembleApp(svc, now, argo, builds, raws[svc+"-staging"], raws[svc+"-prod"])
 	}
+
+	h.attachChanges(ctx, apps)
 
 	f := &fleet{Apps: apps, AppCount: len(apps)}
 	for _, a := range apps {
@@ -922,13 +934,17 @@ func (f *fleet) deriveOverview(now time.Time) {
 			})
 		}
 		if a.Overall == "drift" {
-			o.Attention = append(o.Attention, attentionItem{
+			item := attentionItem{
 				Class:  "c-amb",
 				Title:  a.Name + " is ready to promote",
 				Sub:    "— staging " + a.Staging.Tag + " ahead of prod " + a.Prod.Tag,
 				Action: "Promote",
 				Href:   "#modal-promote-" + a.Name,
-			})
+			}
+			if a.Changes != nil {
+				item.Note, item.Unread = a.Changes.Note, a.Changes.UnreadNote
+			}
+			o.Attention = append(o.Attention, item)
 		}
 	}
 
