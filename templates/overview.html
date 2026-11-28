@@ -13,7 +13,7 @@
         <div class="attn-item">
           <div class="attn-text">
             <span class="dot {{if eq .Class "c-red"}}dot-red{{else}}dot-amb{{end}}"></span>
-            <span><strong>{{.Title}}</strong> <span class="c-mut">{{.Sub}}</span></span>
+            <span><strong>{{.Title}}</strong> <span class="c-mut">{{.Sub}}{{if .Note}} · {{.Note}}{{end}}</span>{{if .Unread}}<span class="c-mut"> · </span><span class="unread-count">{{.Unread}}</span>{{end}}</span>
           </div>
           <a href="{{.Href}}" class="pill pill-secondary attn-action">{{.Action}}</a>
         </div>

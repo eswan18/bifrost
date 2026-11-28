@@ -13,7 +13,7 @@
           {{if .RepoURL}}<a href="{{.RepoURL}}" target="_blank" class="app-name">{{.Name}}</a>{{else}}<span class="app-name">{{.Name}}</span>{{end}}
           {{if .HasJobs}}<label for="exp-d-{{.Name}}" class="chev" aria-label="Toggle jobs for {{.Name}}"></label>{{end}}
         </span>
-        <span class="cell-env">{{template "env-cell" .Staging}}</span>
+        <span class="cell-env">{{template "env-cell" .Staging}}{{if .ShowPromote}}{{template "promote-note" .}}{{end}}</span>
         <span class="cell-env">{{template "env-cell" .Prod}}</span>
         <span class="cell-build">{{template "build-cell" .}}</span>
         <span class="cell-jobs">{{template "jobs-link" .}}</span>
@@ -73,6 +73,7 @@
         {{end}}
       </div>
       {{end}}
+      {{if .ShowPromote}}{{template "promote-note" .}}{{end}}
       <div class="card-actions">
         {{if .ShowPromote}}<a href="#modal-promote-{{.Name}}" class="pill-block pill-primary">Promote ↗</a>{{end}}
         {{if .ShowRollbackPrimary}}<a href="#modal-rollback-{{.Name}}" class="pill-block pill-secondary">Roll back</a>{{end}}

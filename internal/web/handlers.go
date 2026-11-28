@@ -39,6 +39,14 @@ type Handlers struct {
 	// handler tests can supply a trivial fake instead of standing up five
 	// real clients.
 	Orch orchestration
+	// Commits reads what a promotion would ship from GitHub and marks unread
+	// PRs as read afterwards (commits.go). nil → the feature is off and every
+	// page and the promote endpoint behave exactly as they did without it.
+	Commits CommitReader
+	// commitCache and commitBudget belong to Commits; the zero values are the
+	// production ones (an empty cache, the default budget).
+	commitCache  commitCache
+	commitBudget time.Duration
 }
 
 // pageVM is the view model handed to every rendered template. The dashboard
@@ -362,6 +370,14 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The PRs the dialog listed as unread. Checked before anything is read or
+	// written: a malformed list is a hand-built request, and is refused whole.
+	shownPRs, err := parseShownPRs(r.Form["unread_pr"])
+	if err != nil {
+		slog.Warn("promote refused: bad unread_pr", "user", sess.Email, "service", app, "error", err)
+		h.respondMutation(w, r, http.StatusBadRequest, false, fmt.Sprintf("%s: invalid request — refresh and retry", app), "", "prod")
+		return
+	}
 
 	// Re-derive the current state to make sure we promote what the user saw.
 	stagingPods, err := h.Kube.ListPods(r.Context(), app+"-staging")
@@ -402,8 +418,12 @@ func (h *Handlers) Promote(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("promote succeeded", "user", sess.Email, "service", app,
 		"env", "prod", "from", s.ProdTag, "to", s.NewProdTag)
-	h.respondMutation(w, r, http.StatusOK, true,
-		fmt.Sprintf("Promoted %s prod → %s", app, s.NewProdTag), s.NewProdTag, "prod")
+	// Only now, with prod moved, are the PRs the user was shown marked as read
+	// — and only those still unread in the range that was actually promoted.
+	// Its outcome is reported, never turned into a failure.
+	note := h.settleUnread(r.Context(), sess, app, s.ProdTag, s.NewProdTag, shownPRs)
+	h.respondMutationNote(w, r, http.StatusOK, true,
+		fmt.Sprintf("Promoted %s prod → %s", app, s.NewProdTag)+note, s.NewProdTag, "prod", note)
 }
 
 // --- rollback ----------------------------------------------------------------
@@ -496,6 +516,15 @@ func (h *Handlers) Rollback(w http.ResponseWriter, r *http.Request) {
 // the caller's preferred format: JSON for the fetch()-driven UI, or a 303
 // redirect back to the originating page for the plain-form no-JS fallback.
 func (h *Handlers) respondMutation(w http.ResponseWriter, r *http.Request, status int, ok bool, msg, newTag, env string) {
+	h.respondMutationNote(w, r, status, ok, msg, newTag, env, "")
+}
+
+// respondMutationNote is respondMutation with a note for the fetch()-driven
+// UI: the part of a success message that is about something other than the
+// rollout (" · marked #277 as read"). The browser appends it to its own
+// "deploying…" notice, because the flash that also carries it is not shown
+// until the rollout settles and the page reloads.
+func (h *Handlers) respondMutationNote(w http.ResponseWriter, r *http.Request, status int, ok bool, msg, newTag, env, note string) {
 	if ok {
 		SetFlash(w, FlashSuccess, msg)
 	} else {
@@ -508,7 +537,7 @@ func (h *Handlers) respondMutation(w http.ResponseWriter, r *http.Request, statu
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": ok, "error": errMsg, "newTag": newTag, "env": env})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": ok, "error": errMsg, "newTag": newTag, "env": env, "note": note})
 		return
 	}
 	http.Redirect(w, r, backTo(r), http.StatusSeeOther)

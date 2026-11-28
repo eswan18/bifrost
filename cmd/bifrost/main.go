@@ -173,6 +173,14 @@ func main() {
 	authH := &auth.Handlers{OIDC: oidcClient, Session: sm, RenderError: renderError}
 	webH := &web.Handlers{Cfg: cfg, Registry: fleet, Kube: kc, Builds: builds, TriggerIDs: triggerIDs, Renderer: rend}
 
+	// What a promotion would ship, and which of it nobody has read
+	// (internal/commitlog), from the same GitHub tokens the preview control
+	// plane uses. nil without any token, which switches the feature off.
+	// Reading needs only read access; clearing the `unreviewed` label after a
+	// promotion needs the token to have write access to pull requests, and
+	// without it the promotion still succeeds and says the label stayed.
+	webH.Commits = web.NewGitHubCommits(cfg.GitHubToken, cfg.GitHubOwnerTokens)
+
 	// The preview orchestrator needs every one of its dependencies present —
 	// partial config (e.g. a GitHub token but no Neon key, or an empty
 	// registry) leaves webH.Orch nil, and the mutating preview endpoints

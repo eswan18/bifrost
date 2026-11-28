@@ -263,6 +263,11 @@ button { font-family: inherit; }
   background: var(--bg); color: var(--ink);
   border: 1px solid var(--line); width: min(460px, 94vw);
   padding: 26px 28px; box-shadow: 0 24px 60px rgba(0, 0, 0, .25);
+  /* A long list (the promote dialog's commits) scrolls inside the panel, not
+     the page behind it. dvh where supported, so a phone's URL bar can't push
+     the bottom of the panel off-screen. */
+  max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px);
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .modal-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .modal-title { font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
@@ -278,6 +283,51 @@ button { font-family: inherit; }
 .modal-note { font-size: 11.5px; color: var(--mut); margin-top: 6px; }
 .modal-row .pill, .modal-row button.pill { margin-top: 12px; font-size: 13px; padding: 8px 18px; min-height: 36px; }
 .modal-cancel { color: var(--mut); font-size: 13px; margin-top: 18px; display: block; cursor: pointer; }
+
+/* --- promote: what a promotion ships -------------------------------------- */
+
+/* The line beside a Promote control. Quiet, except the unread count. */
+.promote-note { display: block; font-size: 11px; color: var(--mut); margin-top: 3px; }
+.app-card > .promote-note { font-size: 12px; margin-top: 12px; }
+.unread-count { color: var(--amb); font-weight: 600; white-space: nowrap; }
+
+.changes { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line2); min-width: 0; }
+.changes > .modal-note:first-child { margin-top: 0; }
+.changes-head { display: flex; gap: 9px; align-items: baseline; font-size: 13.5px; font-weight: 600; }
+.changes-truncated { color: var(--amb); }
+
+.change-list, .commit-list { list-style: none; margin: 0; padding: 0; }
+.change-list { margin-top: 8px; border-bottom: 1px solid var(--line2); }
+.change-row {
+  display: flex; gap: 12px; align-items: center;
+  min-height: 44px; padding: 9px 0; border-top: 1px solid var(--line2);
+}
+.change-pr { font-size: 12px; font-weight: 600; color: var(--amb); flex: none; }
+.change-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.change-title { font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+.change-author { font-size: 11.5px; color: var(--mut); overflow-wrap: anywhere; }
+.change-row:hover .change-title { text-decoration: underline; }
+.change-row .ext { flex: none; }
+.changes-summary { margin-top: 10px; }
+
+.all-commits { margin-top: 2px; }
+.all-commits summary {
+  font-size: 12px; color: var(--mut); cursor: pointer; padding: 14px 0;
+  text-decoration: underline dotted var(--faint); text-underline-offset: 3px;
+}
+.commit-list { border-top: 1px solid var(--line2); padding: 4px 0 8px; }
+.commit-row { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; font-size: 12px; line-height: 1.4; }
+.commit-sha { font-size: 11px; color: var(--faint); flex: none; }
+.commit-pr { font-size: 11px; color: var(--mut); }
+.commit-text { min-width: 0; overflow-wrap: anywhere; }
+a.commit-row:hover .commit-text { text-decoration: underline; }
+
+/* The confirm button stays in view while the lists above it scroll. */
+.promote-confirm {
+  position: sticky; bottom: -26px; z-index: 1; /* -26px: the panel's own bottom padding */
+  margin: 0 -16px -14px; padding: 0 16px 14px;
+  background: var(--bg); border-top: 1px solid var(--line2);
+}
 
 /* --- auth pages ------------------------------------------------------------ */
 

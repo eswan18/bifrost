@@ -139,7 +139,10 @@ CI-build column. `GITHUB_TOKEN`, `NEON_API_KEY`, `PREVIEW_API_TOKEN` and
 whose registry entry sets `owner:`, `GITHUB_TOKEN_<OWNER>` (e.g.
 `GITHUB_TOKEN_FOOTSTRIKE`) supplies the token for that owner's repos, because a
 fine-grained PAT is scoped to one owner. The default token covers everything
-else.
+else. The same tokens let the promote dialog list what a promotion
+would ship and which pull requests nobody has read (the `unreviewed` label);
+reading needs read access only, but clearing that label after a promotion
+needs the token to have **Pull requests: Read and write** on the repo.
 
 The two `OIDC_ISSUER_*` vars exist because in-cluster pods can't resolve the
 issuer's public hostname: discovery is fetched from the internal URL and the
