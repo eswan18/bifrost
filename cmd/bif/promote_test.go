@@ -515,7 +515,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		&stdout, &stderr, func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, unreachableBuilds, unreachableDigests, noPreview)
+		}, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -534,7 +534,7 @@ func TestPromoteUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 func TestPromoteConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"promote", "bifrost", "-y"}, strings.NewReader(""),
-		&stdout, &stderr, func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, unreachableDigests, noPreview)
+		&stdout, &stderr, func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -810,7 +810,7 @@ func TestPromoteValidatesEveryNameBeforeConnecting(t *testing.T) {
 		strings.NewReader(""), &stdout, &stderr, func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, unreachableBuilds, unreachableDigests, noPreview)
+		}, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)

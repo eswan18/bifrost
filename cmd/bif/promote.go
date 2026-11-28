@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/eswan18/bifrost/internal/commitlog"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/promote"
 )
@@ -26,7 +27,7 @@ type promoter interface {
 // shaped like an interface the real client doesn't implement.
 var _ promoter = (kube.Client)(nil)
 
-const promoteUsage = "Usage: bif promote <app> [<app> ...] [-y/--yes]"
+const promoteUsage = "Usage: bif promote <app> [<app> ...] [-y/--yes] [--commits]"
 
 // promoteCmd implements `bif promote <app> [<app> ...]`, ported from ib.py's
 // promote(). The order of the checks is ib.py's, and so are the strings: this
@@ -41,17 +42,26 @@ const promoteUsage = "Usage: bif promote <app> [<app> ...] [-y/--yes]"
 // exactly what it always was, byte for byte — it is the branch below that
 // renders it, and TestPromoteMatchesOracle still compares it against ib.py's
 // captured stdout.
-func promoteCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error)) int {
+//
+// dialCommits is GitHub, and it is the one third party promote reads. It is
+// asked what the promotion would ship (see commits.go) strictly as decoration
+// on a decision already made from the cluster: it runs after every plan is
+// settled, inside promoteCommitTimeout, and any failure costs one warning line
+// on stderr and nothing else — the output, the prompt and the write are then
+// exactly what they were before this existed. `bif promote bifrost` with
+// GitHub down, or with no token at all, is still the same recovery path.
+func promoteCmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), dialCommits func(context.Context) (commitReader, error)) int {
 	args, yes := takeFlag(args, "-y", "--yes")
+	args, listCommits := takeFlag(args, "--commits")
 	if len(args) == 0 {
 		outln(stdout, promoteUsage)
 		return 1
 	}
-	known, ok := loadApps(stderr)
+	reg, ok := loadRegistry(stderr)
 	if !ok {
 		return 1
 	}
-	apps, ok := resolveApps(stdout, known, args)
+	apps, ok := resolveApps(stdout, reg.Names(), args)
 	if !ok {
 		return 1
 	}
@@ -69,10 +79,33 @@ func promoteCmd(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		plans = append(plans, planPromotion(app, staging, prod))
 	}
 
-	if len(plans) == 1 {
-		return promoteOne(ctx, cluster, plans[0], yes, stdin, stdout)
+	// Only a service that is actually going to be promoted is looked up, so a
+	// run that will refuse or skip everything makes no GitHub call at all.
+	var queries []commitQuery
+	for i := range plans {
+		p := &plans[i]
+		p.repo = repoOf(reg, p.app)
+		if q, ok := p.commitQuery(); ok {
+			queries = append(queries, q)
+		}
 	}
-	return promoteMany(ctx, cluster, plans, yes, stdin, stdout)
+	gh, infos, failed, err := readCommits(ctx, promoteCommitTimeout, dialCommits, queries)
+	warnCommits(stderr, err, failed, len(queries))
+	for i := range plans {
+		plans[i].changes = infos[plans[i].app].changes
+	}
+
+	opts := promoteOpts{yes: yes, listCommits: listCommits}
+	if len(plans) == 1 {
+		return promoteOne(ctx, cluster, gh, plans[0], opts, stdin, stdout, stderr)
+	}
+	return promoteMany(ctx, cluster, gh, plans, opts, stdin, stdout, stderr)
+}
+
+// promoteOpts is the flags, bundled so the two renderings take the same ones.
+type promoteOpts struct {
+	yes         bool // -y/--yes: no prompt (and therefore nothing marked as read)
+	listCommits bool // --commits: list every commit, not only the unread ones
 }
 
 // promoteOutcome is what planPromotion decided for one service. It is the
@@ -142,6 +175,36 @@ type promotePlan struct {
 	// footstrike-api` has to write the repository the Deployment actually
 	// references, which is still fitness-api. See promote.ReplaceTag.
 	newImage string
+	// repo is where the service's commits live, and changes is what this
+	// promotion would ship — the commits on staging's SHA that prod's does not
+	// have. changes is nil whenever GitHub was not asked (nothing to promote)
+	// or could not answer, and nil means the same thing everywhere it is read:
+	// print nothing extra, ask the old question, remove no label.
+	repo    repoRef
+	changes *commitlog.Range
+}
+
+// commitQuery is the GitHub question this plan raises, if it raises one: a
+// promotion that is going to happen, between two tags that both name a commit.
+// An unpinned prod (`latest`) has no SHA to compare from, and then there is
+// simply nothing to ask.
+func (p promotePlan) commitQuery() (commitQuery, bool) {
+	if p.outcome != outcomePromote {
+		return commitQuery{}, false
+	}
+	base, head := promote.ExtractSHA(p.status.ProdTag), promote.ExtractSHA(p.status.StagingTag)
+	if base == "" || head == "" {
+		return commitQuery{}, false
+	}
+	return commitQuery{app: p.app, repo: p.repo, base: base, head: head}, true
+}
+
+// unreadPRs is the PRs confirming this promotion would mark as read.
+func (p promotePlan) unreadPRs() []int {
+	if p.changes == nil {
+		return nil
+	}
+	return p.changes.UnreadPRs()
 }
 
 // planPromotion runs ib.py's guards, in ib.py's order, and decides. It prints
@@ -189,28 +252,38 @@ func planPromotion(app string, stagingImages, prodImages []string) promotePlan {
 // is ib.py's, byte for byte, and it is pinned that way by
 // TestPromoteMatchesOracle: the several-name form got a new rendering precisely
 // so that this one did not have to change.
-func promoteOne(ctx context.Context, cluster promoter, p promotePlan, yes bool, stdin io.Reader, stdout io.Writer) int {
-	renderPromoteCheck(stdout, p)
+//
+// What it gained is the commit summary and its consequences, and each is
+// conditional on commits having been read: the block above the verdict, the
+// sentence in the prompt, the label removal after the write. With p.changes
+// nil every one of them is absent and this is the old function.
+func promoteOne(ctx context.Context, cluster promoter, gh commitReader, p promotePlan, opts promoteOpts, stdin io.Reader, stdout, stderr io.Writer) int {
+	renderPromoteCheck(stdout, p, opts.listCommits)
 	if p.outcome != outcomePromote {
 		if p.outcome.refused() {
 			return 1
 		}
 		return 0
 	}
-	if !yes && !confirm(stdin, stdout, "\nProceed? [y/N] ") {
+	if !opts.yes && !confirm(stdin, stdout, "\nProceed?"+markReadClause(prRefs("", p.unreadPRs()))+" [y/N] ") {
 		outln(stdout, "Aborted.")
 		return 0
 	}
 	if !executePromotion(ctx, cluster, stdout, p) {
 		return 1
 	}
+	settleUnread(ctx, gh, p, !opts.yes, stdout, stderr)
 	return 0
 }
 
 // renderPromoteCheck is ib.py's single-service report: the guard messages, the
 // two-line table under a rule, and the verdict. Every string and every blank
 // line here is captured in testdata/oracle/promote_decision.json.
-func renderPromoteCheck(w io.Writer, p promotePlan) {
+//
+// The commit summary goes between the two tags and the verdict — after the
+// reader knows which two commits are being compared, before the line that says
+// what will be written — and only for a promotion that is going to happen.
+func renderPromoteCheck(w io.Writer, p promotePlan, listCommits bool) {
 	switch p.outcome {
 	case outcomeNoStaging:
 		outf(w, "Error: Could not find staging deployment in %s-staging\n", p.app)
@@ -241,6 +314,10 @@ func renderPromoteCheck(w io.Writer, p promotePlan) {
 	case outcomeNoSHA:
 		outf(w, "\nWarning: Could not parse staging SHA from '%s'\n", p.status.StagingTag)
 	case outcomePromote:
+		if p.changes != nil && p.changes.Total > 0 {
+			outln(w)
+			writeChanges(w, *p.changes, listCommits, commitsHint)
+		}
 		outf(w, "\n→ Promote prod to: %s\n", p.status.NewProdTag)
 	}
 }
@@ -287,8 +364,16 @@ func executePromotion(ctx context.Context, cluster promoter, w io.Writer, p prom
 // See promoteOutcome.refused — a service skipped because it is already in sync
 // is not a failure, and a service that refused because staging is mid-rollout
 // is, even though neither wrote anything.
-func promoteMany(ctx context.Context, cluster promoter, plans []promotePlan, yes bool, stdin io.Reader, stdout io.Writer) int {
-	renderPromotePlans(stdout, plans)
+//
+// Unread PRs follow the same one-prompt rule: the single question names every
+// PR that confirming will mark as read, across all the services (prefixed with
+// the service, since a bare #12 is ambiguous between two repos), and each
+// service's labels come off only after ITS promotion succeeded. A service
+// whose write failed keeps its labels — it was not promoted, so it was not
+// reviewed-at-promotion either.
+func promoteMany(ctx context.Context, cluster promoter, gh commitReader, plans []promotePlan, opts promoteOpts, stdin io.Reader, stdout, stderr io.Writer) int {
+	yes := opts.yes
+	renderPromotePlans(stdout, plans, opts.listCommits)
 
 	var todo []promotePlan
 	var refused, skipped []string
@@ -314,7 +399,11 @@ func promoteMany(ctx context.Context, cluster promoter, plans []promotePlan, yes
 		return 0
 	}
 
-	if !yes && !confirm(stdin, stdout, fmt.Sprintf("\nProceed with %s? [y/N] ", count(len(todo), "promotion"))) {
+	var unread []string
+	for _, p := range todo {
+		unread = append(unread, prRefs(p.app, p.unreadPRs())...)
+	}
+	if !yes && !confirm(stdin, stdout, fmt.Sprintf("\nProceed with %s?%s [y/N] ", count(len(todo), "promotion"), markReadClause(unread))) {
 		outln(stdout, "Aborted.")
 		// Declining is the operator's own choice and is not a failure — but a
 		// refusal earlier in the run still is, and it did not stop being one
@@ -329,6 +418,7 @@ func promoteMany(ctx context.Context, cluster promoter, plans []promotePlan, yes
 	for _, p := range todo {
 		if executePromotion(ctx, cluster, stdout, p) {
 			promoted = append(promoted, p.app)
+			settleUnread(ctx, gh, p, !yes, stdout, stderr)
 		} else {
 			failed = append(failed, p.app)
 		}
@@ -349,7 +439,11 @@ func promoteMany(ctx context.Context, cluster promoter, plans []promotePlan, yes
 // list of images. It goes above the table, naming its service, for the same
 // reason the single-service form puts it before the check: the reader has to
 // see it before they see the promotion it qualifies.
-func renderPromotePlans(w io.Writer, plans []promotePlan) {
+//
+// With --commits each promotable service's full commit list follows the table,
+// under its name. Without it the table carries only planLine's count, which is
+// what keeps the combined plan one screen.
+func renderPromotePlans(w io.Writer, plans []promotePlan, listCommits bool) {
 	for _, p := range plans {
 		if p.prodMismatch {
 			outf(w, "\nWarning: Prod has an image mismatch for %s (deployment in progress?)\n", p.app)
@@ -365,6 +459,15 @@ func renderPromotePlans(w io.Writer, plans []promotePlan) {
 	for _, p := range plans {
 		outf(w, "%-*s  %s\n", width, p.app, planLine(p))
 	}
+	if !listCommits {
+		return
+	}
+	for _, p := range plans {
+		if p.outcome == outcomePromote && p.changes != nil && p.changes.Total > 0 {
+			outf(w, "\n%s\n", p.app)
+			writeChanges(w, *p.changes, true, "")
+		}
+	}
 }
 
 // planLine is one service's row in the combined plan. Every non-promoting row
@@ -373,7 +476,15 @@ func renderPromotePlans(w io.Writer, plans []promotePlan) {
 func planLine(p promotePlan) string {
 	switch p.outcome {
 	case outcomePromote:
-		return fmt.Sprintf("%s -> prod  (prod: %s)", p.status.NewProdTag, p.status.ProdTag)
+		line := fmt.Sprintf("%s -> prod  (prod: %s)", p.status.NewProdTag, p.status.ProdTag)
+		// How much is moving, and whether any of it is unread — the two facts
+		// that decide whether this row needs a closer look before answering.
+		if p.changes != nil {
+			if note := changesNote(count(p.changes.Total, "commit"), *p.changes); note != "" {
+				line += "  (" + note + ")"
+			}
+		}
+		return line
 	case outcomeInSync:
 		return "already in sync, skipping"
 	case outcomeStagingMismatch:

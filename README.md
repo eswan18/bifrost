@@ -177,6 +177,7 @@ longer exists in any repo — remove it.
     bif promote <app>        # compare staging vs prod, then ask before promoting
     bif promote <app> <app>  # several services: one combined plan, one prompt
     bif promote <app> -y     # promote without the prompt
+    bif promote <app> --commits  # also list every commit being promoted
     bif preview list         # table of preview environments
     bif preview up <branch>  # create/update, show progress, print URLs
     bif preview down <tag>   # tear down (confirms unless -y/--yes)
@@ -259,6 +260,62 @@ and retries the request. That is what makes correctness independent of the
 12-hour TTL, which only bounds how long a stale copy can sit on disk. To clear
 it by hand anyway: `rm ~/.cache/bif/preview-token`.
 
+### What a promotion ships, and what nobody has read
+
+Image tags are commits, so `bif promote` asks GitHub what lies between prod's
+and staging's and shows it above the verdict — the commits nobody has read by
+name, the rest as a count:
+
+    haruspex promotion check:
+    --------------------------------------------------
+      staging: b6e95f4
+      prod:    1c0ffee
+
+      21 commits since prod. 1 has not been read:
+
+        ! b6e95f4  #277  Implement issue #221  haruspex-factory[bot]
+
+      Also: 1 dependency bump, 19 by you.  (--commits to list them)
+
+    → Promote prod to: b6e95f4
+
+    Proceed? This marks #277 as read. [y/N]
+
+**Unread** means a merged PR carrying the `unreviewed` label. That label is a
+fleet-wide convention, not a haruspex feature: any repo's merge automation (a
+"factory") can put it on a PR it merged with no human reading it, and the
+review then happens here, at promotion time. Every commit is exactly one of
+unread, a dependency bump (`dependabot[bot]`), other automation (any other bot
+account), or yours. With nothing unread the block is a single line; `--commits`
+lists every commit, newest first, `!` for unread and `~` for bumps and
+automation. The label name and the rules live in `internal/commitlog`.
+
+Confirming the prompt is what marks them read: after a **successful** promotion
+that you confirmed, the label is removed from each unread PR in the range
+(`✓ Marked #277 as read`). If a removal fails you get a warning with the
+`gh pr edit <n> --remove-label unreviewed --repo <owner>/<repo>` to run by
+hand; the exit code stays the promotion's. **`-y` removes nothing** — there was
+no prompt, so nobody agreed to call anything read — and says so in one line. A
+declined or failed promotion removes nothing either.
+
+With several services each promotable row of the plan gains a suffix such as
+`(21 commits, 1 unread)`, the one prompt names every PR it will mark
+(`haruspex#277`), and each service's labels come off after its own write.
+
+`bif status -v` adds the same fact to the rows that are out of sync
+(`21 to promote, 1 unread`), and `-vv` shows the full list plus anything merged
+to `main` that staging is not running yet (`2 more on main, not yet on
+staging`). The default list, `-q` and `--attention` never contact GitHub.
+
+All of it is best-effort, like the build column. The token is the first of
+`GITHUB_TOKEN`, `GH_TOKEN`, then `gh auth token`; with none, public repos still
+read anonymously. The whole GitHub read is bounded (about 5s for promote, 3s
+for status), and on any failure one line goes to stderr —
+`Warning: could not read commits from GitHub: …` — and everything else is
+exactly what it was without it: same output, same prompt, same write. Nothing
+is asked at all unless there is something to promote. GitHub's compare returns
+at most 250 commits; past that the output says how many it actually read.
+
 ### `bif promote` with several services
 
 Several names produce **one combined plan and one prompt**, not a prompt each:
@@ -290,7 +347,8 @@ service skipped because it is already in sync is not a failure; a service that
 refused is, because the operator asked for a promotion that did not happen.
 
 A single name keeps the original per-service output and its `Proceed? [y/N]`
-prompt, unchanged.
+prompt — unchanged apart from the commit summary described above, when there is
+one.
 
 ### How much `bif status` says
 
@@ -447,7 +505,9 @@ how bifrost gets recovered when bifrost is down, so it cannot depend on bifrost
 being up. The service list is `go:embed`ed, so it needs no network either. The
 property is about that one server, not about the network — the Kubernetes API
 and Cloud Build are third parties, not the service being managed, and the Cloud
-Build read degrades to an unknown column rather than a failure.
+Build read degrades to an unknown column rather than a failure. GitHub, read for
+the commit summary, is a third party on the same terms: `bif promote bifrost`
+with GitHub unreachable is the same command it always was, plus one warning.
 
 `preview` is the one exception, and is an HTTP client of bifrost's API by
 design — the server owns preview orchestration, the cluster write credentials
