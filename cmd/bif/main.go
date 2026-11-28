@@ -19,6 +19,11 @@
 // `bif promote bifrost` on any of it. See main_test.go's
 // TestNoBifrostServerDependency.
 //
+// GitHub is the fourth, read through internal/commitlog by `bif promote` and
+// `bif status -v/-vv` to say what a promotion would ship and which of it
+// nobody has read. Same terms: a few seconds at most, one warning line on
+// failure, and output identical to before when it cannot be reached.
+//
 // `bif preview` is the one exception, and is an HTTP client by design: the
 // server owns preview orchestration — the busy set, the cluster write
 // credentials, the Neon and Cloud Build tokens — so there is nothing there for
@@ -42,6 +47,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/eswan18/bifrost/internal/commitlog"
 	"github.com/eswan18/bifrost/internal/gcb"
 	"github.com/eswan18/bifrost/internal/kube"
 	"github.com/eswan18/bifrost/internal/oci"
@@ -63,6 +69,7 @@ Usage:
     bif promote <app>        # Compare staging vs prod, offer to promote
     bif promote <app> <app>  # Same, for several services: one plan, one prompt
     bif promote <app> -y     # Promote without confirmation
+    bif promote <app> --commits  # Also list every commit being promoted
     bif preview list                      # Table of preview environments, TTL remaining
     bif preview up <branch>               # Create/update, show live progress, print URLs
     bif preview up <branch> --ttl 8h      # Same, but auto-expire after 8h
@@ -76,24 +83,28 @@ Usage:
 const argoNamespace = "argocd"
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialBuilds, dialDigests, dialPreview))
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, dialCluster, dialBuilds, dialDigests, dialCommits, dialPreview))
 }
 
 // run is main with the process edges passed in — argv, the input and output
-// streams, the exit status as a return value, and the four connections as
+// streams, the exit status as a return value, and the five connections as
 // functions — so tests can drive whole commands end to end, including
 // promote's confirmation prompt, without any of them reaching a real service.
 //
-// The four are separate parameters rather than one bundle because they are
-// four different relationships. `connect` is the cluster, and everything
+// The five are separate parameters rather than one bundle because they are
+// five different relationships. `connect` is the cluster, and everything
 // reachable through it works with bifrost down. `connectBuilds` is Cloud
 // Build: a third party `bif status` reads for information, whose failure
 // degrades one column and nothing else (see fetchBuilds). `connectDigests` is
 // Artifact Registry, read by `bif status --attention` alone and only when a
 // build tag and a staging tag differ, to tell a new tag apart from new content;
-// its failure falls back to comparing tags and warning. `connectPreview` is
-// bifrost itself, which nothing but the preview branch below is handed.
-func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectBuilds func(context.Context) (buildLister, error), connectDigests func(context.Context) (digestResolver, error), connectPreview func() previewAPI) int {
+// its failure falls back to comparing tags and warning. `connectCommits` is
+// GitHub, read for the commits a promotion would ship: status gets only its
+// reads (readOnlyCommits), promote also gets the one label removal, and its
+// failure is one warning line and the output this CLI printed before it
+// existed. `connectPreview` is bifrost itself, which nothing but the preview
+// branch below is handed.
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, connect func() (promoter, error), connectBuilds func(context.Context) (buildLister, error), connectDigests func(context.Context) (digestResolver, error), connectCommits func(context.Context) (commitReader, error), connectPreview func() previewAPI) int {
 	if len(args) == 0 {
 		outln(stdout, usage)
 		return 1
@@ -103,11 +114,13 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "status":
 		// status gets the read-only view of the connection, not the one
 		// promote uses. See readOnly. It is also the only command handed the
-		// Cloud Build connection: promote must not so much as be able to
-		// stall on a third party.
-		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect), connectBuilds, connectDigests)
+		// Cloud Build and Artifact Registry connections, and its view of
+		// GitHub is narrowed the same way the cluster's is.
+		return statusCmd(ctx, args[1:], stdout, stderr, readOnly(connect), connectBuilds, connectDigests, readOnlyCommits(connectCommits))
 	case "promote":
-		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect)
+		// promote's one third party is GitHub, and only as decoration on a
+		// decision already made from the cluster — see promoteCmd.
+		return promoteCmd(ctx, args[1:], stdin, stdout, stderr, connect, connectCommits)
 	case "preview":
 		return previewCmd(ctx, args[1:], stdin, stdout, stderr, connectPreview)
 	case "completion":
@@ -188,6 +201,17 @@ func dialDigests(ctx context.Context) (digestResolver, error) {
 	return r, nil
 }
 
+// dialCommits builds the GitHub reader `bif promote` and `bif status -v/-vv`
+// describe commits with. It is only called when there is a range to describe.
+//
+// Finding a token is the CLI's job and happens here (discoverGitHubToken);
+// internal/commitlog takes one as an argument and reads no environment. No
+// token is not an error: public repos read anonymously, and a private one
+// answers 404, which the callers report in one line and otherwise ignore.
+func dialCommits(ctx context.Context) (commitReader, error) {
+	return commitlog.New(discoverGitHubToken(ctx, os.Getenv, ghAuthToken)), nil
+}
+
 // loadEmbeddedRegistry is registry.Load, as a variable so a test can run the
 // commands against a registry the embedded one cannot provide (see
 // withRepoOverride in status_test.go).
@@ -204,15 +228,6 @@ func loadRegistry(stderr io.Writer) (registry.Registry, bool) {
 		return nil, false
 	}
 	return reg, true
-}
-
-// loadApps is loadRegistry for the callers that want only the names.
-func loadApps(stderr io.Writer) ([]string, bool) {
-	reg, ok := loadRegistry(stderr)
-	if !ok {
-		return nil, false
-	}
-	return reg.Names(), true
 }
 
 // validateApp mirrors ib.py's validate_app, including printing to stdout. Both

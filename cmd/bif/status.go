@@ -206,7 +206,12 @@ func takeVerbosity(args []string) ([]string, verbosity) {
 // tag and staging tag differ — see resolveSameContent, which does not so much
 // as dial when nothing qualifies. The default list makes no build lookup and
 // no registry lookup: its offline guarantee is unchanged.
-func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error), dialDigests func(context.Context) (digestResolver, error)) int {
+//
+// dialCommits is GitHub, reached by -v and -vv alone and only when some
+// service is out of sync between two tags that both name a commit — see
+// commitQueries. The default list, -q and --attention never touch it, so all
+// three print exactly what they did before it existed.
+func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, connect func() (podLister, error), dialBuilds func(context.Context) (buildLister, error), dialDigests func(context.Context) (digestResolver, error), dialCommits func(context.Context) (commitLister, error)) int {
 	args, quiet := takeFlag(args, "-q", "--quiet")
 	args, attention := takeFlag(args, "-a", "--attention")
 	args, level := takeVerbosity(args)
@@ -292,6 +297,22 @@ func statusCmd(ctx context.Context, args []string, stdout, stderr io.Writer, con
 			set.cellFor(reg.RepoFor(app))))
 	}
 
+	// What each out-of-sync service would ship, for the two tiers that have
+	// room to say it. Read AFTER the cluster, because the question is made of
+	// the SHAs the cluster just reported; concurrent across services and
+	// bounded as a phase, so a slow GitHub costs the table a few seconds at
+	// worst and a dead one costs it one stderr line. A service whose lookup
+	// failed just has no note — no per-row "unavailable", because unlike the
+	// build column this is an annotation and its absence is not a state.
+	if level > listOutput {
+		queries := commitQueries(reg, services, level == detailOutput)
+		_, infos, failed, err := readCommits(ctx, statusCommitTimeout, dialCommits, queries)
+		warnCommits(stderr, err, failed, len(queries))
+		for i := range services {
+			services[i].commits = infos[services[i].app]
+		}
+	}
+
 	switch level {
 	case tableOutput:
 		writeTable(stdout, services, time.Now())
@@ -367,6 +388,39 @@ type serviceStatus struct {
 	staging, prod envState
 	status        promote.Status
 	build         buildCell
+	// commits is what a promote would ship (and, for -vv, what main holds
+	// beyond staging). Zero unless -v/-vv asked GitHub and GitHub answered;
+	// like the build cell it is information and never moves the verdict.
+	commits commitInfo
+}
+
+// commitQueries is the GitHub questions a status run raises: one per service
+// that is out of sync between two tags that both name a commit. In sync,
+// mid-deploy and unknown services raise none — there is no single "what would
+// a promote ship" to describe — so a settled fleet makes no GitHub call.
+// withMain adds -vv's second range, staging...main.
+func commitQueries(reg registry.Registry, services []serviceStatus, withMain bool) []commitQuery {
+	var out []commitQuery
+	for _, s := range services {
+		if s.status.State != promote.OutOfSync {
+			continue
+		}
+		base, head := promote.ExtractSHA(s.status.ProdTag), promote.ExtractSHA(s.status.StagingTag)
+		if base == "" || head == "" {
+			continue
+		}
+		out = append(out, commitQuery{app: s.app, repo: repoOf(reg, s.app), base: base, head: head, withMain: withMain})
+	}
+	return out
+}
+
+// promoteNote is the table's compact form of commits.changes: "21 to promote,
+// 1 unread", or "" when there is nothing to say.
+func (s serviceStatus) promoteNote() string {
+	if s.commits.changes == nil {
+		return ""
+	}
+	return changesNote(fmt.Sprintf("%d to promote", s.commits.changes.Total), *s.commits.changes)
 }
 
 // newServiceStatus normalizes both environments' images and takes the verdict.
@@ -480,13 +534,22 @@ func writeTable(w io.Writer, services []serviceStatus, now time.Time) {
 	rows := [][]string{{"SERVICE", "STATE", "STAGING", "PROD", "BUILD"}}
 	var promotable []string
 	for _, s := range services {
-		rows = append(rows, []string{
+		row := []string{
 			s.app,
 			s.stateLabel(),
 			tagsCell(s.staging.images),
 			tagsCell(s.prod.images),
 			buildLabel(s.build, now),
-		})
+		}
+		// The commit note is a trailing cell on the rows that have one, with
+		// no header of its own. A sixth column would put a heading over a
+		// column that is usually empty and would change every line of the
+		// table for a fleet with nothing to promote; this way a row without a
+		// note — and so a whole table without one — is exactly what it was.
+		if note := s.promoteNote(); note != "" {
+			row = append(row, note)
+		}
+		rows = append(rows, row)
 		if s.status.State == promote.OutOfSync {
 			promotable = append(promotable, s.app)
 		}
@@ -575,6 +638,31 @@ func writeDetail(w io.Writer, services []serviceStatus, now time.Time) {
 		}
 		if s.status.State == promote.OutOfSync {
 			writeCell(w, "promote", fmt.Sprintf("bif promote %s (deploys %s to prod)", s.app, s.status.NewProdTag))
+		}
+		writeDetailCommits(w, s.commits)
+	}
+}
+
+// writeDetailCommits is -vv's commit section: the block `bif promote` shows,
+// in its every-commit form — this tier's promise is everything bif can see,
+// so there is no shorter list to hint at — and then what has merged to main
+// and not yet reached staging.
+//
+// The second half answers the question the first cannot: "is what I am about
+// to promote the latest, or is more on its way?" A promote ships staging, not
+// main, and commits still building (or stuck — see stalledSyncCandidate) are
+// worth knowing about before deciding to promote now or wait.
+func writeDetailCommits(w io.Writer, c commitInfo) {
+	if r := c.changes; r != nil && r.Total > 0 {
+		outln(w)
+		writeChanges(w, *r, true, "")
+	}
+	if r := c.ahead; r != nil && r.Total > 0 {
+		outln(w)
+		outf(w, "  %d more on %s, not yet on staging:\n\n", r.Total, mainBranch)
+		writeCommitRows(w, r.Commits)
+		if r.Truncated() {
+			outf(w, "  GitHub returned only %d of the %d.\n", len(r.Commits), r.Total)
 		}
 	}
 }

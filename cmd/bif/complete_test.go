@@ -65,7 +65,7 @@ func noNetwork(t *testing.T) func() previewAPI {
 func complete(t *testing.T, dial func() previewAPI, words ...string) []string {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), append([]string{"__complete"}, words...), strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, dial)
+	code := run(context.Background(), append([]string{"__complete"}, words...), strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, dial)
 	if code != 0 {
 		t.Errorf("__complete %q exited %d, want 0", words, code)
 	}
@@ -142,14 +142,14 @@ func TestCompletePositions(t *testing.T) {
 			want:  append(append([]string{}, fleet...), "-v", "-vv", "--verbose", "-a", "--attention"),
 		},
 		{
-			name:  "promote offers the fleet and its flag",
+			name:  "promote offers the fleet and its flags",
 			words: []string{"promote", ""},
-			want:  append(append([]string{}, fleet...), "-y", "--yes"),
+			want:  append(append([]string{}, fleet...), "-y", "--yes", "--commits"),
 		},
 		{
 			name:  "a dash narrows to flags",
 			words: []string{"promote", "-"},
-			want:  []string{"-y", "--yes"},
+			want:  []string{"-y", "--yes", "--commits"},
 		},
 		{
 			name:  "a service prefix narrows the fleet",
@@ -230,14 +230,14 @@ func TestCompleteOmitsNamesAlreadyOnTheLine(t *testing.T) {
 		{
 			name:  "promote drops every name given",
 			words: []string{"promote", "bifrost", "identity", ""},
-			want:  append(without(fleet, "bifrost", "identity"), "-y", "--yes"),
+			want:  append(without(fleet, "bifrost", "identity"), "-y", "--yes", "--commits"),
 		},
 		{
 			name: "a name is dropped whichever side of a flag it sits on",
 			// takeFlag accepts flags anywhere, so the names are not
 			// necessarily contiguous.
 			words: []string{"promote", "-y", "bifrost", ""},
-			want:  without(fleet, "bifrost"),
+			want:  append(without(fleet, "bifrost"), "--commits"),
 		},
 		{
 			name:  "a dropped name is still dropped under a prefix",
@@ -284,6 +284,11 @@ func TestCompleteOmitsFlagsAlreadyGiven(t *testing.T) {
 		{
 			name:  "promote's flag is dropped once given",
 			words: []string{"promote", "-y", "-"},
+			want:  []string{"--commits"},
+		},
+		{
+			name:  "both of promote's flags given leaves nothing to offer",
+			words: []string{"promote", "-y", "--commits", "-"},
 			want:  nil,
 		},
 	}
@@ -411,7 +416,7 @@ func TestCompletePreviewDownSwallowsFailures(t *testing.T) {
 func TestCompleteIsHidden(t *testing.T) {
 	for _, args := range [][]string{nil, {"stauts"}} {
 		var stdout, stderr bytes.Buffer
-		run(context.Background(), args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
+		run(context.Background(), args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 		if strings.Contains(stdout.String(), "__complete") {
 			t.Errorf("`bif %s` advertises __complete:\n%s", strings.Join(args, " "), stdout.String())
 		}
@@ -420,7 +425,7 @@ func TestCompleteIsHidden(t *testing.T) {
 	// completion, by contrast, is a command an operator runs, so it joins the
 	// listing the unknown-command path prints.
 	var stdout, stderr bytes.Buffer
-	run(context.Background(), []string{"stauts"}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
+	run(context.Background(), []string{"stauts"}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 	if !strings.Contains(stdout.String(), "Available commands: status, promote, preview, completion") {
 		t.Errorf("completion is missing from the command listing:\n%s", stdout.String())
 	}
@@ -467,7 +472,7 @@ func TestCompletionCmd(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
@@ -511,7 +516,7 @@ func TestShimsAreValidShell(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			if code := run(context.Background(), []string{"completion", tc.arg}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview); code != 0 {
+			if code := run(context.Background(), []string{"completion", tc.arg}, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview); code != 0 {
 				t.Fatalf("bif completion %s exited %d", tc.arg, code)
 			}
 

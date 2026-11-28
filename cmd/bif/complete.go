@@ -73,7 +73,7 @@ func completionCmd(args []string, stdout io.Writer) int {
 // printed on the wrong stream does not read as an error to the operator, it
 // reads as a completion called "Error: connecting to the cluster". Not having
 // the stream is a stronger guarantee than remembering not to use it, and it is
-// why this command loads the registry itself instead of calling loadApps,
+// why this command loads the registry itself instead of calling loadRegistry,
 // which reports parse failures on stderr.
 //
 // Exit 0 always, for the same reason: a non-zero exit from a completion
@@ -105,7 +105,7 @@ type flagGroup []string
 
 var (
 	statusFlags      = []flagGroup{{"-v", "-vv", "--verbose"}, {"-a", "--attention"}}
-	promoteFlags     = []flagGroup{{"-y", "--yes"}}
+	promoteFlags     = []flagGroup{{"-y", "--yes"}, {"--commits"}}
 	previewUpFlags   = []flagGroup{{"--ttl"}, {"--no-wait"}, {"--auto-update"}}
 	previewDownFlags = []flagGroup{{"-y", "--yes"}}
 )

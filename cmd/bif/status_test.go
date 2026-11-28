@@ -116,7 +116,7 @@ func exec(t *testing.T, cluster *fakeCluster, args ...string) (string, int) {
 func execStdin(t *testing.T, cluster *fakeCluster, stdin string, args ...string) (string, int) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, unreachableBuilds, unreachableDigests, noPreview)
+	code := run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr, cluster.connect, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 	return stdout.String(), code
 }
 
@@ -174,7 +174,7 @@ func (f *fakeBuilds) counts() (dials, calls int) {
 func execBuilds(t *testing.T, cluster *fakeCluster, builds *fakeBuilds, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, unreachableDigests, noPreview)
+	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, unreachableDigests, unreachableCommits, noPreview)
 	return out.String(), errb.String(), code
 }
 
@@ -721,7 +721,7 @@ func TestUnknownServiceRejectedBeforeConnecting(t *testing.T) {
 		func() (promoter, error) {
 			connected = true
 			return nil, errors.New("should not have been called")
-		}, unreachableBuilds, unreachableDigests, noPreview)
+		}, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
@@ -744,7 +744,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 	c.errs = map[string]error{"bifrost-prod": errors.New("namespaces \"bifrost-prod\" not found")}
 
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"status", "bifrost", "-vv"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, unreachableDigests, noPreview)
+	code := run(context.Background(), []string{"status", "bifrost", "-vv"}, strings.NewReader(""), &stdout, &stderr, c.connect, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
 	}
@@ -761,7 +761,7 @@ func TestListPodsErrorReadsAsIndeterminate(t *testing.T) {
 func TestConnectFailureExitsNonZero(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"status"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, unreachableDigests, noPreview)
+		func() (promoter, error) { return nil, errors.New("no kubeconfig") }, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
@@ -777,7 +777,7 @@ func TestJobPodsExcluded(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cluster := &jobCluster{}
 	code := run(context.Background(), []string{"status", "bifrost", "-q"}, strings.NewReader(""), &stdout, &stderr,
-		func() (promoter, error) { return cluster, nil }, unreachableBuilds, unreachableDigests, noPreview)
+		func() (promoter, error) { return cluster, nil }, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 	if stdout.String() != "" || code != 0 {
 		t.Errorf("stdout = %q, exit = %d; want in-sync (no output, 0) with the job pod ignored", stdout.String(), code)
 	}
@@ -1860,7 +1860,7 @@ func newDigests(byImage map[string]string) *fakeDigests {
 func execAttention(t *testing.T, cluster *fakeCluster, builds *fakeBuilds, digests *fakeDigests, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, digests.dial, noPreview)
+	code = run(context.Background(), args, strings.NewReader(""), &out, &errb, cluster.connect, builds.dial, digests.dial, unreachableCommits, noPreview)
 	return out.String(), errb.String(), code
 }
 

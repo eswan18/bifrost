@@ -45,6 +45,19 @@ func unreachableDigests(context.Context) (digestResolver, error) {
 	return nil, errors.New("no credentials")
 }
 
+// unreachableCommits is the GitHub connection every test that isn't about the
+// commit summary runs with, and it fails for the same reason the two above do.
+// No unit test may reach GitHub — and every promote and status assertion in
+// this package that predates the commit summary is recorded against a GitHub
+// that is not there, so each one is also evidence for the property the summary
+// was built under: when commits cannot be read, stdout is byte-for-byte what it
+// was. (TestPromoteMatchesOracle is the sharpest case: it still compares
+// against ib.py's captured output.) The summary's own tests supply a working
+// one (see fakeCommits).
+func unreachableCommits(context.Context) (commitReader, error) {
+	return nil, errors.New("no credentials")
+}
+
 func TestDispatch(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -103,7 +116,7 @@ func TestDispatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, noPreview)
+			code := run(context.Background(), tc.args, strings.NewReader(""), &stdout, &stderr, noCluster, unreachableBuilds, unreachableDigests, unreachableCommits, noPreview)
 			if code != tc.wantCode {
 				t.Errorf("exit = %d, want %d", code, tc.wantCode)
 			}
