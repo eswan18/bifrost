@@ -46,34 +46,30 @@ func TestParsePR(t *testing.T) {
 // TestClassify pins the priority order as well as the four outcomes: every
 // commit is exactly one kind, and Unread beats the author-based ones.
 func TestClassify(t *testing.T) {
-	unreviewed := map[int]bool{277: true, 300: true}
 	tests := []struct {
-		name string
-		c    Commit
-		want Kind
+		name   string
+		c      Commit
+		unread bool
+		want   Kind
 	}{
-		{"labelled PR by the factory bot is unread, not automation", Commit{PR: 277, Author: "haruspex-factory[bot]", Bot: true}, Unread},
-		{"labelled PR by a person is still unread", Commit{PR: 300, Author: "eswan18"}, Unread},
-		{"labelled PR by dependabot is unread, not a bump", Commit{PR: 277, Author: BumpBotLogin, Bot: true}, Unread},
-		{"dependabot is a bump", Commit{PR: 12, Author: BumpBotLogin, Bot: true}, Bump},
+		{"an unread merge by the factory bot is unread, not automation", Commit{PR: 277, Author: "haruspex-factory[bot]", Bot: true}, true, Unread},
+		{"an unread merge by a person is still unread", Commit{PR: 300, Author: "eswan18"}, true, Unread},
+		{"an unread merge by dependabot is unread, not a bump", Commit{PR: 277, Author: BumpBotLogin, Bot: true}, true, Unread},
+		{"dependabot is a bump", Commit{PR: 12, Author: BumpBotLogin, Bot: true}, false, Bump},
 		// The login decides, not the type: the category is "dependency bump".
-		{"dependabot is a bump even if the type is missing", Commit{Author: BumpBotLogin}, Bump},
-		{"another bot is automation", Commit{PR: 13, Author: "haruspex-factory[bot]", Bot: true}, Automation},
-		{"a person is yours", Commit{PR: 14, Author: "eswan18"}, Yours},
-		{"no PR and no account is yours", Commit{Author: "Ethan Swan"}, Yours},
-		// PR 0 means "no PR"; it must never match a map entry.
-		{"no PR is never unread", Commit{PR: 0, Author: "eswan18"}, Yours},
+		{"dependabot is a bump even if the type is missing", Commit{Author: BumpBotLogin}, false, Bump},
+		{"another bot is automation", Commit{PR: 13, Author: "haruspex-factory[bot]", Bot: true}, false, Automation},
+		{"a person is yours", Commit{PR: 14, Author: "eswan18"}, false, Yours},
+		{"no PR and no account is yours", Commit{Author: "Ethan Swan"}, false, Yours},
+		// The number in a subject decides nothing on its own.
+		{"a subject naming a PR is not thereby unread", Commit{PR: 277, Author: "eswan18"}, false, Yours},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := Classify(tc.c, unreviewed); got != tc.want {
+			if got := Classify(tc.c, tc.unread); got != tc.want {
 				t.Errorf("Classify = %v, want %v", got, tc.want)
 			}
 		})
-	}
-	// A nil label set is what Between passes when no commit names a PR.
-	if got := Classify(Commit{PR: 277, Bot: true}, nil); got != Automation {
-		t.Errorf("Classify with no labels = %v, want Automation", got)
 	}
 }
 
@@ -113,6 +109,7 @@ type fakeGitHub struct {
 	t        *testing.T
 	compare  map[string]string // "base...head" -> JSON body
 	issues   []string          // JSON objects, served labelPageSize per page
+	pulls    map[int]string    // PR number -> its merge commit ("" = closed unmerged)
 	deletes  map[string]int    // path -> status
 	wantAuth string            // exact Authorization header expected ("" = none)
 
@@ -155,6 +152,17 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		start := min((page-1)*labelPageSize, len(f.issues))
 		end := min(start+labelPageSize, len(f.issues))
 		_, _ = w.Write([]byte("[" + strings.Join(f.issues[start:end], ",") + "]"))
+	case r.Method == http.MethodGet && strings.HasPrefix(rest, "pulls/"):
+		var n int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(rest, "pulls/"), "%d", &n); err != nil {
+			f.t.Errorf("pull request path %s: %v", rest, err)
+		}
+		sha, ok := f.pulls[n]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"merged":%t,"merge_commit_sha":%q}`, sha != "", sha)
 	case r.Method == http.MethodDelete:
 		status, ok := f.deletes[rest]
 		if !ok {
@@ -221,6 +229,10 @@ func TestBetween(t *testing.T) {
 		// 221 is a labelled ISSUE, not a PR, and 900 is a labelled PR that is
 		// not in this range. Neither may make anything unread.
 		issues: []string{prIssue(277), `{"number":221}`, prIssue(900)},
+		pulls: map[int]string{
+			277: "4444444aaaaaaaaaaaaa",
+			900: "9999999aaaaaaaaaaaaa",
+		},
 	}
 	c := serve(t, gh, "test-token")
 
@@ -338,16 +350,81 @@ func TestUnreviewedPRsExactPage(t *testing.T) {
 	}
 }
 
-// TestBetweenSkipsLabelsWhenNoCommitNamesAPR: most of the fleet has no factory
-// and no squash suffixes, and should cost one request, not two.
-func TestBetweenSkipsLabelsWhenNoCommitNamesAPR(t *testing.T) {
+// TestBetweenGoesByTheMergeCommitNotTheSubject is the reason unread is
+// decided by SHA. Whoever writes a commit writes its subject, so a subject
+// must be able neither to hide an unread change nor to claim somebody else's.
+func TestBetweenGoesByTheMergeCommitNotTheSubject(t *testing.T) {
+	gh := &fakeGitHub{
+		compare: map[string]string{"a...b": compareBody(4,
+			// Really PR 277's merge commit, with a subject naming another PR.
+			rawCommit("aaaa111aaaaaaaaaaaaa", "Tidy up (#12)", "haruspex-factory[bot]", "Bot"),
+			// Really PR 280's merge commit, with no number in its subject.
+			rawCommit("bbbb222aaaaaaaaaaaaa", "Tidy up some more", "haruspex-factory[bot]", "Bot"),
+			// Claims to be 277, and is not.
+			rawCommit("cccc333aaaaaaaaaaaaa", "Something else (#277)", "eswan18", "User"),
+			// Claims to be 281, which is labelled but was closed unmerged.
+			rawCommit("dddd444aaaaaaaaaaaaa", "Yet another (#281)", "eswan18", "User"),
+		)},
+		issues: []string{prIssue(277), prIssue(280), prIssue(281)},
+		pulls: map[int]string{
+			277: "aaaa111aaaaaaaaaaaaa",
+			280: "bbbb222aaaaaaaaaaaaa",
+			281: "",
+		},
+	}
+	c := serve(t, gh, "")
+	got, err := c.Between(context.Background(), "eswan18", "haruspex", "a", "b")
+	if err != nil {
+		t.Fatalf("Between: %v", err)
+	}
+	type row struct {
+		sha  string
+		pr   int
+		kind Kind
+	}
+	var rows []row
+	for _, commit := range got.Commits {
+		rows = append(rows, row{commit.SHA, commit.PR, commit.Kind})
+	}
+	want := []row{
+		{"dddd444", 281, Yours},
+		{"cccc333", 277, Yours},
+		{"bbbb222", 280, Unread},
+		{"aaaa111", 277, Unread},
+	}
+	if !slices.Equal(rows, want) {
+		t.Errorf("rows (newest first) = %+v\nwant %+v", rows, want)
+	}
+	if prs := got.UnreadPRs(); !slices.Equal(prs, []int{280, 277}) {
+		t.Errorf("UnreadPRs = %v, want [280 277]", prs)
+	}
+}
+
+// TestBetweenAsksForLabelsWhateverTheSubjectsSay: skipping the label lookup
+// when no subject names a PR would let a subject decide the answer.
+func TestBetweenAsksForLabelsWhateverTheSubjectsSay(t *testing.T) {
 	gh := &fakeGitHub{compare: map[string]string{"a...b": compareBody(1, rawCommit("1234567", "Direct push", "eswan18", "User"))}}
 	c := serve(t, gh, "")
 	if _, err := c.Between(context.Background(), "eswan18", "haruspex", "a", "b"); err != nil {
 		t.Fatalf("Between: %v", err)
 	}
-	if n := gh.seen("/issues"); n != 0 {
-		t.Errorf("made %d label requests for a range with no PRs, want 0", n)
+	if n := gh.seen("/issues"); n != 1 {
+		t.Errorf("made %d label requests, want 1", n)
+	}
+	// Asked twice, GitHub is asked once: the answer is cached briefly.
+	if _, err := c.Between(context.Background(), "eswan18", "haruspex", "a", "b"); err != nil {
+		t.Fatalf("Between again: %v", err)
+	}
+	if n := gh.seen("/issues"); n != 1 {
+		t.Errorf("made %d label requests after a repeat, want 1", n)
+	}
+	// Until something is marked as read, which must show at once.
+	c.Forget("eswan18", "haruspex")
+	if _, err := c.Between(context.Background(), "eswan18", "haruspex", "a", "b"); err != nil {
+		t.Fatalf("Between after Forget: %v", err)
+	}
+	if n := gh.seen("/issues"); n != 2 {
+		t.Errorf("made %d label requests after Forget, want 2", n)
 	}
 }
 

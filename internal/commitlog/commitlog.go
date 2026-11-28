@@ -100,8 +100,13 @@ const (
 type Commit struct {
 	SHA     string // abbreviated to seven characters
 	Subject string // first line of the message
-	// PR is the pull request the commit was squash-merged from, parsed out of
-	// the subject's trailing " (#123)". Zero when there is none.
+	// PR is the pull request the commit came from. Zero when there is none.
+	//
+	// For an Unread commit it is the labelled PR whose merge commit this IS,
+	// as GitHub records it. For every other commit it is only what the subject
+	// claims in its trailing " (#123)": good enough to label a row, and never
+	// used to decide anything, because whoever writes a commit writes its
+	// subject.
 	PR     int
 	Author string // GitHub login; the git author name when no account is linked
 	Bot    bool   // the author account's type is "Bot"
@@ -117,6 +122,10 @@ type Range struct {
 	// Total is GitHub's total_commits: how many commits the range really
 	// holds, which exceeds len(Commits) when the response was capped.
 	Total int
+	// full holds each commit's whole SHA, parallel to Commits. Kept out of
+	// Commit because nothing that renders one wants forty characters; Between
+	// needs it to match a commit against a PR's recorded merge commit.
+	full []string
 }
 
 // Truncated reports whether GitHub returned fewer commits than the range
@@ -174,12 +183,16 @@ func ParsePR(subject string) int {
 	return n
 }
 
-// Classify decides a commit's kind from its own fields and the set of PR
-// numbers that carry the unreviewed label. The order of the cases is the
-// priority order; see the Kind constants.
-func Classify(c Commit, unreviewed map[int]bool) Kind {
+// Classify decides a commit's kind. unread says whether this commit is the
+// recorded merge commit of a PR that carries the unreviewed label — a fact
+// about the commit's SHA, established by Between, and deliberately not
+// something read off the subject line: a subject that says "(#12)" is a claim
+// by whoever wrote the commit, and one that could otherwise hide an unread
+// change or get somebody else's PR marked as read. The order of the cases is
+// the priority order; see the Kind constants.
+func Classify(c Commit, unread bool) Kind {
 	switch {
-	case c.PR != 0 && unreviewed[c.PR]:
+	case unread:
 		return Unread
 	case c.Author == BumpBotLogin:
 		return Bump
@@ -198,11 +211,42 @@ type Client struct {
 	baseURL string
 	http    *http.Client
 
-	// labels caches UnreviewedPRs per owner/repo for the life of the client,
-	// which is one bif invocation. `bif status -vv` asks about two ranges of
-	// the same repo, and the label set is the same answer both times.
-	mu     sync.Mutex
-	labels map[string]map[int]bool
+	// labels and merges cache the two label answers per owner/repo, so that
+	// `bif status -vv`, which asks about two ranges of the same repo, asks
+	// GitHub once. They are dropped after cacheTTL: a CLI run never lives that
+	// long, but a server holding one Client for days must not go on showing
+	// a PR as unread after its label has been removed, or miss a new one.
+	mu       sync.Mutex
+	cachedAt map[string]time.Time
+	labels   map[string]map[int]bool
+	merges   map[string]map[string]int
+}
+
+// cacheTTL is how long a repo's label answers are reused.
+const cacheTTL = 30 * time.Second
+
+// fresh reports whether key's cached answers may still be used, and forgets
+// them if not. Callers hold c.mu.
+func (c *Client) fresh(key string) bool {
+	at, ok := c.cachedAt[key]
+	if ok && time.Since(at) < cacheTTL {
+		return true
+	}
+	delete(c.labels, key)
+	delete(c.merges, key)
+	delete(c.cachedAt, key)
+	return false
+}
+
+// Forget drops what is cached about owner/repo. MarkRead calls it, so that a
+// reader sees the label gone at once and not cacheTTL later.
+func (c *Client) Forget(owner, repo string) {
+	key := strings.ToLower(owner + "/" + repo)
+	c.mu.Lock()
+	delete(c.labels, key)
+	delete(c.merges, key)
+	delete(c.cachedAt, key)
+	c.mu.Unlock()
 }
 
 // New builds a client. token may be empty: unauthenticated requests still read
@@ -215,10 +259,12 @@ func New(token string) *Client {
 // NewWithBaseURL exists as a test seam; production code uses New.
 func NewWithBaseURL(token, baseURL string) *Client {
 	return &Client{
-		token:   token,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: httpTimeout},
-		labels:  map[string]map[int]bool{},
+		token:    token,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		http:     &http.Client{Timeout: httpTimeout},
+		labels:   map[string]map[int]bool{},
+		merges:   map[string]map[string]int{},
+		cachedAt: map[string]time.Time{},
 	}
 }
 
@@ -308,6 +354,7 @@ func (c *Client) Compare(ctx context.Context, owner, repo, base, head string) (R
 			commit.Bot = raw.Author.Type == "Bot"
 		}
 		out.Commits = append(out.Commits, commit)
+		out.full = append(out.full, raw.SHA)
 	}
 	// total_commits is trusted for one thing — being LARGER than what came
 	// back. A response that omits it must not make a full list look empty.
@@ -347,6 +394,7 @@ func (c *Client) UnreviewedPRs(ctx context.Context, owner, repo string) (map[int
 	key := strings.ToLower(owner + "/" + repo)
 	c.mu.Lock()
 	cached, ok := c.labels[key]
+	ok = ok && c.fresh(key)
 	c.mu.Unlock()
 	if ok {
 		return cached, nil
@@ -373,6 +421,7 @@ func (c *Client) UnreviewedPRs(ctx context.Context, owner, repo string) (map[int
 
 	c.mu.Lock()
 	c.labels[key] = out
+	c.cachedAt[key] = time.Now()
 	c.mu.Unlock()
 	return out, nil
 }
@@ -400,31 +449,99 @@ func (c *Client) labelPage(ctx context.Context, reqURL string, out map[int]bool)
 	return len(issues), nil
 }
 
+// maxUnreadPRs bounds how many labelled PRs are looked up one by one. The
+// label is removed at every promotion, so more than this many means something
+// has gone wrong, and the honest answer then is "could not tell".
+const maxUnreadPRs = 50
+
+// unreadMerges maps the merge commit of every merged PR that carries the
+// unreviewed label to that PR's number. This, and not a number in a subject
+// line, is what makes a commit unread: GitHub records which commit a PR
+// became, and nobody who writes commits can change that record.
+func (c *Client) unreadMerges(ctx context.Context, owner, repo string) (map[string]int, error) {
+	key := strings.ToLower(owner + "/" + repo)
+	c.mu.Lock()
+	cached, ok := c.merges[key]
+	ok = ok && c.fresh(key)
+	c.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	labelled, err := c.UnreviewedPRs(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	if len(labelled) > maxUnreadPRs {
+		return nil, fmt.Errorf("github: %d pull requests are labelled %s, too many to check", len(labelled), UnreviewedLabel)
+	}
+	out := make(map[string]int, len(labelled))
+	for pr := range labelled {
+		sha, err := c.mergeCommit(ctx, owner, repo, pr)
+		if err != nil {
+			return nil, err
+		}
+		// A labelled PR that was closed without merging has no commit on the
+		// branch, so there is nothing of it to ship.
+		if sha != "" {
+			out[sha] = pr
+		}
+	}
+
+	c.mu.Lock()
+	c.merges[key] = out
+	c.mu.Unlock()
+	return out, nil
+}
+
+// mergeCommit returns the full SHA of the commit a PR was merged as, or ""
+// if it was not merged.
+func (c *Client) mergeCommit(ctx context.Context, owner, repo string, pr int) (string, error) {
+	reqURL := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", c.baseURL, url.PathEscape(owner), url.PathEscape(repo), pr)
+	resp, err := c.do(ctx, http.MethodGet, reqURL, "pull request lookup", http.StatusOK)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body struct {
+		Merged         bool   `json:"merged"`
+		MergeCommitSHA string `json:"merge_commit_sha"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("github pull request lookup: decoding: %w", err)
+	}
+	if !body.Merged {
+		return "", nil
+	}
+	return body.MergeCommitSHA, nil
+}
+
 // Between is Compare with every commit classified: the one call the CLI makes.
 //
-// The label listing is skipped when no commit in the range names a PR. Nothing
-// could be unread then, and for most of the fleet — repos the factory never
-// touches, merged by hand — that makes this one request instead of two.
+// A commit is unread when it is the merge commit of a labelled PR. The labels
+// are asked for on every range, whatever the subjects say: skipping the
+// question when no subject names a PR would let a subject decide the answer.
 func (c *Client) Between(ctx context.Context, owner, repo, base, head string) (Range, error) {
 	r, err := c.Compare(ctx, owner, repo, base, head)
 	if err != nil {
 		return Range{}, err
 	}
-	var unreviewed map[int]bool
-	for _, commit := range r.Commits {
-		if commit.PR != 0 {
-			unreviewed, err = c.UnreviewedPRs(ctx, owner, repo)
-			if err != nil {
-				// Not degraded to "none are unread": a range whose labels
-				// could not be read is a range this package cannot describe,
-				// and saying "0 unread" about it would be a false all-clear.
-				return Range{}, err
-			}
-			break
-		}
+	// Not degraded to "none are unread" on failure: a range whose labels could
+	// not be read is a range this package cannot describe, and saying
+	// "0 unread" about it would be a false all-clear.
+	merges, err := c.unreadMerges(ctx, owner, repo)
+	if err != nil {
+		return Range{}, err
 	}
 	for i := range r.Commits {
-		r.Commits[i].Kind = Classify(r.Commits[i], unreviewed)
+		pr, unread := 0, false
+		if i < len(r.full) {
+			pr, unread = merges[r.full[i]]
+		}
+		if unread {
+			r.Commits[i].PR = pr
+		}
+		r.Commits[i].Kind = Classify(r.Commits[i], unread)
 	}
 	return r, nil
 }
@@ -445,6 +562,7 @@ func (c *Client) MarkRead(ctx context.Context, owner, repo string, pr int) error
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
+	c.Forget(owner, repo)
 	return nil
 }
 
